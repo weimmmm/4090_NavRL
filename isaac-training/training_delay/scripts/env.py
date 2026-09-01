@@ -1019,8 +1019,10 @@ class NavigationEnv(IsaacEnv):
                 self.episode_time / self.nominal_command_dt
             ).clamp(max=float(self.max_episode_length))
             self.stats["decision_count"][:] = self.progress_buf.unsqueeze(1)
-            self.stats["reach_goal"] = torch.maximum(
-                self.stats["reach_goal"], reach_goal.float() * stats_mask
+            # Match baseline semantics: keep the goal condition from the
+            # latest valid physics step, including the terminal step.
+            self.stats["reach_goal"] = torch.where(
+                stats_mask.bool(), reach_goal.float(), self.stats["reach_goal"]
             )
             self.stats["collision"] = torch.maximum(
                 self.stats["collision"], collision.float() * stats_mask
