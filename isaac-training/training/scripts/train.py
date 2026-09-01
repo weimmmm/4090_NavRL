@@ -104,7 +104,13 @@ def main(cfg):
         # print("data: ", data)
         # print("============================")
         # Log Info
-        info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+        physics_frames = collector._frames * int(cfg.sim.substeps)
+        info = {
+            "env_frames": collector._frames,
+            "physics_frames": physics_frames,
+            "rollout_fps": collector._fps,
+            "rollout_physics_fps": collector._fps * int(cfg.sim.substeps),
+        }
 
         # Train Policy
         train_loss_stats = policy.train(data)
