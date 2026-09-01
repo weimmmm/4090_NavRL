@@ -91,6 +91,10 @@ docker-compose.override.yml
 */wandb/
 */wandb/*/files/
 */wandb/*/*.wandb
+**/wandb/
+
+# Ignore generated experiment outputs from nested training variants
+**/outputs/
 
 # Ignore Isaac Orbit symlink
 isaac-training/third_party/orbit/_isaac_sim

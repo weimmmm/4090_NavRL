@@ -31,12 +31,16 @@ from .dragon import DragonHover
 from .rearrange import Rearrange
 from .isaac_env import IsaacEnv
 
-try:
-    from .pinball import Pinball
-    from .forest import Forest
-except ModuleNotFoundError:
-    print(
-        "To run the environments which use `ContactSensor` and `RayCaster`,"
-        "please install Isaac Orbit (https://github.com/NVIDIA-Omniverse/orbit)."
-    )
+# These optional environments import Orbit's Nucleus asset helpers at module import time.
+# Skip them unless explicitly requested so local environments do not block on Nucleus.
+import os
 
+if os.environ.get("OMNI_DRONES_LOAD_OPTIONAL_ENVS", "0") == "1":
+    try:
+        from .pinball import Pinball
+        from .forest import Forest
+    except ModuleNotFoundError:
+        print(
+            "To run the environments which use `ContactSensor` and `RayCaster`,"
+            "please install Isaac Orbit (https://github.com/NVIDIA-Omniverse/orbit)."
+        )

@@ -130,21 +130,28 @@ class GAE(nn.Module):
     def forward(
         self, 
         reward: torch.Tensor, 
-        terminated: torch.Tensor, 
+        done: torch.Tensor,
         value: torch.Tensor, 
-        next_value: torch.Tensor
+        next_value: torch.Tensor,
+        time_scale: torch.Tensor=None,
     ):
-        num_steps = terminated.shape[1]
+        num_steps = done.shape[1]
         advantages = torch.zeros_like(reward)
-        not_done = 1 - terminated.float()
+        not_done = 1 - done.float()
+        if time_scale is None:
+            time_scale = torch.ones_like(reward)
         gae = 0
         for step in reversed(range(num_steps)):
+            discount = self.gamma.pow(time_scale[:, step])
+            trace_decay = self.lmbda.pow(time_scale[:, step])
             delta = (
                 reward[:, step] 
-                + self.gamma * next_value[:, step] * not_done[:, step] 
+                + discount * next_value[:, step] * not_done[:, step]
                 - value[:, step]
             )
-            advantages[:, step] = gae = delta + (self.gamma * self.lmbda * not_done[:, step] * gae) 
+            advantages[:, step] = gae = (
+                delta + discount * trace_decay * not_done[:, step] * gae
+            )
         returns = advantages + value
         return advantages, returns
 
@@ -166,12 +173,11 @@ def evaluate(
     exploration_type: ExplorationType=ExplorationType.MEAN
 ):
 
-    record_video = bool(cfg.get("record_eval_video", False))
-    env.enable_render(record_video)
+    env.enable_render(True)
     env.eval()
     env.set_seed(seed)
 
-    render_callback = RenderCallback(interval=2) if record_video else None
+    render_callback = RenderCallback(interval=2)
     
     with set_exploration_type(exploration_type):
         trajs = env.rollout(
@@ -203,12 +209,23 @@ def evaluate(
         for k, v in traj_stats.items()
     }
 
-    if record_video:
-        info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-            format="mp4",
+    # RenderCallback records every two policy transitions. Actor inference sets
+    # the outer transition duration; command transport overlaps later inference.
+    if bool(cfg.timing.enabled):
+        inference_steps = round(
+            float(cfg.timing.inference_delay.eval) / float(cfg.sim.dt)
         )
+        transition_steps = max(
+            int(cfg.sim.substeps), inference_steps
+        )
+    else:
+        transition_steps = int(cfg.sim.substeps)
+    eval_transition_dt = transition_steps * float(cfg.sim.dt)
+    info["recording"] = wandb.Video(
+        render_callback.get_video_array(axes="t c h w"), 
+        fps=0.5 / eval_transition_dt,
+        format="mp4"
+    )
     env.train()
     # env.reset()
 

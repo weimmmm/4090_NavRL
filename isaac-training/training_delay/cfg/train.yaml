@@ -28,6 +28,22 @@ env_dyn:
   vel_range: [0.5, 1.5]
   local_range: [5.0, 5.0, 4.5]
 
+timing:
+  enabled: true
+  mode: overlapping_transport
+  randomize_in_eval: true
+  reference_dt: 0.016
+  inference_delay:
+    min: 0.016
+    max: 0.096
+    eval: 0.032
+  command_delay:
+    min: 0.016
+    max: 0.032
+    eval: 0.016
+  change_probability: 0.2
+  max_step_change: 1
+
 viewer:
   eye: [0., 40., 40.]
   lookat: [0., 2.5, 0.]
@@ -35,6 +51,6 @@ viewer:
 
 wandb:
   project: End_to_End_Navigation_4090_PPO
-  name: baseline_PPO
+  name: ppo_delay
   entity: null
   mode: online

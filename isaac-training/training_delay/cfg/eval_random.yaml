@@ -1,0 +1,53 @@
+defaults:
+  - _self_
+  - drone
+  - ppo
+  - sim
+
+headless: true
+gpu_id: 1
+device: "cuda:${gpu_id}"
+seed: 0
+
+# Supply both checkpoints on the command line.
+baseline_checkpoint: null
+delay_checkpoint: null
+
+env:
+  num_envs: 1024
+  max_episode_length: 2200
+  env_spacing: 8.0
+  num_obstacles: 200
+
+env_dyn:
+  num_obstacles: 0
+  vel_range: [0.5, 1.5]
+  local_range: [5.0, 5.0, 4.5]
+
+eval:
+  enabled: true
+  dataset_path: ../training/cfg/eval_env.pt
+  max_steps: 2200
+  record_video: true
+  video_dir: eval_videos/random_delay
+
+timing:
+  enabled: true
+  mode: overlapping_transport
+  randomize_in_eval: true
+  reference_dt: 0.016
+  inference_delay:
+    min: 0.016
+    max: 0.096
+    eval: 0.032
+  command_delay:
+    min: 0.016
+    max: 0.032
+    eval: 0.016
+  change_probability: 0.2
+  max_step_change: 1
+
+viewer:
+  eye: [0.0, 40.0, 40.0]
+  lookat: [0.0, 2.5, 0.0]
+  resolution: [960, 720]

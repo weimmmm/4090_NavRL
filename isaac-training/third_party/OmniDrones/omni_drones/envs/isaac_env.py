@@ -117,7 +117,7 @@ class IsaacEnv(EnvBase):
             backend="torch",
             sim_params=sim_params,
             physics_prim_path="/physicsScene",
-            device="cuda:0",
+            device=cfg.sim.device,
         )
         self._create_viewport_render_product()
         self.dt = self.sim.get_physics_dt()
@@ -416,4 +416,3 @@ class _AgentSpecView(Dict[str, AgentSpec]):
     def __setitem__(self, k: str, v: AgentSpec) -> None:
         v._env = self.env
         return self.env._agent_spec.__setitem__(k, v)
-

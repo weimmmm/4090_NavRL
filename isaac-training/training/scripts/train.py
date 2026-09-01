@@ -1,18 +1,19 @@
 import argparse
 import os
+import sys
+
+OMNIDRONES_SOURCE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "OmniDrones")
+)
+if OMNIDRONES_SOURCE not in sys.path:
+    sys.path.insert(0, OMNIDRONES_SOURCE)
+
 import hydra
 import datetime
 import wandb
 import torch
 from omegaconf import DictConfig, OmegaConf
 from omni.isaac.kit import SimulationApp
-from ppo import PPO
-from omni_drones.controllers import LeePositionController
-from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
-from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
-from torchrl.envs.transforms import TransformedEnv, Compose
-from utils import evaluate
-from torchrl.envs.utils import ExplorationType
 
 
 
@@ -21,10 +22,27 @@ FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
     # Simulation App
-    sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
+    gpu_id = int(str(cfg.device).split(":")[-1])
+    sim_app = SimulationApp({
+        "headless": cfg.headless,
+        "anti_aliasing": 1,
+        "active_gpu": gpu_id,
+        "physics_gpu": gpu_id,
+        "multi_gpu": False,
+    })
+
+    # Isaac Sim must be initialized before importing OmniDrones extensions.
+    from ppo import PPO
+    from omni_drones.controllers import LeePositionController
+    from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
+    from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
+    from torchrl.envs.transforms import TransformedEnv, Compose
+    from utils import evaluate
+    from torchrl.envs.utils import ExplorationType
 
     # Use Wandb to monitor training
-    if (cfg.wandb.run_id is None):
+    run_id = cfg.wandb.get("run_id")
+    if run_id is None:
         run = wandb.init(
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
@@ -40,7 +58,7 @@ def main(cfg):
             entity=cfg.wandb.entity,
             config=cfg,
             mode=cfg.wandb.mode,
-            id=cfg.wandb.run_id,
+            id=run_id,
             resume="must"
         )
 
@@ -102,9 +120,8 @@ def main(cfg):
             info.update(stats)
 
         # Evaluate policy and log info
-        if i % cfg.eval_interval == 0:
+        if cfg.enable_eval and i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
-            env.enable_render(True)
             env.eval()
             eval_info = evaluate(
                 env=transformed_env, 
@@ -136,4 +153,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
-    

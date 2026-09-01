@@ -1,0 +1,22 @@
+algo:
+  # Per-physics-tick discount parameters. Variable-duration transitions use
+  # gamma^n and lambda^n, where n = transition_dt / 0.016.
+  gamma: 0.99
+  gae_lambda: 0.95
+  feature_extractor:
+    learning_rate: 5e-4
+    dyn_obs_num: 5
+  
+  actor:
+    learning_rate: 5e-4
+    clip_ratio: 0.1
+    action_limit: 2.0 # m/s
+  
+  critic:
+    learning_rate: 5e-4
+    clip_ratio: 0.1
+  
+  entropy_loss_coefficient: 1e-3 # encourage exploration
+  training_frame_num: 32
+  training_epoch_num: 4
+  num_minibatches: 16 # split into N minibatches
