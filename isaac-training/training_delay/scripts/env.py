@@ -23,9 +23,10 @@ from timing import TwoStageDelaySchedule
 
 class NavigationEnv(IsaacEnv):
 
-    # Actor inference and command transport are separate stages. Transport is
-    # queued and overlaps the following inference, while the unchanged
-    # velocity controller keeps running on the most recently applied cmd_vel.
+    # Actor inference and command transport are separate stages. A 50 Hz
+    # publisher snapshots the latest completed Actor output and sends it
+    # through an ordered delayed channel. Transport overlaps later inference
+    # while the velocity controller keeps running on the active cmd_vel.
 
     def __init__(self, cfg):
         print("[Navigation Environment]: Initializing Env...")
@@ -39,6 +40,12 @@ class NavigationEnv(IsaacEnv):
             if not os.path.isabs(dataset_path):
                 project_dir = os.path.dirname(os.path.dirname(__file__))
                 dataset_path = os.path.join(project_dir, dataset_path)
+            if not os.path.isfile(dataset_path):
+                raise FileNotFoundError(
+                    "Evaluation dataset does not exist: "
+                    f"{dataset_path}. Set eval.enabled=false or provide "
+                    "eval.dataset_path."
+                )
             self.eval_scenarios = torch.load(dataset_path, map_location="cpu")
             self._validate_eval_scenarios(self.eval_scenarios, cfg)
             self.terrain_seed = int(self.eval_scenarios["terrain_seed"])
@@ -71,26 +78,65 @@ class NavigationEnv(IsaacEnv):
             physics_dt=self.dt,
             nominal_steps=self.substeps,
         )
-        self.max_command_delay_steps = self.timing_schedule.command_range[1]
-
+        self.command_publish_hz = float(cfg.timing.get("command_publish_hz", 50.0))
+        if self.command_publish_hz <= 0.0:
+            raise ValueError("timing.command_publish_hz must be positive")
+        self.command_publish_period = 1.0 / self.command_publish_hz
+        if self.command_publish_period + 1e-9 < self.dt:
+            raise ValueError(
+                "timing.command_publish_hz cannot exceed the physics frequency"
+            )
         # The policy selects world-frame velocity commands. active_cmd_vel is
-        # visible to the low-level controller. Actor outputs enter a persistent
-        # FIFO after inference and become active when transport finishes.
+        # visible to the low-level controller. A separate periodic publisher
+        # republishes the latest completed Actor output into an ordered,
+        # delayed command channel.
         self.active_cmd_vel = torch.zeros(
             self.num_envs, 3, dtype=torch.float, device=self.device
         )
         self.pending_cmd_vel = torch.zeros_like(self.active_cmd_vel)
+        self.latest_actor_cmd_vel = torch.zeros_like(self.active_cmd_vel)
         self.next_pending_cmd_vel = torch.zeros_like(self.active_cmd_vel)
         self.inference_delay = torch.zeros(
             self.num_envs, 1, dtype=torch.float, device=self.device
         )
+        self.latest_actor_inference_delay = torch.zeros_like(self.inference_delay)
+        self.latest_actor_sampled_inference_delay = torch.zeros_like(
+            self.inference_delay
+        )
+        self.latest_actor_completion_time = torch.zeros_like(
+            self.inference_delay
+        )
         self.command_delay = torch.zeros_like(self.inference_delay)
+        self.publisher_wait_delay = torch.zeros_like(self.inference_delay)
+        self.transport_delay = torch.zeros_like(self.inference_delay)
         self.total_delay = torch.zeros_like(self.inference_delay)
         self.transition_dt = torch.full_like(self.inference_delay, self.reference_dt)
         self.command_age_at_update = torch.zeros_like(self.inference_delay)
         self.active_command_age = torch.zeros_like(self.inference_delay)
+        self.has_active_command = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.has_latest_actor_command = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.actor_sequence = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.latest_actor_sequence = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
+        self.last_applied_actor_sequence = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
+        self.command_sequence = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.last_applied_sequence = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
         self.pending_command_age = torch.zeros_like(self.inference_delay)
         self.command_queue_depth = torch.zeros_like(self.inference_delay)
+        self.command_publish_elapsed = torch.zeros_like(self.inference_delay)
         self._command_queue = []
         self.reward_gamma = float(cfg.algo.get("gamma", 0.99))
         if not 0.0 < self.reward_gamma <= 1.0:
@@ -386,11 +432,12 @@ class NavigationEnv(IsaacEnv):
 
 
     def _set_specs(self):
-        # Original navigation state (8), applied cmd_vel (3), next queued
-        # cmd_vel (3), last measured delays (3), pending age (1), queue depth
-        # (1). Commands are expressed in the goal frame; no future sampled
-        # delay is exposed to the policy.
-        observation_dim = 19
+        # Preserve the baseline navigation state (8) and append only the two
+        # causal timing features used by the policy:
+        # observation -> Actor inference delay, and Actor output -> controller
+        # apply delay. Command transport state remains internal to simulation.
+        # Command transport state remains internal to the simulation.
+        observation_dim = 10
         num_dim_each_dyn_obs_state = 10
 
         # Observation Spec
@@ -438,6 +485,8 @@ class NavigationEnv(IsaacEnv):
             "truncated": UnboundedContinuousTensorSpec(1),
             "inference_delay": UnboundedContinuousTensorSpec(1),
             "command_delay": UnboundedContinuousTensorSpec(1),
+            "publisher_wait_delay": UnboundedContinuousTensorSpec(1),
+            "transport_delay": UnboundedContinuousTensorSpec(1),
             "total_delay": UnboundedContinuousTensorSpec(1),
             "sampled_inference_delay": UnboundedContinuousTensorSpec(1),
             "sampled_command_delay": UnboundedContinuousTensorSpec(1),
@@ -446,6 +495,7 @@ class NavigationEnv(IsaacEnv):
             "command_age_at_update": UnboundedContinuousTensorSpec(1),
             "pending_command_age": UnboundedContinuousTensorSpec(1),
             "command_queue_depth": UnboundedContinuousTensorSpec(1),
+            "command_publish_count": UnboundedContinuousTensorSpec(1),
             "command_update_count": UnboundedContinuousTensorSpec(1),
             "controller_update_count": UnboundedContinuousTensorSpec(1),
             "episode_time": UnboundedContinuousTensorSpec(1),
@@ -538,15 +588,29 @@ class NavigationEnv(IsaacEnv):
         self.prev_drone_vel_w[env_ids] = 0.
         self.active_cmd_vel[env_ids] = 0.
         self.pending_cmd_vel[env_ids] = 0.
+        self.latest_actor_cmd_vel[env_ids] = 0.
         self.next_pending_cmd_vel[env_ids] = 0.
         self.inference_delay[env_ids] = 0.
+        self.latest_actor_inference_delay[env_ids] = 0.
+        self.latest_actor_sampled_inference_delay[env_ids] = 0.
+        self.latest_actor_completion_time[env_ids] = 0.
         self.command_delay[env_ids] = 0.
+        self.publisher_wait_delay[env_ids] = 0.
+        self.transport_delay[env_ids] = 0.
         self.total_delay[env_ids] = 0.
         self.transition_dt[env_ids] = self.nominal_command_dt
         self.command_age_at_update[env_ids] = 0.
         self.active_command_age[env_ids] = 0.
+        self.has_active_command[env_ids] = False
+        self.has_latest_actor_command[env_ids] = False
+        self.actor_sequence[env_ids] = 0
+        self.latest_actor_sequence[env_ids] = -1
+        self.last_applied_actor_sequence[env_ids] = -1
+        self.command_sequence[env_ids] = 0
+        self.last_applied_sequence[env_ids] = -1
         self.pending_command_age[env_ids] = 0.
         self.command_queue_depth[env_ids] = 0.
+        self.command_publish_elapsed[env_ids] = 0.
         self.episode_time[env_ids] = 0.
         if env_ids.numel() == self.num_envs:
             self._command_queue.clear()
@@ -592,89 +656,215 @@ class NavigationEnv(IsaacEnv):
         self,
         command: torch.Tensor,
         mask: torch.Tensor,
-        command_age_steps: torch.Tensor,
-        inference_delay: float,
+        inference_delay: torch.Tensor,
+        publisher_wait_delay: torch.Tensor,
+        transport_delay: torch.Tensor,
+        sequence: torch.Tensor,
+        actor_sequence: torch.Tensor,
     ):
         mask = mask.reshape(self.num_envs)
-        self.command_age_at_update[mask] = self.active_command_age[mask]
         self.active_cmd_vel[mask] = command[mask]
-        self.active_command_age[mask] = 0.
-        actual_command_delay = command_age_steps[mask].unsqueeze(-1) * self.dt
-        self.command_delay[mask] = actual_command_delay
-        self.total_delay[mask] = inference_delay + actual_command_delay
-        self.stats["command_update_count"][mask] += 1.
+        self.last_applied_sequence[mask] = sequence.reshape(self.num_envs)[mask]
+
+        actor_sequence = actor_sequence.reshape(self.num_envs)
+        new_actor_command = mask & actor_sequence.gt(
+            self.last_applied_actor_sequence
+        )
+        previous_command_duration = self.active_command_age[new_actor_command].clone()
+        previous_command_duration[
+            ~self.has_active_command[new_actor_command]
+        ] = 0.0
+        self.command_age_at_update[new_actor_command] = previous_command_duration
+        self.active_command_age[new_actor_command] = 0.
+        # command_delay is the measured Actor-completion -> controller-apply
+        # delay. It is updated for every packet actually accepted by the
+        # controller, including a 50 Hz re-publication of the same Actor value.
+        actual_actor_to_controller_delay = (
+            publisher_wait_delay + transport_delay
+        )
+        self.command_delay[mask] = actual_actor_to_controller_delay[mask]
+        self.publisher_wait_delay[mask] = publisher_wait_delay[mask]
+        self.transport_delay[mask] = transport_delay[mask]
+        self.total_delay[mask] = (
+            inference_delay[mask] + actual_actor_to_controller_delay[mask]
+        )
+        self.has_active_command[new_actor_command] = True
+        self.last_applied_actor_sequence[new_actor_command] = actor_sequence[
+            new_actor_command
+        ]
+        self.stats["command_update_count"][new_actor_command] += 1.
+
+    def _complete_actor_inference(
+        self,
+        command: torch.Tensor,
+        valid_mask: torch.Tensor,
+        measured_inference_delay: torch.Tensor,
+        sampled_inference_delay: float,
+    ):
+        valid_mask = valid_mask.reshape(self.num_envs)
+        self.latest_actor_cmd_vel[valid_mask] = command[valid_mask]
+        self.latest_actor_inference_delay[valid_mask] = measured_inference_delay[
+            valid_mask
+        ]
+        self.latest_actor_sampled_inference_delay[valid_mask] = float(
+            sampled_inference_delay
+        )
+        self.latest_actor_completion_time[valid_mask] = self.episode_time[
+            valid_mask
+        ]
+        self.latest_actor_sequence[valid_mask] = self.actor_sequence[valid_mask]
+        self.actor_sequence[valid_mask] += 1
+        self.has_latest_actor_command[valid_mask] = True
 
     def _enqueue_command(
         self,
         command: torch.Tensor,
-        delay_steps: int,
+        delay_steps,
         valid_mask: torch.Tensor,
-        inference_delay: float,
+        inference_delay: torch.Tensor,
+        publisher_wait_delay: torch.Tensor,
+        actor_sequence: torch.Tensor,
     ):
         valid_mask = valid_mask.reshape(self.num_envs).clone()
-        if delay_steps == 0 and not self._command_queue:
-            self._apply_command(
-                command,
-                valid_mask,
-                command_age_steps=torch.zeros(
-                    self.num_envs, dtype=torch.long, device=self.device
-                ),
-                inference_delay=inference_delay,
-            )
-            return
+        inference_delay = inference_delay.reshape(self.num_envs, 1)
+        publisher_wait_delay = publisher_wait_delay.reshape(self.num_envs, 1)
+        actor_sequence = actor_sequence.reshape(self.num_envs).clone()
+        sequence = self.command_sequence.clone()
+        self.command_sequence[valid_mask] += 1
 
-        scheduled_steps = torch.full(
-            (self.num_envs,),
-            int(delay_steps),
-            dtype=torch.long,
-            device=self.device,
-        )
-        tail_remaining = torch.zeros_like(scheduled_steps)
-        for entry in self._command_queue:
-            tail_remaining = torch.where(
-                entry["valid"], entry["remaining_steps"], tail_remaining
+        if torch.is_tensor(delay_steps):
+            scheduled_steps = delay_steps.reshape(self.num_envs).to(
+                device=self.device, dtype=torch.long
+            ).clone()
+        else:
+            scheduled_steps = torch.full(
+                (self.num_envs,),
+                int(delay_steps),
+                dtype=torch.long,
+                device=self.device,
             )
-        # ROS transports preserve publication order per environment. A newer
-        # command may share an arrival boundary with the FIFO tail, but cannot
-        # overtake it.
-        scheduled_steps = torch.maximum(scheduled_steps, tail_remaining)
+
+        # Preserve publication order. Every message waits at least its sampled
+        # delay; when the channel is backlogged it may wait longer behind an
+        # earlier publication.
+        for entry in self._command_queue:
+            scheduled_steps = torch.where(
+                valid_mask & entry["valid"],
+                torch.maximum(scheduled_steps, entry["remaining_steps"]),
+                scheduled_steps,
+            )
+
         immediate = valid_mask & scheduled_steps.eq(0)
         self._apply_command(
             command,
             immediate,
-            command_age_steps=torch.zeros_like(scheduled_steps),
             inference_delay=inference_delay,
+            publisher_wait_delay=publisher_wait_delay,
+            transport_delay=torch.zeros_like(inference_delay),
+            sequence=sequence,
+            actor_sequence=actor_sequence,
         )
+
         queued = valid_mask & scheduled_steps.gt(0)
-        self._command_queue.append(
-            {
-                "command": command.clone(),
-                "remaining_steps": scheduled_steps,
-                "age_steps": torch.zeros_like(scheduled_steps),
-                "inference_delay": float(inference_delay),
-                "valid": queued,
-                "retention_steps": max(1, self.max_command_delay_steps),
-            }
+        if queued.any().item():
+            self._command_queue.append(
+                {
+                    "command": command.clone(),
+                    "remaining_steps": scheduled_steps,
+                    "age_steps": torch.zeros_like(scheduled_steps),
+                    "inference_delay": inference_delay.clone(),
+                    "publisher_wait_delay": publisher_wait_delay.clone(),
+                    "sequence": sequence,
+                    "actor_sequence": actor_sequence,
+                    "valid": queued,
+                }
+            )
+
+    def _publish_latest_actor_command(self, publish_mask: torch.Tensor):
+        publish_mask = (
+            publish_mask.reshape(self.num_envs)
+            & self.has_latest_actor_command
         )
+        if not publish_mask.any().item():
+            return
+
+        command_steps, sampled_command_delay = (
+            self.timing_schedule.sample_command(self.training)
+        )
+        self.stats["sampled_command_delay"][publish_mask] = sampled_command_delay
+        self.stats["sampled_total_delay"][publish_mask] = (
+            self.latest_actor_sampled_inference_delay[publish_mask]
+            + sampled_command_delay
+        )
+        self.stats["command_publish_count"][publish_mask] += 1.
+        publisher_wait_delay = (
+            self.episode_time - self.latest_actor_completion_time
+        ).clamp_min(0.0)
+        # The configured 60~150 ms is Actor-completion -> controller-apply.
+        # Remove the time already spent waiting for the next 50 Hz publication
+        # so the delayed transport does not count that interval twice.
+        publisher_wait_steps = torch.round(
+            publisher_wait_delay.squeeze(-1) / self.dt
+        ).to(dtype=torch.long)
+        transport_steps = torch.clamp(
+            int(command_steps) - publisher_wait_steps, min=0
+        )
+        self._enqueue_command(
+            self.latest_actor_cmd_vel,
+            transport_steps,
+            publish_mask,
+            self.latest_actor_inference_delay,
+            publisher_wait_delay,
+            self.latest_actor_sequence,
+        )
+
+    def _advance_command_publisher(self, alive_mask: torch.Tensor):
+        alive_mask = alive_mask.reshape(self.num_envs)
+        self.command_publish_elapsed += self.dt * alive_mask.unsqueeze(-1)
+        publish_tick = alive_mask & self.command_publish_elapsed.squeeze(-1).ge(
+            self.command_publish_period - 1e-9
+        )
+        self.command_publish_elapsed[publish_tick] -= self.command_publish_period
+        self._publish_latest_actor_command(publish_tick)
+        self._refresh_command_queue_state()
 
     def _advance_command_transport(self, alive_mask: torch.Tensor):
         alive_mask = alive_mask.reshape(self.num_envs)
+        due_entries = []
         remaining_entries = []
         for entry in self._command_queue:
             valid = entry["valid"]
             entry["remaining_steps"][valid] -= 1
             entry["age_steps"][valid] += 1
             due = valid & entry["remaining_steps"].le(0)
+            if due.any().item():
+                due_entries.append((entry, due))
+            entry["valid"][due] = False
+            if entry["valid"].any().item():
+                remaining_entries.append(entry)
+
+        # Multiple packets can arrive on one physics tick. Apply only the
+        # newest due packet per environment, and discard packets older than an
+        # already-applied publication.
+        applied = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for entry, due in reversed(due_entries):
+            sequence = entry["sequence"]
+            take = (
+                due
+                & alive_mask
+                & ~applied
+                & sequence.gt(self.last_applied_sequence)
+            )
             self._apply_command(
                 entry["command"],
-                due & alive_mask,
-                command_age_steps=entry["age_steps"],
+                take,
                 inference_delay=entry["inference_delay"],
+                publisher_wait_delay=entry["publisher_wait_delay"],
+                transport_delay=entry["age_steps"].unsqueeze(-1) * self.dt,
+                sequence=sequence,
+                actor_sequence=entry["actor_sequence"],
             )
-            entry["valid"][due] = False
-            entry["retention_steps"] -= 1
-            if entry["retention_steps"] > 0:
-                remaining_entries.append(entry)
+            applied |= take
         self._command_queue = remaining_entries
         self._refresh_command_queue_state()
 
@@ -682,20 +872,26 @@ class NavigationEnv(IsaacEnv):
         self.next_pending_cmd_vel.zero_()
         self.pending_command_age.zero_()
         self.command_queue_depth.zero_()
-        waiting_for_head = torch.ones(
-            self.num_envs, dtype=torch.bool, device=self.device
+        head_remaining = torch.full(
+            (self.num_envs,),
+            torch.iinfo(torch.long).max,
+            dtype=torch.long,
+            device=self.device,
         )
         for entry in self._command_queue:
             valid = entry["valid"]
             self.command_queue_depth[valid] += 1.
-            take = valid & waiting_for_head
+            take = valid & entry["remaining_steps"].lt(head_remaining)
             self.next_pending_cmd_vel[take] = entry["command"][take]
             self.pending_command_age[take] = (
                 entry["age_steps"][take].unsqueeze(-1) * self.dt
             )
-            waiting_for_head[take] = False
+            head_remaining[take] = entry["remaining_steps"][take]
 
     def _advance_physics_tick(self, render_step: int, alive_mask: torch.Tensor):
+        # Apply transport completions before this control cycle so a command
+        # whose countdown reaches zero is used by the controller immediately.
+        self._advance_command_transport(alive_mask)
         self._apply_velocity_control()
         self.sim.step(self._should_render(render_step))
         if self.cfg.env_dyn.num_obstacles != 0:
@@ -705,7 +901,6 @@ class NavigationEnv(IsaacEnv):
         self.episode_time += self.dt * alive
         self.active_command_age += self.dt * alive
         self.stats["controller_update_count"] += alive
-        self._advance_command_transport(alive_mask)
         self._stats_mask = alive
         self._record_physics_step = True
         try:
@@ -715,33 +910,19 @@ class NavigationEnv(IsaacEnv):
 
     def _update_observation_timing(self, tensordict: TensorDictBase):
         state_key = ("agents", "observation", "state")
-        direction_key = ("agents", "observation", "direction")
         state = tensordict[state_key]
-        direction = tensordict[direction_key]
-        active_cmd_goal = vec_to_new_frame(
-            self.active_cmd_vel.unsqueeze(1), direction
-        ).squeeze(1)
-        pending_cmd_goal = vec_to_new_frame(
-            self.next_pending_cmd_vel.unsqueeze(1), direction
-        ).squeeze(1)
-        state[..., 8:11] = active_cmd_goal
-        state[..., 11:14] = pending_cmd_goal
-        state[..., 14:15] = self.inference_delay / self.reference_dt
-        state[..., 15:16] = self.command_delay / self.reference_dt
-        state[..., 16:17] = self.total_delay / self.reference_dt
-        state[..., 17:18] = self.pending_command_age / self.reference_dt
-        state[..., 18:19] = self.command_queue_depth
+        state[..., 8:9] = self.inference_delay / self.reference_dt
+        state[..., 9:10] = self.command_delay / self.reference_dt
 
     def _step(self, tensordict: TensorDictBase):
-        timing = self.timing_schedule.sample(self.training)
+        inference_steps, sampled_inference_delay = (
+            self.timing_schedule.sample_inference(self.training)
+        )
+        elapsed_steps = max(self.substeps, inference_steps)
         self.pending_cmd_vel.copy_(self._read_actor_command(tensordict))
+        observation_time = self.episode_time.clone()
 
-        sampled_inference_delay = timing.inference_steps * self.dt
-        sampled_command_delay = timing.command_steps * self.dt
-        sampled_total_delay = sampled_inference_delay + sampled_command_delay
         self.stats["sampled_inference_delay"].fill_(sampled_inference_delay)
-        self.stats["sampled_command_delay"].fill_(sampled_command_delay)
-        self.stats["sampled_total_delay"].fill_(sampled_total_delay)
         self.transition_dt.zero_()
 
         self.progress_buf += 1
@@ -755,23 +936,25 @@ class NavigationEnv(IsaacEnv):
         truncated = torch.zeros_like(terminated)
         step_tensordict = None
         render_step = 0
-        command_enqueued = False
+        actor_completed = False
 
         # Zero inference latency makes the actor output available at the start
         # of this nominal control interval.
-        if timing.inference_steps == 0:
+        if inference_steps == 0:
             valid = ~(terminated | truncated)
-            self.inference_delay[valid] = sampled_inference_delay
-            self._enqueue_command(
+            measured_inference_delay = (
+                self.episode_time - observation_time
+            ).clamp_min(0.0)
+            self.inference_delay[valid] = measured_inference_delay[valid]
+            self._complete_actor_inference(
                 self.pending_cmd_vel,
-                timing.command_steps,
                 valid,
+                measured_inference_delay,
                 sampled_inference_delay,
             )
-            self._refresh_command_queue_state()
-            command_enqueued = True
+            actor_completed = True
 
-        while render_step < timing.elapsed_steps:
+        while render_step < elapsed_steps:
             alive = ~(terminated | truncated)
             self.transition_dt += self.dt * alive.float()
             step_tensordict = self._advance_physics_tick(render_step, alive)
@@ -784,28 +967,34 @@ class NavigationEnv(IsaacEnv):
             truncated |= self.truncated
             render_step += 1
 
-            # The actor output appears after inference_steps. Its transport
-            # countdown starts from this boundary and overlaps future inference.
-            if not command_enqueued and render_step == timing.inference_steps:
+            # Actor completion only updates the value seen by the independent
+            # 50 Hz command publisher.
+            if not actor_completed and render_step == inference_steps:
                 valid = ~(terminated | truncated)
-                self.inference_delay[valid] = sampled_inference_delay
-                self._enqueue_command(
+                measured_inference_delay = (
+                    self.episode_time - observation_time
+                ).clamp_min(0.0)
+                self.inference_delay[valid] = measured_inference_delay[valid]
+                self._complete_actor_inference(
                     self.pending_cmd_vel,
-                    timing.command_steps,
                     valid,
+                    measured_inference_delay,
                     sampled_inference_delay,
                 )
-                self._refresh_command_queue_state()
-                command_enqueued = True
+                actor_completed = True
 
-        if not command_enqueued:
-            raise RuntimeError("Actor command was not enqueued after inference")
+            self._advance_command_publisher(~(terminated | truncated))
+
+        if not actor_completed:
+            raise RuntimeError("Actor output did not complete after inference")
 
         self.reward = transition_reward
         self.terminated = terminated
         self.truncated = truncated
         self.stats["inference_delay"] = self.inference_delay
         self.stats["command_delay"] = self.command_delay
+        self.stats["publisher_wait_delay"] = self.publisher_wait_delay
+        self.stats["transport_delay"] = self.transport_delay
         self.stats["total_delay"] = self.total_delay
         self.stats["transition_dt"] = self.transition_dt
         self.stats["command_age_at_update"] = self.command_age_at_update
@@ -865,31 +1054,19 @@ class NavigationEnv(IsaacEnv):
         vel_w = self.root_state[..., 7:10] # world vel
         vel_g = vec_to_new_frame(vel_w, target_dir_2d)   # coordinate change for velocity
 
-        # The first eight values preserve the baseline state layout. Timing-aware
-        # checkpoints additionally observe applied/queued commands and only
-        # timing values that are causally available at this boundary.
+        # The first eight values preserve the baseline state layout. The only
+        # additional policy inputs are the latest measured stage delays.
         drone_state = torch.cat(
             [rpos_clipped_g, distance_2d, distance_z, vel_g], dim=-1
-        ).squeeze(1)
-        active_cmd_goal = vec_to_new_frame(
-            self.active_cmd_vel.unsqueeze(1), target_dir_2d
-        ).squeeze(1)
-        pending_cmd_goal = vec_to_new_frame(
-            self.next_pending_cmd_vel.unsqueeze(1), target_dir_2d
         ).squeeze(1)
         timing_state = torch.cat(
             [
                 self.inference_delay / self.reference_dt,
                 self.command_delay / self.reference_dt,
-                self.total_delay / self.reference_dt,
-                self.pending_command_age / self.reference_dt,
-                self.command_queue_depth,
             ],
             dim=-1,
         )
-        drone_state = torch.cat(
-            [drone_state, active_cmd_goal, pending_cmd_goal, timing_state], dim=-1
-        )
+        drone_state = torch.cat([drone_state, timing_state], dim=-1)
 
         if (self.cfg.env_dyn.num_obstacles != 0):
             # ---------Network Input III: Dynamic obstacle states--------
@@ -1032,6 +1209,8 @@ class NavigationEnv(IsaacEnv):
             )
             self.stats["inference_delay"] = self.inference_delay
             self.stats["command_delay"] = self.command_delay
+            self.stats["publisher_wait_delay"] = self.publisher_wait_delay
+            self.stats["transport_delay"] = self.transport_delay
             self.stats["total_delay"] = self.total_delay
             self.stats["transition_dt"] = self.transition_dt
             self.stats["command_age_at_update"] = self.command_age_at_update

@@ -142,6 +142,10 @@ def main(cfg):
         transition_dt = data["next", "stats", "transition_dt"].float()
         inference_delay = data["next", "stats", "inference_delay"].float()
         command_delay = data["next", "stats", "command_delay"].float()
+        publisher_wait_delay = data[
+            "next", "stats", "publisher_wait_delay"
+        ].float()
+        transport_delay = data["next", "stats", "transport_delay"].float()
         total_delay = data["next", "stats", "total_delay"].float()
         sampled_inference_delay = data[
             "next", "stats", "sampled_inference_delay"
@@ -157,6 +161,9 @@ def main(cfg):
         ].float()
         command_queue_depth = data[
             "next", "stats", "command_queue_depth"
+        ].float()
+        command_publish_count = data[
+            "next", "stats", "command_publish_count"
         ].float()
         batch_sim_time_seconds = (
             transition_dt.sum().item() / transformed_env.num_envs
@@ -186,6 +193,12 @@ def main(cfg):
                 inference_delay.mean().item()
             ),
             "timing/mean_measured_command_delay": command_delay.mean().item(),
+            "timing/mean_publisher_wait_delay": (
+                publisher_wait_delay.mean().item()
+            ),
+            "timing/mean_measured_transport_delay": (
+                transport_delay.mean().item()
+            ),
             "timing/mean_measured_total_delay": total_delay.mean().item(),
             "timing/mean_sampled_inference_delay": (
                 sampled_inference_delay.mean().item()
@@ -201,6 +214,9 @@ def main(cfg):
             ),
             "timing/mean_command_queue_depth": (
                 command_queue_depth.mean().item()
+            ),
+            "timing/mean_command_publish_count": (
+                command_publish_count.mean().item()
             ),
         }
 

@@ -1,8 +1,8 @@
 # NavRL 延时训练对照实验结果与分析
 
-本文档说明当前仓库中 `training`（无延时）和 `training_delay`（随机 Actor 推理延时 + 异步命令传输延时）两套实验的代码流程、配置、统计口径和运行方法。
+本文档说明当前仓库中 `training`（无延时）和 `training_delay`（随机 Actor 推理延时 + 50 Hz 发布 + 异步命令传输延时）两套实验的代码流程、配置、统计口径和运行方法。
 
-> **版本说明（2026-08-31）**：当前代码和 0.1 节结果使用“双阶段随机延时”模型，即 Actor 推理延时与异步 FIFO command 传输延时。0.2～0.4 节保留的是旧版随机动作保持实验，只能用于历史追溯，不能与当前结果混合统计。当前延时网络使用 19 维状态，旧版 9 维 `training_delay` checkpoint 与当前网络不兼容。
+> **版本说明（2026-09-01）**：当前代码使用“双阶段随机延时”模型。Actor 完成后更新 latest output，独立 50 Hz 发布器重复发布该值，再经过有序的随机延时通道到达控制器。0.2～0.4 节保留的是旧版实验，只能用于历史追溯。当前延时网络使用 10 维状态（基线 8 维 + 两个最近实测量），旧版 checkpoint 与当前网络不兼容。
 
 ## 0. 实验结果摘要
 
@@ -15,12 +15,12 @@
 
 两份策略均在物理 GPU 1 上运行，使用同一批 1024 个固定场景、`seed=0`、完整 2200 policy step rollout、相同的 Actor 推理延时序列和相同的 command 传输延时序列。这里的“无延时训练基线”只表示它在无延时环境中训练；本次评估本身对两份策略都施加了双阶段随机延时。
 
-双阶段延时条件如下：
+下表是历史评估使用的延时条件；当前配置中的 command 范围已经改为较小的实机控制链路估计值 0.060～0.150 s。
 
 | 延时阶段 | 配置范围 | physics tick | 本次 2200 步序列均值 |
 |---|---:|---:|---:|
 | Actor 推理延时 | 0.016～0.096 s | 1～6 | 0.04102 s |
-| command 传输延时 | 0.016～0.032 s | 1～2 | 0.02324 s |
+| command 传输延时（历史评估） | 0.016～0.032 s | 1～2 | 0.02324 s |
 
 延时采用 `change_probability=0.2`、`max_step_change=1` 的随机游走。推理延时 1～6 tick 在本次序列中分别出现 `648/556/462/285/140/109` 次；command 延时 1/2 tick 分别出现 `1204/996` 次。
 
@@ -48,9 +48,9 @@
 为什么加入延时训练后 Reach Goal 反而更高：
 
 1. **比较的是两种训练方式在同一个双延时测试环境中的表现。** 延时并没有让任务本身变简单；无延时基线遇到了训练时没有见过的观测陈旧和命令滞后，而双阶段策略训练时已覆盖这些扰动。
-2. **当前模型允许策略看到因果上可获得的时序状态。** 19 维状态包含当前执行的 `cmd_vel`、FIFO 头命令、已完成的两段延时、等待年龄和队列深度。策略可以根据“控制器实际正在执行什么”修正下一条命令；8 维基线没有这些信息。
+2. **当前模型允许策略看到因果上可获得的时序状态。** 10 维状态只在基线 8 维状态后追加最近一次实际观测到 Actor 推理延时和最近一次 Actor 输出到控制器采用的实际延时；8 维基线没有这些信息。
 3. **随机延时训练是一种时序域随机化。** 它牺牲理想无延时条件下的单一最优控制，换取对一组推理和传输时延的鲁棒性，因此在随机延时测试分布上高于无延时基线是合理结果。
-4. **当前提升不是旧版动作保持的低通滤波假象。** command 在 Actor 推理完成后才进入 FIFO，传输倒计时与下一次推理重叠；`VelController` 每个 physics tick 都闭环运行，保持的是当前 active `cmd_vel`，不是电机动作。
+4. **历史提升不是旧版动作保持的低通滤波假象。** command 传输倒计时与下一次推理重叠；`VelController` 每个 physics tick 都闭环运行，保持的是当前 active `cmd_vel`，不是电机动作。当前 50 Hz 发布模型需要重新训练和评估，不能直接沿用本表数值。
 5. **结论仍受单 seed 限制。** 当前差值足以说明这一次固定场景下存在明显鲁棒性收益，但论文结论仍需多 seed 均值、标准差或置信区间。
 
 原始 YAML：
@@ -124,7 +124,7 @@ delay_value/videos/checkpoint_8000_two_stage_random/delay.mp4
 2. **延时曲线较高的主要原因是训练横轴不等价。** 例如 delay 在约 1489 step 达到 `reach_goal=0.871`，无延时在约 6728 step 达到约 `0.876`；按物理训练时间对齐后，两者处于相近水平。
 3. **旧动作保持模型可能带来额外稳定性。** 历史结果中的 delay 实现是随机 zero-order hold：一个动作被 VelController 转成电机动作后保持 2～8 个 physics step。这会减少高频动作变化，但它不是当前双阶段延时代码。
 4. **旧奖励实现会使 delay 的 return 偏高。** 之前平滑惩罚按决策次数计算，而主要奖励按 `time_scale` 放大，delay 在相同物理时间内支付的平滑惩罚次数更少。当前代码已将平滑项一起乘以 `time_scale`，后续实验应使用新代码重新训练。
-5. **当前双阶段结果与旧结果不能纵向比较数值。** 两者的网络输入、延时因果关系、奖励累计和评估 horizon 均不同。当前实验应该以 2026-08-31 的 19 维 checkpoint 和双阶段 FIFO 结果为准。
+5. **当前双阶段结果与旧结果不能纵向比较数值。** 两者的网络输入、延时因果关系、奖励累计和评估 horizon 均不同。历史结果使用的是旧的 19 维 FIFO 实现；新的训练应以 10 维、50 Hz 发布实现重新产生 checkpoint 和评估结果。
 6. **训练曲线仍应按物理时间对齐。** 当前 W&B 已记录 `policy_frames`、`physics_frames`、`sim_time_seconds` 和 `wall_time_seconds`。比较样本效率、仿真经历和计算成本时应分别选择对应横轴。
 
 ### 0.6 本实验的结论边界
@@ -152,16 +152,13 @@ isaac-training/
 │   └── scripts/{env,ppo,train,eval}.py
 ├── training_delay/                   # 双阶段延时训练
 │   ├── cfg/train.yaml
-│   └── scripts/{env,timing,ppo,train,utils}.py
+│   ├── cfg/eval_random.yaml
+│   └── scripts/{env,timing,ppo,train,eval,eval_random_delay,utils}.py
 └── delay_value/                      # 双阶段延时评估归档
-    ├── cfg/eval_random.yaml
-    ├── environments/fixed_scenarios.pt
-    ├── scripts/{eval_env,eval_random_delay,env,timing,ppo}.py
-    ├── results/
-    └── videos/
+    └── 历史结果与旧版评估脚本
 ```
 
-当前固定评估场景数据集为 `isaac-training/delay_value/environments/fixed_scenarios.pt`。它只固定起点、目标点、地形随机种子和障碍物配置；仿真、观测、奖励、控制器和双延时执行逻辑仍来自 `training_delay` 的 `NavigationEnv`。
+当前配置默认从 `isaac-training/training/cfg/eval_env.pt` 加载固定评估场景。它只固定起点、目标点、地形随机种子和障碍物配置；仿真、观测、奖励、控制器和双延时执行逻辑仍来自 `training_delay` 的 `NavigationEnv`。
 
 ## 3. 环境与仿真参数
 
@@ -198,59 +195,65 @@ training_delay: cfg/train.yaml 中 gpu_id=1，即 cuda:1
   -> 映射到 [-2, 2] m/s 的局部速度
   -> 转换到世界坐标系
   -> Actor 推理延时（控制器继续执行旧 cmd_vel）
-  -> Actor 输出进入 command FIFO
+  -> 推理完成，只更新 latest_actor_cmd_vel
   -> 立即开始下一次 Actor 推理
-  -> FIFO 命令传输到期后更新 active cmd_vel
+  -> 独立 50 Hz 发布器周期性读取 latest_actor_cmd_vel
+  -> 每次发布重新采样 command 传输延时
+  -> 有序传输到期后更新 active cmd_vel
   -> VelController（始终每个 physics tick 闭环运行）
   -> LeePositionController
   -> 四旋翼电机动作
   -> Isaac Sim physics
 ```
 
-当前采用 `overlapping_transport`。动作基于推理开始时的观测；推理完成后，该动作进入 FIFO，命令传输倒计时与下一次 Actor 推理同时进行。FIFO 保证后发命令不能超过先发命令。`LeePositionController` 源码没有修改，并且在每个 `0.016 s` physics tick 都根据当前无人机状态重新计算电机动作，因此保持的是速度设定值，不是电机输出。
+当前采用 `overlapping_transport`。动作基于推理开始时的观测；推理完成只覆盖发布器持有的 latest output，不会立刻创建传输任务。50 Hz 时钟到达后，发布器读取当时最新的 Actor 输出，并采样该 Actor 输出到控制器采用的目标延时；目标延时减去已经等待的发布器时间后，才作为发布后的传输倒计时。传输倒计时与下一次推理和后续发布同时进行；后发报文不能越过先发报文，同一 tick 到期时只应用最新发布。`LeePositionController` 源码没有修改，并且在每个 `0.016 s` physics tick 都根据当前无人机状态重新计算电机动作，因此保持的是速度设定值，不是电机输出。
 
-一次只存在一个 Actor 推理任务，但可同时存在推理任务和传输中的命令。由于 1024 个 Isaac 环境共享同一个仿真时钟，当前整批环境共享同一条推理/延时采样序列，但每个环境的 FIFO 有独立有效状态，episode reset 会单独清除该环境的旧命令。
+一次只存在一个 Actor 推理任务，但可同时存在推理任务和多条传输中的发布报文。发布器会重复发布同一 Actor 输出，直到新推理完成后 latest output 被覆盖。由于 1024 个 Isaac 环境共享仿真时钟，当前整批环境共享同一条延时采样序列；每个环境的在途报文有独立有效状态和序号，episode reset 会单独清除该环境的旧报文。
 
 ## 5. 双阶段延时机制
 
 ### 5.1 问题定义
 
-实机从一次观测到速度命令真正被控制器采用，包含两个物理含义不同的阶段：
+实机从一次观测到速度命令真正被控制器采用，当前拆为以下时间点：
 
 ```text
-t_obs             t_actor_done              t_controller_apply
-  |--------------------|----------------------------|
-       inference delay          command delay
+t_obs       t_actor_done       t_publish       t_controller_apply
+  |---------------|---------------|-------------------|
+    inference       publisher wait      transport
 ```
 
 定义：
 
 ```text
-d_infer = t_actor_done - t_obs
-d_cmd   = t_controller_apply - t_actor_done
-d_total = d_infer + d_cmd
+d_infer    = t_actor_done - t_obs
+d_pub_wait = t_publish - t_actor_done
+d_transport = t_controller_apply - t_publish
+d_total    = d_infer + d_pub_wait + d_transport
 ```
 
-`d_infer` 表示图像/激光预处理、网络传输和 Actor 前向推理造成的观测陈旧；`d_cmd` 表示 Actor 已经产生动作后，到 ROS/通信链路和控制线程真正采用该 `cmd_vel` 的等待时间。两者不能简单合并成一个动作保持时间，因为 command 在传输时，系统可以开始处理下一次观测和推理。
+`d_infer` 表示图像/激光预处理和 Actor 前向推理造成的观测陈旧；`d_pub_wait` 是推理完成后等待下一次 50 Hz 发布时刻的时间；`d_transport` 是发布后到控制器采用该 `cmd_vel` 的时间。三者不能简单实现成一个动作保持，因为等待期间 Actor、发布器和控制器仍按各自时钟运行。
 
 ### 5.2 当前配置
 
-`training_delay/cfg/train.yaml` 和 `delay_value/cfg/eval_random.yaml` 的核心配置为：
+`training_delay/cfg/train.yaml` 和 `training_delay/cfg/eval_random.yaml` 的核心配置为：
 
 ```yaml
 timing:
   enabled: true
   mode: overlapping_transport
-  randomize_in_eval: false
+  sampling_mode: random_walk_steps
+  command_sampling_mode: random_walk_steps
+  command_publish_hz: 50.0
+  randomize_in_eval: true
   reference_dt: 0.016
   inference_delay:
     min: 0.016
     max: 0.096
     eval: 0.032
   command_delay:
-    min: 0.016
-    max: 0.032
-    eval: 0.016
+    min: 0.060
+    max: 0.150
+    eval: 0.100
   change_probability: 0.2
   max_step_change: 1
 ```
@@ -262,29 +265,31 @@ timing:
 | 项目 | 时间范围 | tick 范围 | 对应频率/含义 |
 |---|---:|---:|---|
 | Actor 推理周期 | 0.016～0.096 s | 1～6 | 62.5～10.42 Hz 的策略更新频率 |
-| command 传输 | 0.016～0.032 s | 1～2 | Actor 完成后额外等待 1～2 tick |
-| 单条命令观测到执行 | 0.032～0.128 s | 2～8 | 两段延时之和 |
+| cmd_vel 发布周期 | 平均 0.020 s | 受 physics tick 量化 | 独立于 Actor 更新频率 |
+| Actor 输出到控制器采用 | 0.060～0.150 s | 4～9 | 每次 50 Hz 发布单独采样，包含发布等待 |
+| 观测到控制器采用 | 约 0.080～0.272 s | 推理 + 0～0.032 s 发布等待 + 传输 | 不含机体动力学响应 |
 
-两个阶段各自维护一个随机游走状态。每次 Actor 决策时，每一段以概率 `0.2` 尝试改变，变化量从 `-1/0/+1` tick 中采样，并裁剪到各自范围。当前 1024 个并行环境共享仿真时钟和同一对延时采样值，这与批量同步推理一致；每个环境的 FIFO 有独立 valid mask，单个 episode reset 不会把其他环境的命令清空。
+两个随机阶段各自维护随机游走状态。推理延时在每次 Actor 决策开始时采样；command 延时在每次 50 Hz 发布时采样。每次以概率 `0.2` 尝试改变，变化量从 `-1/0/+1` tick 中采样并裁剪到范围内。当前 1024 个并行环境共享仿真时钟和采样值；每个环境的在途报文有独立 valid mask，单个 episode reset 不会把其他环境的报文清空。
 
-### 5.3 异步重叠与 FIFO
+### 5.3 Actor、50 Hz 发布和有序传输
 
-一次外层 PPO transition 对应一次 Actor 推理周期，而不是 `d_infer+d_cmd`：
+一次外层 PPO transition 对应一次 Actor 推理周期，而不是整段端到端延时：
 
 ```text
 观测 O_k
   -> Actor 推理 d_infer(k)
-  -> 产生 cmd_k 并压入 FIFO，记录 d_cmd(k)
+  -> 产生 cmd_k，覆盖 latest_actor_cmd_vel
   -> 立即开始基于新观测的下一次 Actor 推理
 
 同时：
-FIFO 每个 physics tick 递减剩余传输时间
-  -> cmd_k 到期
-  -> 更新 active_cmd_vel
+50 Hz 发布时钟到达
+  -> 快照 latest_actor_cmd_vel
+  -> 采样 d_transport 并进入有序通道
+  -> 报文到期后更新 active_cmd_vel
   -> VelController 从下一 physics tick 起使用新设定值
 ```
 
-因此 command 传输与下一次 Actor 推理重叠。FIFO 保证后发布命令不能越过先发布命令；多个命令可同时处于等待状态。episode reset 时，该环境尚未执行的命令会失效，避免上一 episode 的 command 泄漏到下一 episode。
+因此发布与传输都和下一次 Actor 推理重叠。每次 50 Hz 发布都会为当前 latest Actor 输出重新采样 `0.060~0.150 s` 的端到端目标延时，再扣除该输出已经等待发布器的时间；为保持 ROS 有序传输，若前一报文尚未到期，后一报文不会提前越过它。多个报文同 tick 到期时只采用最新报文。重复发布同一个 Actor 输出可以刷新控制器收到的速度值，但不会被统计成新的 Actor command，也不会重置上一条不同命令的执行时长。episode reset 时，该环境尚未执行的报文会失效。
 
 ### 5.4 `VelController` 的行为
 
@@ -301,13 +306,13 @@ FIFO 每个 physics tick 递减剩余传输时间
 
 ### 5.5 因果观测与不可见信息
 
-策略可以观察最近已经发生的时序状态，包括 active command、FIFO 头 command、最近完成的推理延时、最近执行命令的传输/总延时、当前等待年龄和队列深度。策略不能观察本次尚未完成的未来延时，也不能直接看到 FIFO 还剩多少 tick 才到期，避免把仿真器内部未来信息泄漏给策略。
+策略只观察最近已经完成的 Actor 推理时长，以及最近一次 Actor 输出到控制器采用的实际延时。它不观察发布器相位、在途 payload、剩余传输时间或采样到的未来值，避免把仿真器内部状态泄漏给策略。
 
 采样到但尚未发生的延时只写入 `stats.sampled_inference_delay`、`stats.sampled_command_delay` 和 `stats.sampled_total_delay`，用于实验核对，不进入策略输入。
 
 ### 5.6 公平评估中的随机序列
 
-`delay_value` 使用独立 timing RNG。评估基线和双阶段 checkpoint 前都会用同一 seed 重置该 RNG，因此两份策略按 decision index 得到完全相同的两段延时序列。这个 RNG 与场景 reset 和策略轨迹消耗的随机数隔离，避免某个策略更早碰撞后改变后续延时采样。
+当前 `training_delay` 评估在每个 rollout 前调用 `env.set_seed(seed)` 并重置 timing schedule。使用 `ExplorationType.MEAN` 时，基线和延时策略会从同一 seed 开始采样同一条延时序列；如果改用随机探索，策略本身消耗的随机数可能改变后续时序采样，不能直接视为严格配对。
 
 2026-08-31 评估的 2200 点延时序列为：
 
@@ -326,19 +331,14 @@ mean command delay:         0.02324 s
 
 无延时 PPO 使用 8 维无人机状态：相对目标方向、水平距离、垂直距离和目标坐标系速度。
 
-延时 PPO 使用 19 维状态。前 8 维保持不变，随后增加：
+延时 PPO 使用 10 维状态。前 8 维保持不变，随后增加：
 
 ```text
-控制器当前执行的 cmd_vel（目标坐标系，3维）
-FIFO 头部等待命令的 cmd_vel（目标坐标系，3维）
-last_completed_inference_delay / reference_dt
-last_applied_command_delay / reference_dt
-last_applied_total_delay / reference_dt
-pending_command_age / reference_dt
-command_queue_depth
+last_measured_inference_delay / reference_dt
+interval_between_command_apply_events / reference_dt
 ```
 
-策略只看到已完成的延时和当前已经等待的时间，不会看到“尚需多久到达”或本次未来采样值。这些采样值只写入 `stats.sampled_*`和 W&B 用于核对分布。
+策略只看到已经完成的两段延时，不会看到“尚需多久到达”或本次未来采样值。这些采样值只写入 `stats.sampled_*` 和 W&B 用于核对分布。
 
 ## 7. PPO 训练流程
 
@@ -389,7 +389,7 @@ transition_reward = sum(gamma**j * tick_reward[j])
 
 这样不会再用一次转移最终状态的奖励乘以时间倍数，碰撞、目标和轨迹奖励按真实物理推进累计。
 
-外层 PPO transition 对应一次 Actor 推理，持续时间为该次推理延时（最少一个 nominal tick）。命令传输通过跨 transition FIFO 表示，不再延长 Actor transition。GAE 使用：
+外层 PPO transition 对应一次 Actor 推理，持续时间为该次推理延时（最少一个 nominal tick）。50 Hz 发布和命令传输通过跨 transition 的持久状态表示，不再延长 Actor transition。GAE 使用：
 
 ```python
 time_scale = transition_dt / reference_dt
@@ -411,14 +411,17 @@ trace_decay = lambda_ ** time_scale
 | `stats.decision_count` | 实际 actor 决策次数，随机延时下通常明显小于 2200 |
 | `stats.episode_time` | 真实累计物理时间，最大约 35.2 s |
 | `stats.inference_delay` | 最近一次已完成的 Actor 推理延时 |
-| `stats.command_delay` | 最近一条已执行命令的实际传输/FIFO 等待时间 |
-| `stats.total_delay` | 最近一条已执行命令的实际观测到执行时延 |
-| `stats.sampled_*` | 当前 Actor 任务采样到的瞬时随机延时，仅用于核对，不代表整段 rollout 的均值 |
+| `stats.command_delay` | 最近一次 Actor 输出完成到控制器采用的实际延时，也是网络第 10 维的原始值 |
+| `stats.publisher_wait_delay` | 该 Actor 输出完成后等待下一次 50 Hz 发布的实际时间 |
+| `stats.transport_delay` | 该报文从发布到控制器采用的实际等待时间 |
+| `stats.total_delay` | 对应命令从观测到控制器采用的实际总时间：推理 + 发布等待 + 传输 |
+| `stats.sampled_*` | 最近一次 Actor 或发布事件采样到的随机值，仅用于核对，不进入策略 |
 | `stats.transition_dt` | 当前 PPO transition 覆盖的物理时间 |
 | `stats.command_age_at_update` | 新命令生效时旧命令的年龄 |
-| `stats.pending_command_age` | FIFO 头命令已等待的时间 |
-| `stats.command_queue_depth` | 当前等待执行的命令数 |
-| `stats.command_update_count` | episode 内 active cmd_vel 实际更新次数 |
+| `stats.pending_command_age` | 最早即将到达的在途命令已经等待的时间 |
+| `stats.command_queue_depth` | 当前仍在途的 50 Hz 发布报文数量 |
+| `stats.command_publish_count` | episode 内实际执行的 50 Hz 发布次数 |
+| `stats.command_update_count` | episode 内不同 Actor command 实际生效次数；重复发布不计数 |
 | `stats.controller_update_count` | 低层控制器实际闭环更新次数 |
 | `stats.reach_goal` | episode 内是否到达目标 |
 | `stats.collision` | episode 结束时碰撞状态 |
@@ -491,31 +494,29 @@ python scripts/train.py \
 当前双阶段评估使用：
 
 ```text
-isaac-training/delay_value/environments/fixed_scenarios.pt
+isaac-training/training/cfg/eval_env.pt
 ```
 
-该文件不是环境代码，只保存 1024 个固定起点、目标点、terrain seed 和障碍场景元数据。实际环境类是与 `training_delay/scripts/env.py` 对齐的 `NavigationEnv`，由 `delay_value/scripts/eval_env.py` 检查双阶段延时配置后创建。
+该文件不是环境代码，只保存固定起点、目标点、terrain seed 和障碍场景元数据。实际环境类是 `training_delay/scripts/env.py` 中的 `NavigationEnv`。
 
-正式对照应保持 `fixed_scenarios.pt`、`seed`、`num_envs=1024`、`num_obstacles=200`、`env_dyn.num_obstacles=0`、rollout horizon 和 timing 配置一致。场景固定与延时随机并不冲突：前者控制空间环境，后者测试时序鲁棒性。
+正式对照应保持 `eval_env.pt`、`seed`、`num_envs=1024`、`num_obstacles=200`、`env_dyn.num_obstacles=0`、rollout horizon 和 timing 配置一致。场景固定与延时随机并不冲突：前者控制空间环境，后者测试时序鲁棒性。
 
 ## 13. 随机延时评估
 
 当前评估入口位于独立归档目录：
 
 ```bash
-cd /home/wei/End_to_End/NavRL/isaac-training/delay_value
+cd /home/yimingwei/NavRL/isaac-training/training_delay
 source /home/wei/miniconda3/etc/profile.d/conda.sh
 conda activate NavRL
 python -u scripts/eval_random_delay.py \
-  baseline_checkpoint=/home/wei/End_to_End/NavRL/isaac-training/training/scripts/wandb/run-20260827_204049-ma206url/files/checkpoint_8000.pt \
-  delay_checkpoint=/home/wei/End_to_End/NavRL/isaac-training/training_delay/scripts/wandb/run-20260831_012406-81d8oenb/files/checkpoint_8000.pt \
+  baseline_checkpoint=/path/to/training/checkpoint.pt \
+  delay_checkpoint=/path/to/training_delay/checkpoint.pt \
   gpu_id=1 device=cuda:1 \
-  eval.max_steps=2200 \
-  eval.video_dir=videos/checkpoint_8000_two_stage_random \
-  eval.result_dir=results/checkpoint_8000_two_stage_random
+  eval.max_steps=2200
 ```
 
-脚本会让两种策略使用同一固定场景、同一随机种子和同一双阶段延时序列。无延时策略输入自动截取前 8 维状态，以兼容原始 PPO；当前延时策略使用完整 19 维状态。运行完成后，视频写入 `delay_value/videos/`，checkpoint 路径、完整 timing 配置和指标写入 `delay_value/results/` 的 YAML。旧版 9 维 delay checkpoint 无法加载到当前网络。
+脚本会让策略使用固定场景、随机种子和双阶段延时配置。`eval_random_delay.py` 可同时加载原始 8 维基线和当前 10 维延时策略：基线输入自动截取前 8 维，两者都直接使用 `NavigationEnv` 内部的低层控制器；旧版 19 维 FIFO checkpoint 无法加载到当前网络。单模型 `eval.py` 使用 `delay_checkpoint`。运行完成后，视频和指标由当前配置决定。
 
 ## 14. 视频帧率
 
@@ -537,7 +538,7 @@ python -u scripts/eval_random_delay.py \
 checkpoint 文件
 W&B run id
 GPU id 和 seed
-fixed_scenarios.pt
+eval_env.pt
 reach_goal / collision / episode_len / decision_count / episode_time
 sim_time_seconds 和 wall_time_seconds
 评估视频

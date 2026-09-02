@@ -173,27 +173,37 @@ def evaluate(
     exploration_type: ExplorationType=ExplorationType.MEAN
 ):
 
-    env.enable_render(True)
+    eval_cfg = cfg.get("eval", {})
+    record_video = bool(eval_cfg.get("record_video", False))
+    env.enable_render(record_video)
     env.eval()
     env.set_seed(seed)
+    # Keep repeated evaluation runs reproducible while preserving random
+    # timing during the rollout when timing.randomize_in_eval is enabled.
+    if hasattr(env, "reset_timing_schedule"):
+        env.reset_timing_schedule()
 
-    render_callback = RenderCallback(interval=2)
+    render_callback = RenderCallback(interval=2) if record_video else None
     
     with set_exploration_type(exploration_type):
-        trajs = env.rollout(
-            max_steps=env.max_episode_length,
-            policy=policy,
-            callback=render_callback,
-            auto_reset=True,
-            break_when_any_done=False,
-            return_contiguous=False,
-        )
-    # base_env.enable_render(not cfg.headless)
-    env.enable_render(not cfg.headless)
+        rollout_kwargs = {
+            "max_steps": int(eval_cfg.get("max_steps", env.max_episode_length)),
+            "policy": policy,
+            "auto_reset": True,
+            "break_when_any_done": False,
+            "return_contiguous": False,
+        }
+        if render_callback is not None:
+            rollout_kwargs["callback"] = render_callback
+        trajs = env.rollout(**rollout_kwargs)
+    env.enable_render(not cfg.headless and record_video)
     env.reset()
     
-    done = trajs.get(("next", "done")) 
-    first_done = torch.argmax(done.long(), dim=1).cpu() # idx of first done will be return for each trajs
+    done = trajs.get(("next", "done")).bool()
+    first_done = torch.argmax(done.long(), dim=1).cpu()
+    has_done = done.any(dim=1).cpu()
+    last_step = torch.full_like(first_done, done.shape[1] - 1)
+    first_done = torch.where(has_done, first_done, last_step)
 
     def take_first_episode(tensor: torch.Tensor):
         indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
@@ -209,23 +219,24 @@ def evaluate(
         for k, v in traj_stats.items()
     }
 
-    # RenderCallback records every two policy transitions. Actor inference sets
-    # the outer transition duration; command transport overlaps later inference.
-    if bool(cfg.timing.enabled):
-        inference_steps = round(
-            float(cfg.timing.inference_delay.eval) / float(cfg.sim.dt)
+    # RenderCallback records every two policy transitions. Use the measured
+    # duration from this rollout because inference delay is randomized.
+    eval_transition_dt = float(
+        traj_stats.get(
+            "transition_dt",
+            torch.tensor(float(cfg.sim.dt) * float(cfg.sim.substeps)),
         )
-        transition_steps = max(
-            int(cfg.sim.substeps), inference_steps
-        )
-    else:
-        transition_steps = int(cfg.sim.substeps)
-    eval_transition_dt = transition_steps * float(cfg.sim.dt)
-    info["recording"] = wandb.Video(
-        render_callback.get_video_array(axes="t c h w"), 
-        fps=0.5 / eval_transition_dt,
-        format="mp4"
+        .float()
+        .mean()
+        .item()
     )
+    eval_transition_dt = max(eval_transition_dt, 1e-6)
+    if render_callback is not None:
+        info["recording"] = wandb.Video(
+            render_callback.get_video_array(axes="t c h w"),
+            fps=0.5 / eval_transition_dt,
+            format="mp4"
+        )
     env.train()
     # env.reset()
 

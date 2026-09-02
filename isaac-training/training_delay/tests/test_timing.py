@@ -66,6 +66,31 @@ class TwoStageDelayScheduleTest(unittest.TestCase):
         self.assertEqual(schedule.inference_range, (1, 6, 2))
         self.assertEqual(schedule.command_range, (1, 2, 1))
 
+    def test_real_command_delay_range_is_quantized_to_4_9_ticks(self):
+        cfg = make_config()
+        cfg.command_delay = Config(min=0.060, max=0.150, eval=0.100)
+        schedule = TIMING.TwoStageDelaySchedule(
+            cfg, physics_dt=0.016, nominal_steps=1
+        )
+
+        self.assertEqual(schedule.command_range, (4, 9, 6))
+        step = schedule.sample(training=False)
+        self.assertEqual(step.command_steps, 6)
+        self.assertAlmostEqual(step.command_delay, 0.100)
+
+    def test_stage_samplers_can_run_on_different_clocks(self):
+        schedule = TIMING.TwoStageDelaySchedule(
+            make_config(), physics_dt=0.016, nominal_steps=1
+        )
+
+        inference_steps, inference_delay = schedule.sample_inference(
+            training=False
+        )
+        command_steps, command_delay = schedule.sample_command(training=False)
+
+        self.assertEqual((inference_steps, inference_delay), (2, 0.032))
+        self.assertEqual((command_steps, command_delay), (1, 0.016))
+
     def test_old_serial_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "overlapping_transport"):
             TIMING.TwoStageDelaySchedule(
