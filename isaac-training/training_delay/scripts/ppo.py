@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from tensordict.tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDictModule
 from einops.layers.torch import Rearrange
@@ -18,11 +19,16 @@ class PPO(TensorDictModuleBase):
         action_spec,
         device,
         timing_reference=0.016,
+        distributed=False,
     ):
         super().__init__()
         self.cfg = cfg
         self.device = device
         self.timing_reference = float(timing_reference)
+        self.distributed = bool(
+            distributed and dist.is_available() and dist.is_initialized()
+        )
+        self.world_size = dist.get_world_size() if self.distributed else 1
 
         
         # Feature extractor for LiDAR
@@ -77,7 +83,7 @@ class PPO(TensorDictModuleBase):
         self.gae = GAE(
             float(cfg.get("gamma", 0.99)),
             float(cfg.get("gae_lambda", 0.95)),
-        )
+        ).to(self.device)
         self.critic_loss_fn = nn.HuberLoss(delta=10) # huberloss (L1+L2): https://pytorch.org/docs/stable/generated/torch.nn.HuberLoss.html
 
         # Optimizer
@@ -111,6 +117,39 @@ class PPO(TensorDictModuleBase):
         tensordict["agents", "action"] = actions_world
         return tensordict
 
+    @torch.no_grad()
+    def sync_distributed_parameters(self):
+        """Make all ranks start from identical parameters and value statistics."""
+        if not self.distributed:
+            return
+        for parameter in self.parameters():
+            dist.broadcast(parameter.data, src=0)
+        for buffer in self.buffers():
+            # NCCL only supports dense CUDA tensors.  GAE is explicitly moved
+            # to the policy device above; keep this guard for any future
+            # CPU-only or non-strided buffers added to the policy.
+            if buffer.is_cuda and buffer.layout == torch.strided:
+                dist.broadcast(buffer, src=0)
+
+    def _sync_gradients(self):
+        """Average local PPO gradients before each rank updates its optimizer."""
+        if not self.distributed:
+            return
+        for parameter in self.parameters():
+            if parameter.grad is None:
+                continue
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            parameter.grad.div_(self.world_size)
+
+    def _sync_value_norm(self):
+        """Average ValueNorm's EMA state so all ranks use the same critic scale."""
+        if not self.distributed:
+            return
+        for name in ("running_mean", "running_mean_sq", "debiasing_term"):
+            value = getattr(self.value_norm, name)
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+            value.div_(self.world_size)
+
     def train(self, tensordict):
         # tensordict: (num_env, num_frames, dim), batchsize = num_env * num_frames
         next_tensordict = tensordict["next"]
@@ -133,10 +172,25 @@ class PPO(TensorDictModuleBase):
 
         # calculate GAE: Generalized Advantage Estimation
         adv, ret = self.gae(rewards, dones, values, next_values, time_scale)
-        adv_mean = adv.mean()
-        adv_std = adv.std()
-        adv = (adv - adv_mean) / adv_std.clip(1e-7)
         self.value_norm.update(ret) # update running mean and var for return
+        self._sync_value_norm()
+
+        if self.distributed:
+            # Normalize advantages using statistics from all rollout workers.
+            # This keeps the PPO update independent of how many GPUs are used.
+            count = torch.tensor(float(adv.numel()), device=adv.device)
+            adv_sum = adv.sum()
+            adv_sum_sq = (adv * adv).sum()
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(adv_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(adv_sum_sq, op=dist.ReduceOp.SUM)
+            adv_mean = adv_sum / count.clamp_min(1.0)
+            adv_var = (adv_sum_sq / count.clamp_min(1.0) - adv_mean.square()).clamp_min(1e-7)
+            adv = (adv - adv_mean) / adv_var.sqrt()
+        else:
+            adv_mean = adv.mean()
+            adv_std = adv.std()
+            adv = (adv - adv_mean) / adv_std.clip(1e-7)
         ret = self.value_norm.normalize(ret)  # normalize return
         tensordict.set("adv", adv)
         tensordict.set("ret", ret)
@@ -188,6 +242,8 @@ class PPO(TensorDictModuleBase):
         self.actor_optim.zero_grad()
         self.critic_optim.zero_grad()
         loss.backward()
+
+        self._sync_gradients()
 
         actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.) # to prevent gradient growing too large
         critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_norm=5.)

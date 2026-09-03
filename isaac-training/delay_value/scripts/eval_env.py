@@ -1,4 +1,15 @@
-"""Evaluation adapter around the training_delay navigation environment."""
+"""Compatibility adapter that always uses the live training environment."""
+
+import os
+import sys
+
+
+TRAINING_DELAY_SCRIPTS = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "training_delay", "scripts")
+)
+if TRAINING_DELAY_SCRIPTS in sys.path:
+    sys.path.remove(TRAINING_DELAY_SCRIPTS)
+sys.path.insert(0, TRAINING_DELAY_SCRIPTS)
 
 from env import NavigationEnv
 

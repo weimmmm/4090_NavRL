@@ -1,0 +1,87 @@
+name: sac
+
+feature_extractor:
+  dyn_obs_num: 5
+
+# v19-aggressive：v17 yaml 基础上只动 3 个参数，目标"高时间性价比、提升到达率"。
+# 实测数据来源：
+#   v16 (run-20260505_231723-nsmdbznw, alpha_init=1.0, alpha_lr=3e-4, warmup=200k):
+#     50M frames 内 train reach 均值 0.121、forward_mean=0.40、to_goal_velocity=0.71，
+#     alpha 在 8M frames 内跌破 0.1，eval best 0.7148 @ 131M frames（top-2 0.6948 @ 590M）。
+#     结论：v16 的 alpha 策略让 actor 早早进入"利用"阶段，这是 v17 唯一缺乏的。
+#   v17 (run-20260507_011803-rezaus24, alpha_init=5.0, alpha_lr=1e-5):
+#     50M 内 train reach 0.008、forward≈0、to_goal_velocity≈0；alpha 整段 ~3.0 维持纯探索。
+#     eval best 0.7354 @ 806M。慢启动 → 时间性价比差。
+#   v18 (alpha_init=1.0, alpha_lr=5e-5, UTD=4, buffer=18M):
+#     alpha 在 24M 才跌破 0.1（介于 v16/v17 之间），但 UTD=4 + buffer=18M 让 actor 在 critic
+#     还没看过成功样本时就被大幅更新拉进"猛冲出界"陷阱，eval best 仅 0.2207。
+#   zdy (warmup_steps=20M, batch_size=512, num_minibatches=160) → 0.83
+#     长 warmup 让 critic 先在 buffer 上吃满样本，actor 才开始更新，避免 v18 那种早期崩坏。
+#
+# v19-aggressive 设计 = v16 的"快 alpha"+ zdy 的"长 warmup"+ v17 已验证的稳定底座。
+#   1) alpha_init: 5.0 -> 1.0  借鉴 v16，让 alpha 早期能主动衰减进入利用区间
+#   2) alpha_learning_rate: 1e-5 -> 3e-4  借鉴 v16，alpha 在约 10M frames 内跌破 0.1
+#   3) warmup_steps: 200000 -> 5000000  借鉴 zdy（zdy 用 20M + batch=512，等效 batch 数 4×；
+#      我们 batch=2048，5M warmup 与 zdy 20M 等效铺数据时长）
+# 其它 v17 参数全部保留：gamma=0.95、log_std_max=0.5、UTD=2、buffer=10M、reward_scale=1.0、
+# critic.loss=mse、grad_clip=0、target_q_clip=0、actor_update_interval=1。
+
+actor:
+  # v1 用 5e-5，保持。
+  learning_rate: 5e-5
+  action_limit: 2.0  # m/s
+  # log_std_max=0.5 来自 v17（v1 等价 std 上限），与 v16 的 2.0 区别：让 actor 后期
+  # 不会输出极宽分布，配合 alpha 衰减后仍有动作幅度上限，是 v16 后期退化的反向修复。
+  log_std_init: -0.5
+  log_std_min: -5.0
+  log_std_max: 0.5
+
+critic:
+  learning_rate: 5e-4
+  loss: mse
+
+# UTD = 64 × 2048 / (2048 × 32) = 2.0  保持 v17，避免 v18 UTD=4 的早期崩坏。
+training_frame_num: 32
+n_step: 1
+num_minibatches: 128
+# buffer=10M 同 v17。GPU storage ~17 GB，A100-40GB 安全。
+buffer_size: 10000000
+# 修改①：warmup 200k -> 5M
+# 决策：zdy 用 batch=512、warmup=20M，warmup 期内 buffer 累积约 20M / 16k(每环境) ≈ 1250 个 batch；
+#       我们 batch=2048，warmup=5M 累积 ~76 个 batch（按 65536 frames/batch），
+#       与 zdy 等效"actor 看到第一次更新时 critic 已经稳"的语义对齐。
+# 副作用：5M warmup ≈ 1.5 分钟纯采样，相对 500M 总训练几乎不占成本。
+warmup_steps: 5000000
+batch_size: 2048
+gamma: 0.95
+tau: 0.004
+
+# 修改②③：alpha 全部回到 v16 的快衰减
+# - alpha_init: 5.0 -> 1.0   ln(1)=0 起步，比 v17 的 ln(5)≈1.6 低 1.6，actor 一开始就有明显方向
+# - alpha_learning_rate: 1e-5 -> 3e-4   实测 v16 在 ~8M 内 alpha 跌破 0.1，actor 进入利用阶段
+# warmup=5M 兜底：alpha 跌速虽快，但 warmup 期 actor 不更新，critic 已先吃满成功样本，
+# 不会重蹈 v18 "alpha 折中 + 早期 actor 大量更新 → 学坏"的覆辙。
+# 风险：warmup 结束时 alpha 已接近 0，actor 一开始更新就是低熵；这是新组合无先例。
+# 后备：若 v19-aggressive 失败（eval best < 0.55），下一版改成 alpha_lr=2e-4、warmup=2M（保守版）。
+alpha_init: 1.0
+learn_alpha: true
+target_entropy: -3.0
+# v21: min_alpha 0.005 -> 0.004
+# 历史决策记录：
+#   - v20-A 设 min_alpha=0.05，427M frames 后 best_eval reach 仅 0.0493
+#     （v19 同期 ~0.7）。原因：alpha 永远贴 0.05 上限（实测全程 0.0500），
+#     entropy 飙到 +2.02（v19 -3 附近），actor 被锁在高熵区不学到达。
+#   - v19 实测 alpha 全程 0.004-0.008 区间，从未跌破 0.004
+#     （样本：qotu0lw8 500M、wd4e6241 1.2B 跨度）。
+#   - v20-B 设 0.005 后效果不如 v19；v21 下探到 0.004，贴近 v19 实测下沿：
+#     * 不会被 v19 自然衰减触发（一般 alpha 在 0.005-0.007 之间反馈震荡）；
+#     * 仅在"真要跌破 0.004 进入 v16 风格自由衰减"那一刻起底；
+#     * target_entropy=-3 的反馈会立刻把 alpha 拉回 0.006+，不会锁死 actor。
+# 如需变量隔离重复实验：min_alpha=0 即 v19 原版；min_alpha=0.003 / 0.001 为更保守备选。
+min_alpha: 0.004
+max_alpha: .inf
+alpha_learning_rate: 3e-4
+actor_update_interval: 1
+grad_clip_norm: 0.0
+target_q_clip: 0.0
+reward_scale: 1.0

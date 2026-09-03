@@ -1,21 +1,35 @@
-"""Compare policies under the same two-stage random timing schedule."""
+"""Evaluate checkpoints with the live training_delay environment and timing model."""
 
+import glob
 import importlib.util
 import os
+import re
 import sys
 from datetime import datetime
+
+OMNIDRONES_SOURCE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "OmniDrones")
+)
+TRAINING_DELAY_SCRIPTS = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "training_delay", "scripts")
+)
+for source_path in (TRAINING_DELAY_SCRIPTS, OMNIDRONES_SOURCE):
+    if source_path in sys.path:
+        sys.path.remove(source_path)
+    sys.path.insert(0, source_path)
 
 import hydra
 import numpy as np
 import torch
 from hydra.utils import to_absolute_path
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from omni.isaac.kit import SimulationApp
-from torchrl.envs.utils import ExplorationType, set_exploration_type
+from torchrl.envs.utils import ExplorationType
 
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 PROJECT_PATH = os.path.dirname(FILE_PATH)
+TRAINING_DELAY_PATH = os.path.abspath(os.path.join(PROJECT_PATH, "..", "training_delay"))
 
 
 def _resolve_project_path(path):
@@ -25,15 +39,44 @@ def _resolve_project_path(path):
     return os.path.abspath(os.path.join(PROJECT_PATH, path))
 
 
+def _latest_delay_checkpoint():
+    pattern = os.path.join(TRAINING_DELAY_PATH, "wandb", "**", "files", "checkpoint_*.pt")
+    candidates = [path for path in glob.glob(pattern, recursive=True) if os.path.isfile(path)]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No training_delay checkpoint matched {pattern}. "
+            "Set delay_checkpoint=/absolute/path/checkpoint_N.pt explicitly."
+        )
+    return max(candidates, key=lambda path: (os.path.getmtime(path), path))
+
+
+def _resolve_checkpoint(path, name):
+    if path is None:
+        return None
+    if name == "delay_checkpoint" and str(path).strip().lower() in {"latest", "auto"}:
+        checkpoint = _latest_delay_checkpoint()
+    else:
+        checkpoint = to_absolute_path(str(path))
+    if not os.path.isfile(checkpoint):
+        raise FileNotFoundError(f"{name} does not exist: {checkpoint}")
+    return os.path.abspath(checkpoint)
+
+
+def _checkpoint_step(path):
+    match = re.search(r"checkpoint_(\d+)\.pt$", path)
+    return int(match.group(1)) if match else None
+
+
 def _load_baseline_ppo():
-    """Load the bundled original 8-D PPO without shadowing delay PPO."""
-    baseline_scripts = os.path.join(PROJECT_PATH, "scripts")
-    module_path = os.path.join(baseline_scripts, "baseline_ppo.py")
+    """Load the original 8-D PPO without shadowing the live delay PPO."""
+    module_path = os.path.abspath(
+        os.path.join(PROJECT_PATH, "..", "training", "scripts", "ppo.py")
+    )
     spec = importlib.util.spec_from_file_location("baseline_ppo_for_eval", module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load baseline PPO from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    sys.path.insert(0, baseline_scripts)
+    sys.path.insert(0, os.path.dirname(module_path))
     try:
         spec.loader.exec_module(module)
     finally:
@@ -42,8 +85,6 @@ def _load_baseline_ppo():
 
 
 class _BaselineObservationSpec:
-    """Give baseline PPO a zero observation with its original 8-D state."""
-
     def __init__(self, spec):
         self.spec = spec
 
@@ -55,8 +96,6 @@ class _BaselineObservationSpec:
 
 
 class _BaselinePolicy:
-    """Remove timing-aware state features before calling the old policy."""
-
     def __init__(self, policy):
         self.policy = policy
 
@@ -70,243 +109,164 @@ class _BaselinePolicy:
         return tensordict
 
 
-class _TimedRenderCallback:
-    """Render frames and keep each outer policy transition duration."""
-
-    def __init__(self, base_env, interval=2):
-        from omni_drones.utils.torchrl import RenderCallback
-
-        self.base_env = base_env
-        self.interval = int(interval)
-        self._callback = RenderCallback(interval=self.interval)
-        self.transition_dts = []
-
-    def __call__(self, *args, **kwargs):
-        result = self._callback(*args, **kwargs)
-        # RenderCallback is invoked after the environment step, so this is
-        # the interval represented by the newly rendered state.
-        self.transition_dts.append(float(self.base_env.transition_dt.mean().item()))
-        return result
-
-    def get_video_array(self, *args, **kwargs):
-        return self._callback.get_video_array(*args, **kwargs)
-
-
-def _load_policy(policy_cls, cfg, observation_spec, action_spec, checkpoint, device, timing_reference):
-    policy = policy_cls(
-        cfg.algo,
-        observation_spec,
-        action_spec,
-        device,
-        timing_reference,
-    ) if timing_reference is not None else policy_cls(
-        cfg.algo,
-        observation_spec,
-        action_spec,
-        device,
-    )
-    state_dict = torch.load(to_absolute_path(checkpoint), map_location=device)
-    policy.load_state_dict(state_dict)
+def _load_policy(policy_cls, cfg, observation_spec, action_spec, checkpoint, timing_ref):
+    args = (cfg.algo, observation_spec, action_spec, cfg.device)
+    policy = policy_cls(*args) if timing_ref is None else policy_cls(*args, timing_ref)
+    policy.load_state_dict(torch.load(checkpoint, map_location=cfg.device))
     return policy
 
 
-def _save_results(cfg, metrics):
-    result_dir = str(cfg.eval.result_dir)
-    if not os.path.isabs(result_dir):
-        result_dir = os.path.join(PROJECT_PATH, result_dir)
+def _save_results(cfg, checkpoints, metrics, dataset):
+    result_dir = _resolve_project_path(cfg.eval.result_dir)
     os.makedirs(result_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_path = os.path.join(result_dir, f"evaluation_{timestamp}.yaml")
     payload = {
-        "implementation": "two_stage_async_fifo",
-        "environment": "training_delay.NavigationEnv",
+        "implementation": "training_delay_live_50hz_overlapping_transport",
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "baseline_checkpoint": to_absolute_path(str(cfg.baseline_checkpoint)),
-        "delay_checkpoint": (
-            to_absolute_path(str(cfg.delay_checkpoint))
-            if cfg.delay_checkpoint is not None
-            else None
-        ),
-        "dataset_path": _resolve_project_path(cfg.eval.dataset_path),
+        "training_source": TRAINING_DELAY_PATH,
+        "dataset_path": str(cfg.eval.dataset_path),
         "seed": int(cfg.seed),
+        "environment": {
+            "num_envs": int(cfg.env.num_envs),
+            "num_static_obstacles": int(cfg.env.num_obstacles),
+            "num_dynamic_obstacles": int(cfg.env_dyn.num_obstacles),
+            "max_steps": int(cfg.eval.max_steps),
+        },
+        "scenarios": {
+            "format_version": int(dataset["format_version"]),
+            "sampling": str(dataset.get("sampling", "unspecified")),
+            "seed": int(dataset.get("seed", cfg.seed)),
+            "terrain_seed": int(dataset["terrain_seed"]),
+            "mean_horizontal_distance": float(
+                (
+                    dataset["target_pos"][:, 0, :2]
+                    - dataset["start_pos"][:, 0, :2]
+                )
+                .norm(dim=-1)
+                .mean()
+            ),
+        },
         "timing": OmegaConf.to_container(cfg.timing, resolve=True),
+        "checkpoints": {
+            name: {"path": path, "step": _checkpoint_step(path)}
+            for name, path in checkpoints.items()
+            if path is not None
+        },
         "metrics": metrics,
     }
     OmegaConf.save(OmegaConf.create(payload), result_path)
     return result_path
 
 
-def _first_episode_stats(trajs):
-    done = trajs.get(("next", "done"))
-    first_done = torch.argmax(done.long(), dim=1).cpu()
-    has_done = done.any(dim=1).cpu()
-    last_step = torch.full_like(first_done, done.shape[1] - 1)
-    first_done = torch.where(has_done, first_done, last_step)
-
-    def take_first_episode(tensor):
-        tensor = tensor.cpu()
-        indices = first_done.reshape(first_done.shape + (1,) * (tensor.ndim - 2))
-        return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-    return {
-        key: take_first_episode(value)
-        for key, value in trajs[("next", "stats")].items()
-    }
-
-
-@torch.no_grad()
-def _evaluate_one(env, base_env, policy, name, cfg):
-    seed = int(cfg.seed)
-    env.eval()
-    env.set_seed(seed, static_seed=True)
-    # A dedicated timing RNG makes both policies see the same inference and
-    # command delay sequence, independent of policy-dependent episode resets.
-    base_env.reset_timing_schedule(seed)
-    env.reset()
-
-    record_video = bool(cfg.eval.record_video)
-    env.enable_render(record_video)
-    callback = None
-    if record_video:
-        callback = _TimedRenderCallback(base_env, interval=2)
-
-    rollout_kwargs = {
-        "max_steps": int(cfg.eval.max_steps),
-        "policy": policy,
-        "auto_reset": True,
-        "break_when_any_done": False,
-        "return_contiguous": False,
-    }
-    if callback is not None:
-        rollout_kwargs["callback"] = callback
-    with set_exploration_type(ExplorationType.MEAN):
-        trajs = env.rollout(**rollout_kwargs)
-
-    stats = _first_episode_stats(trajs)
-    metrics = {
-        f"{name}/{key}": float(value.float().mean())
-        for key, value in stats.items()
-    }
-
-    # episode_len is already reported in equivalent nominal control steps by
-    # the delay environment. Expose the physical-time equivalent separately;
-    # decision_count remains the raw number of policy commands.
-    if "episode_len" in stats and "episode_time" in stats:
-        nominal_dt = float(cfg.sim.dt) * float(cfg.sim.substeps)
-        metrics[f"{name}/equivalent_episode_len"] = (
-            float(stats["episode_time"].float().mean()) / nominal_dt
-        )
-
-    if callback is not None:
-        import imageio_ffmpeg
-
-        video_dir = cfg.eval.video_dir
-        if not os.path.isabs(video_dir):
-            video_dir = os.path.join(PROJECT_PATH, video_dir)
-        os.makedirs(video_dir, exist_ok=True)
-        video_path = os.path.join(video_dir, f"{name}.mp4")
-        video_array = callback.get_video_array(axes="t h w c")[..., :3]
-        if video_array.dtype != np.uint8:
-            if video_array.max() <= 1.0:
-                video_array = video_array * 255.0
-            video_array = np.clip(video_array, 0.0, 255.0).astype(np.uint8)
-        video_array = np.ascontiguousarray(video_array)
-        height, width = video_array.shape[1:3]
-        # Frames are captured every two policy decisions. Use the measured
-        # transition duration so playback follows simulated physical time.
-        if callback.transition_dts:
-            mean_transition_dt = float(np.mean(callback.transition_dts))
-        else:
-            mean_transition_dt = float(cfg.timing.reference_dt)
-        fps = max(1, int(round(1.0 / (mean_transition_dt * callback.interval))))
-        metrics[f"{name}/mean_transition_dt"] = mean_transition_dt
-        metrics[f"{name}/video_fps"] = fps
-        writer = imageio_ffmpeg.write_frames(
-            video_path,
-            size=(width, height),
-            fps=fps,
-            codec="libx264",
-            quality=8,
-        )
-        writer.send(None)
-        try:
-            for frame in video_array:
-                writer.send(frame)
-        finally:
-            writer.close()
-        metrics[f"{name}/video_path"] = video_path
-
-    env.enable_render(False)
-    env.reset()
-    return metrics
+def _prefix_metrics(name, metrics):
+    result = {}
+    for key, value in metrics.items():
+        if key == "recording":
+            continue
+        short_key = key.removeprefix("eval/")
+        result[f"{name}/{short_key}"] = float(value)
+    return result
 
 
 @hydra.main(config_path=FILE_PATH, config_name="eval_random", version_base=None)
 def main(cfg: DictConfig):
-    cfg.device = f"cuda:{cfg.gpu_id}"
-    cfg.sim.device = cfg.device
-    dataset_path = _resolve_project_path(cfg.eval.dataset_path)
-    dataset = torch.load(dataset_path, map_location="cpu")
-    cfg.env.num_envs = int(dataset["num_envs"])
+    with open_dict(cfg):
+        cfg.device = f"cuda:{int(cfg.gpu_id)}"
+        cfg.sim.device = cfg.device
+        cfg.eval.dataset_path = _resolve_project_path(cfg.eval.dataset_path)
 
-    if cfg.baseline_checkpoint is None:
-        raise ValueError("Set baseline_checkpoint=/path/to/baseline.pt")
+    dataset = torch.load(cfg.eval.dataset_path, map_location="cpu")
+    expected = {
+        "num_envs": int(cfg.env.num_envs),
+        "num_obstacles": int(cfg.env.num_obstacles),
+        "num_dynamic_obstacles": int(cfg.env_dyn.num_obstacles),
+    }
+    for key, value in expected.items():
+        if int(dataset[key]) != value:
+            raise ValueError(
+                f"Evaluation dataset {key}={dataset[key]}, but config requires {value}. "
+                "Regenerate it with scripts/create_eval_env.py."
+            )
+
+    checkpoints = {
+        "baseline": _resolve_checkpoint(cfg.get("baseline_checkpoint"), "baseline_checkpoint"),
+        "delay": _resolve_checkpoint(cfg.get("delay_checkpoint"), "delay_checkpoint"),
+    }
+    if all(path is None for path in checkpoints.values()):
+        raise ValueError("Set baseline_checkpoint and/or delay_checkpoint")
 
     sim_app = SimulationApp(
         {
-            "headless": cfg.headless,
+            "headless": bool(cfg.headless),
             "anti_aliasing": 1,
-            "active_gpu": cfg.gpu_id,
-            "physics_gpu": cfg.gpu_id,
+            "active_gpu": int(cfg.gpu_id),
+            "physics_gpu": int(cfg.gpu_id),
             "multi_gpu": False,
         }
     )
-
+    evaluation_succeeded = False
     try:
-        from eval_env import TwoStageDelayEvalEnv
+        from env import NavigationEnv
         from ppo import PPO as DelayPPO
+        from utils import evaluate
 
-        env = TwoStageDelayEvalEnv(cfg)
-        transformed_env = env.eval()
-        transformed_env.set_seed(cfg.seed, static_seed=True)
+        # Dynamic obstacle placement happens during NavigationEnv construction
+        # and uses NumPy. Seed both RNGs before construction so the full scene,
+        # not only its fixed start/target tensors, is reproducible.
+        np.random.seed(int(cfg.seed))
+        torch.manual_seed(int(cfg.seed))
+        torch.cuda.manual_seed_all(int(cfg.seed))
+        env = NavigationEnv(cfg).eval()
+        policies = {}
 
-        baseline_ppo = _load_baseline_ppo()
-        baseline_action_spec = type(
-            "ActionSpecView", (), {"shape": (1, 3)}
-        )()
-        baseline_policy = _load_policy(
-            baseline_ppo,
-            cfg,
-            _BaselineObservationSpec(transformed_env.observation_spec),
-            baseline_action_spec,
-            cfg.baseline_checkpoint,
-            cfg.device,
-            None,
-        )
-        baseline_policy = _BaselinePolicy(baseline_policy)
+        if checkpoints["baseline"] is not None:
+            baseline_ppo = _load_baseline_ppo()
+            baseline_action_spec = type("ActionSpecView", (), {"shape": (1, 3)})()
+            policies["baseline"] = _BaselinePolicy(
+                _load_policy(
+                    baseline_ppo,
+                    cfg,
+                    _BaselineObservationSpec(env.observation_spec),
+                    baseline_action_spec,
+                    checkpoints["baseline"],
+                    None,
+                )
+            )
 
-        metrics = {}
-        if cfg.delay_checkpoint is None:
-            metrics.update(_evaluate_one(transformed_env, env, baseline_policy, "random_timing", cfg))
-        else:
-            delay_policy = _load_policy(
+        if checkpoints["delay"] is not None:
+            policies["delay"] = _load_policy(
                 DelayPPO,
                 cfg,
-                transformed_env.observation_spec,
-                transformed_env.action_spec,
-                cfg.delay_checkpoint,
-                cfg.device,
+                env.observation_spec,
+                env.action_spec,
+                checkpoints["delay"],
                 float(cfg.timing.reference_dt),
             )
-            metrics.update(_evaluate_one(transformed_env, env, baseline_policy, "baseline", cfg))
-            metrics.update(_evaluate_one(transformed_env, env, delay_policy, "delay", cfg))
-        printable = {key: value for key, value in metrics.items()}
-        print("[NavRL]: random-delay comparison results")
-        print(OmegaConf.to_yaml(OmegaConf.create(printable), sort_keys=True))
-        result_path = _save_results(cfg, printable)
-        print(f"[NavRL]: saved evaluation results to {result_path}")
+
+        metrics = {}
+        for name, policy in policies.items():
+            print(f"[NavRL]: evaluating {name}: {checkpoints[name]}", flush=True)
+            policy_metrics = evaluate(
+                env=env,
+                policy=policy,
+                seed=int(cfg.seed),
+                cfg=cfg,
+                exploration_type=ExplorationType.MEAN,
+            )
+            metrics.update(_prefix_metrics(name, policy_metrics))
+
+        print("[NavRL]: evaluation results", flush=True)
+        print(OmegaConf.to_yaml(OmegaConf.create(metrics), sort_keys=True))
+        result_path = _save_results(cfg, checkpoints, metrics, dataset)
+        print(f"[NavRL]: saved evaluation results to {result_path}", flush=True)
+        evaluation_succeeded = True
     finally:
-        sim_app.close()
+        # Isaac Sim 2023 can segfault in close() while unwinding a Python
+        # exception, which hides the actionable traceback. The OS releases
+        # simulator resources when the failed process exits.
+        if evaluation_succeeded:
+            sim_app.close()
 
 
 if __name__ == "__main__":

@@ -1153,9 +1153,23 @@ class NavigationEnv(IsaacEnv):
         penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
         
         # e. height penalty reward for flying unnessarily high or low
-        penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
-        penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
-        penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
+        # Keep all height terms one value per environment.  The drone state
+        # can be [N, 1, 3] while height_range may be [N, 1, 2]; flattening
+        # before the comparison avoids accidental [N, N] broadcasting when
+        # a reset returns a singleton dimension.
+        z = self.drone.pos[..., 2].reshape(self.num_envs)
+        z_min = self.height_range[..., 0].reshape(self.num_envs)
+        z_max = self.height_range[..., 1].reshape(self.num_envs)
+        penalty_height = torch.where(
+            z > z_max + 0.2,
+            (z - z_max - 0.2).square(),
+            torch.zeros_like(z),
+        )
+        penalty_height = torch.where(
+            z < z_min - 0.2,
+            (z_min - 0.2 - z).square(),
+            penalty_height,
+        ).unsqueeze(-1)
 
 
         # f. Collision condition with its penalty

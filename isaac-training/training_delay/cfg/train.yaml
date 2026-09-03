@@ -9,6 +9,11 @@ headless: True
 device: "cuda:0"
 seed: 0
 
+# Set by torchrun when launching one Isaac Sim process per GPU. Keep the
+# default single-process path unchanged when WORLD_SIZE is not set.
+distributed:
+  backend: nccl
+
 # Total Training Length
 max_frame_num: 1200000000 # max frame
 enable_eval: false
@@ -18,7 +23,7 @@ save_interval: 500
 
 # Training Environment
 env:
-  num_envs: 2048 # Number of drones for training
+  num_envs: 9216 # Number of drones for training
   max_episode_length: 2200
   env_spacing: 8.0 
   num_obstacles: 350

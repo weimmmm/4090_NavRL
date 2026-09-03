@@ -1,0 +1,255 @@
+# =========================================================================
+# GPU 启动约定（固定物理 GPU0）
+# -------------------------------------------------------------------------
+# 固定启动方式：
+#     python scripts/train_sac.py \
+#         device=cuda:0 sim.device=cuda:0 replay_buffer.storage_device=cuda:0 ...
+#
+# 脚本会强制 CUDA_VISIBLE_DEVICES=0；device、sim.device 与 replay buffer
+# 使用进程内 cuda:0，即物理 GPU0。
+# =========================================================================
+defaults:
+  - _self_
+  - drone
+  # cfg/sac.yaml 保持在 cfg 根目录；组合后挂载为 cfg.algo。
+  - sac@algo
+  - sim
+
+headless: True
+device: "cuda:0"   # 必须与 sim.device 一致
+seed: 3407
+
+# ---- Warm-start (可选) ----
+# null = 冷启动；指向一个 SAC checkpoint(.pt) 则 load policy.state_dict 后再训。
+# 仅恢复 policy 权重；optimizer / replay buffer / env_frames / wandb run_id **全部从零**。
+# 适合换任务再训（baseline → AT、改 cfg 后接着练，等等）。
+# 对抗训练强烈建议挂 v19 best ckpt：
+#   warm_start_ckpt: /home/a100/NavRL/isaac-training/training/scripts/wandb/run-20260511_012301-qotu0lw8/files/checkpoint_best.pt
+warm_start_ckpt: null
+
+# ---- Strict-resume (可选) ----
+# null = 不续训；指向一个 full-state ckpt(.pt) 则完整恢复：
+#   1) policy state_dict（actor+critic1+critic2+critic_target+log_alpha）
+#   2) actor_optim / critic1_optim / critic2_optim / alpha_optim 的 Adam m,v
+#   3) update_step / adv_global_step（AT 课程接续）
+#   4) replay buffer（如 ckpt 包含；不含则按 warmup_steps 重填）
+#   5) collector env_frames 累计（wandb 时间轴对齐到旧 run）
+#   6) best/topk_eval/topk_train/pre_adv 元数据
+#   7) wandb run_id 自动续接（除非 cfg.wandb.run_id 显式覆盖）
+# 与 warm_start_ckpt 互斥（同时设置会报错）。
+# 要求 ckpt 是 save_full_state=true 跑过的产出（文件名形如 checkpoint_best_state.pt）；
+# 旧 ckpt（只含 policy）无法走 resume，只能走 warm_start_ckpt。
+# 用法：
+#   resume_ckpt: /home/a100/NavRL/isaac-training/training/scripts/wandb/run-xxx/files/checkpoint_best_state.pt
+resume_ckpt: null
+
+# ---- 完整训练状态落盘开关 ----
+# false（默认）= 与旧版完全等价，best/latest/final 只存 policy.state_dict()。
+# true        = best/latest/final 三处同时多存一份 *_state.pt（默认 ~100-200 MB / 份）。
+#               包含：policy + 3×Adam optimizer + alpha_optim + log_alpha + update_step
+#                    + adv_global_step + best/topk/pre_adv meta + wandb run_id 等。
+#               **默认不含 replay buffer**（10M buffer 在 GPU 上 ~17 GB / 份，对长 run 极不划算）；
+#               续训时缺 buffer 仅前 5-20M frames 类似 warmup，对 ≥500M 的长 run 影响 < 1%。
+# 必须设为 true，将来才能用 resume_ckpt 续训这次 run。
+save_full_state: false
+
+# ---- 训练中 dump in-training eval 的 world snapshot（v20 起新增；v20-rev 后语义） ----
+# true（v21 起改为默认）= 配合 best/top-k 配套保存，方便事后用 eval.py 精确复评。
+# false       = 与 v19 等价，不写 world.pt。
+# true        = dump 与 best/top-k ckpt 联动（v20-rev 后新行为）：
+#               1) eval step 跨过 min_step 阈值前，rollout 不装 callback，零开销。
+#               2) eval step 跨过阈值后，rollout 期间采集 drone/target/dyn_obs
+#                  初始 + 整段 dyn_obs 轨迹到内存。
+#               3) 仅当本次 eval 触发 best ckpt 写盘或被纳入 eval top-k 时，
+#                  才把内存里的 snapshot 写一份配套 world.pt，文件名共享 step
+#                  字段（eval_world_eval_step{step:07d}_envframes{f}.pt 或
+#                  eval_world_best.pt）。
+#               4) ckpt 被挤出 top-k 时，配套 world.pt 一并删除。
+#               5) train-topk 不联动 dump（train metric 没有 eval rollout）。
+#               磁盘开销：top-5 eval × 11 MB + best × 11 MB ≈ 66 MB / run。
+#               adv eval 永远不 dump。
+# 适用场景：想事后用 eval.py + eval_world_path 精确复现 ckpt 在 in-training eval
+# 时刻的 reach（解决"in-training reach 高但 eval.py 通路低"的 gap）。
+save_eval_worlds: false
+
+# ---- 是否把 replay buffer 也写进 *_state.pt ----
+# false（默认）= 不存 buffer，续训时 buffer 从 0 重填（~5M frames warmup 期）。
+# true        = 把 buffer 也序列化进 *_state.pt，文件膨胀到 (buffer_size × 单帧大小)
+#               例如 buffer_size=10M / GPU storage 大约 17 GB / 份。
+# 推荐场景：buffer_size 较小（如 200K，AT 短 run）、或必须 bit-level 一致复现。
+# 仅在 save_full_state=true 时生效。
+save_full_state_with_buffer: false
+
+# Total Training Length
+# v20-B：在 v19 (500M) 基础上拉长到 1.2B (与 v17 同口径)，
+# 配合 algo/sac.yaml 的 min_alpha=0.005 (≈v19 alpha 实测下沿) 给后期一个软底。
+# 预期：500-800M 区间可能出现新 best（类似 v19 但有 floor 防退化）；
+#       800M-1.2B 区间 min_alpha 兜底防止"alpha→0、actor 退化"。
+# 若需要单变量复现 v19 原版，CLI 覆盖：max_frame_num=500000000 algo.min_alpha=0
+# 10,000 个 collector step：10,000 × num_envs(2048) × rollout(32) = 655,360,000 帧。
+max_frame_num: 655360000
+# Saves checkpoint_latest.pt by overwriting it; numbered checkpoints are disabled
+# to avoid filling the wandb run directory during long SAC runs.
+save_interval: 1000
+train_stats_window: 256
+best_metric: eval_deterministic/stats.reach_goal
+# v19-aggressive：best_min_step=1500（约 98M frames）。
+# 决策依据：alpha_init=1.0 + alpha_lr=3e-4 + warmup=5M 组合下，actor 大约在 30-60M frames
+# 进入有意义的利用阶段，1500 step（98M frames）已跨过 warmup + 早期混乱，又不会像
+# 5000 step 那样错过 v16 式的早期峰值。
+# v18 "低速贴边伪成功"主要靠 filename_metrics 加 speed/to_goal_velocity 来事后筛掉。
+best_min_step: 1500
+best_score:
+  reach_goal: 1000.0
+  return: 1.0
+  collision: 200.0
+  out_of_bound: 100.0
+  truncated: 0.0
+
+# Secondary best ckpt tracked alongside the deterministic-eval best.
+# - metric: 训练分布上的滚动 reach_goal（four_side_random + stochastic policy）。
+# - min_delta: 防抖阈值，避免 noise 频繁触发 torch.save。
+# - 与 best_metric 共用 best_min_step / best_score 权重。
+best_train:
+  metric: train/stats.reach_goal
+  min_delta: 0.005
+
+top_k_ckpt:
+  enabled: true
+  k: 5
+  metric: eval_deterministic/stats.reach_goal
+  # v19-aggressive：与 best_min_step 同步 1500，避开 warmup + 早期混乱期。
+  min_step: 1000
+  filename_metrics:
+    - eval_deterministic/stats.out_of_bound
+    - eval_deterministic/stats.collision
+    - eval_deterministic/stats.truncated
+    - eval_deterministic/stats.return
+    - eval_deterministic/goal_distance_mean
+
+top_k_train_ckpt:
+  enabled: true
+  k: 5
+  metric: train/stats.reach_goal
+  # v19-aggressive：1500 step。v18 伪成功 ckpt 在 step 4220-4224、train/speed.mean=0.26，
+  # 单靠抬 min_step 已无法完全屏蔽；新增 speed.mean / to_goal_velocity 进 filename，
+  # 事后挑 ckpt 时直接看文件名就能丢掉 speed.mean<0.4 + to_goal_velocity<0.4 的伪成功。
+  min_step: 1000
+  # v19：filename_metrics 加上 train/speed.mean 与 progress.to_goal_velocity_mean。
+  # 这两个指标能直接区分"高速直冲到达"和"低速贴边伪成功"；事后筛 ckpt 时
+  # 看到 speed.mean<0.4 + low_speed_rate>0.5 的就丢。
+  filename_metrics:
+    - train/stats.collision
+    - train/stats.out_of_bound
+    - train/stats.truncated
+    - train/stats.return
+    - train/stats.episode_len
+    - train/speed.mean
+    - train/progress.to_goal_velocity_mean
+
+deterministic_eval:
+  # v19-aggressive：interval=200（比 v18 的 300 更密）。
+  # 决策依据：v16 在 ~131M frames(step ≈ 2000) 出现峰值，v19 alpha 策略与 v16 同源、
+  # 总长度只有 500M（≈ 7600 step），interval=200 全程约 38 次评估，足够锁定早期峰值；
+  # P0-3 修复后 eval 不污染训练，加密 eval 安全。
+  # 代价：每次 eval ~7s × 38 ≈ 4.5 分钟，相对总训练时长可忽略。
+  enabled: true
+  interval: 200
+  seed: 3407
+  max_steps: 2200
+
+# Frozen evaluation world specification. `scripts/build_eval_world.py` uses this
+# section only; it does not alter the training environment above.
+eval_world:
+  path: eval_worlds/eval_3407_2048.pt
+  name: eval_3407_2048
+  seed: 3407
+  num_envs: 2048
+  num_obstacles_static: 350
+  num_obstacles_dynamic: 80
+  overwrite: false
+
+# ==================== 训练侧 reward 系数（env.py 读 cfg.reward.*） ====================
+# 改这里 = 改"训练方法"，不影响评估量尺（评估量尺见 cfg/eval_protocol_v1.json）。
+# 缺省值 = 历史硬编码值，behavior 不变；CLI 可覆盖，如 reward.vel_coef=1.0 reward.terminal_collision=0。
+# 每个 run 的 reward 配方随 cfg 自动写入 wandb config。
+reward:
+  vel_coef: 0.3
+  step_bias: 0.1
+  safety_static_coef: 1.0
+  safety_dynamic_coef: 1.0
+  smooth_coef: 0.1
+  height_coef: 2.0
+  safety_clamp_min: -5.0
+  terminal_reach: 100.0
+  terminal_collision: 200.0
+  terminal_out_of_bound: 100.0
+
+# Training Environment
+env:
+  num_envs: 3096
+  max_episode_length: 2200
+  env_spacing: 8.0
+  num_obstacles: 350
+  # Layout options:
+  # - fixed_y_random: current full task distribution, start y=+24 and target y=-24 with random x/z.
+  # - fixed_y_grid: deterministic full-task eval grid, start y=+24 and target y=-24 with fixed x/z.
+  # - four_side_random: SAC-original-style random starts/targets on four map sides.
+  train_layout: four_side_random
+  eval_layout: fixed_y_random
+
+env_dyn:
+  num_obstacles: 80
+  vel_range: [0.5, 1.5]
+  local_range: [5.0, 5.0, 4.5]
+
+viewer:
+  eye: [0., 40., 40.]
+  lookat: [0., 2.5, 0.]
+  resolution: [960, 720]
+
+wandb:
+  project: End_to_End_Navigation_SAC
+  # v19-aggressive 名字：v16 alpha 策略（v16warm = warm policy 早期升温）
+  # + zdy 长 warmup（zdylong = warmup 5M），明确区别于 v17 复现。
+  # v21: v20-B 下探 min_alpha=0.004，贴近 v19 实测下沿 + max_frame_num=1.2B
+  # AT 实验请通过 CLI 覆盖，例如：
+  #   wandb.name=sac_at_v1_fgsm_eps05_coef1_warm
+  #   wandb.name=sac_at_v2_pgd_eps05_coef1_warm
+  name: sac_curriculum_v2_1
+  entity: null
+  mode: online
+  run_id: null
+  # null = 自动落到 scripts/wandb/SAC/train；可用 CLI 覆盖为自定义目录。
+  dir: null
+
+
+# ---- Debug 日志（调对抗训练 / 调超参时打开；调好就关） ----
+# enabled=false 时所有相关代码都是 no-op（零开销）；
+# enabled=true 时在 wandb run 目录下新建 debug/ 子文件夹，写：
+#   debug_meta.json     run 启动一次性写：cfg/ckpt 来源等
+#   debug_iter.jsonl    每 iter 一行结构化记录（pandas/jq 直读，每行 flush）
+#   debug_iter.log      同步一份人读，方便 `tail -f` 实时看
+# basic 字段每 iter 都写（loss / AT 标量 / 性能 / Q 健康）；
+# verbose 字段每 `verbose_every` iter 才写一次（参数 L2，可选梯度范数）。
+debug_log:
+  enabled: false                # 当前项目未携带 debug_logger.py，基础训练默认关闭
+  level: basic                  # basic | verbose（保留扩展位，目前由 verbose_every 控制频率）
+  verbose_every: 50             # 多少 iter 写一次 verbose（参数 L2 / 梯度范数）
+  log_grad_norm: false          # 是否记录 critic1/critic2/actor 的梯度 L2（轻微开销，调好就关）
+  log_param_l2: true            # 是否记录 actor.feature/body/head + critic1/critic2 的参数 L2
+  log_q_quantiles: true         # 预留扩展（当前仅记 q 均值；分位数后续按需补）
+  subdir: debug                 # 子目录名，落到 <wandb_run>/files/<subdir>/
+
+replay_buffer:
+  # 10M transition 全部常驻主机内存，避免占用训练 GPU 显存。
+  # SAC 每次 sample 后才把一个 batch 拷到 GPU 计算。
+  storage_device: cpu
+  # CPU replay 必须 pin，才能让 batch.to(cuda, non_blocking=True) 异步搬运。
+  pin_memory: true
+  prefetch: 0
+  store_full_transitions: false
+
+simple_eval:
+  # Every saved checkpoint is evaluated on the same frozen eval_3407.pt world.
+  save_interval: 200

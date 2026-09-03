@@ -1,0 +1,55 @@
+implementation: training_delay_live_50hz_overlapping_transport
+created_at: '2026-09-03T06:16:11+00:00'
+training_source: /workspace/NavRL/isaac-training/training_delay
+dataset_path: /workspace/NavRL/isaac-training/delay_value/environments/fixed_scenarios.pt
+seed: 0
+environment:
+  num_envs: 256
+  num_static_obstacles: 350
+  num_dynamic_obstacles: 80
+  max_steps: 1
+timing:
+  enabled: true
+  mode: overlapping_transport
+  sampling_mode: random_walk_steps
+  command_sampling_mode: random_walk_steps
+  command_publish_hz: 50.0
+  randomize_in_eval: true
+  reference_dt: 0.016
+  inference_delay:
+    min: 0.016
+    max: 0.096
+    eval: 0.032
+  command_delay:
+    min: 0.06
+    max: 0.15
+    eval: 0.1
+  change_probability: 0.2
+  max_step_change: 1
+checkpoints:
+  delay:
+    path: /workspace/NavRL/isaac-training/training_delay/wandb/run-20260903_040330-2wl73jsv/files/checkpoint_1000.pt
+    step: 1000
+metrics:
+  delay/stats.collision: 0.0
+  delay/stats.command_age_at_update: 0.0
+  delay/stats.command_delay: 0.0
+  delay/stats.command_publish_count: 1.0
+  delay/stats.command_queue_depth: 1.0
+  delay/stats.command_update_count: 0.0
+  delay/stats.controller_update_count: 2.0
+  delay/stats.decision_count: 1.0
+  delay/stats.episode_len: 2.0
+  delay/stats.episode_time: 0.032258063554763794
+  delay/stats.inference_delay: 0.032258063554763794
+  delay/stats.pending_command_age: 0.0
+  delay/stats.publisher_wait_delay: 0.0
+  delay/stats.reach_goal: 0.0
+  delay/stats.return: 7.538585186004639
+  delay/stats.sampled_command_delay: 0.09677419066429138
+  delay/stats.sampled_inference_delay: 0.032258063554763794
+  delay/stats.sampled_total_delay: 0.12903225421905518
+  delay/stats.total_delay: 0.0
+  delay/stats.transition_dt: 0.032258063554763794
+  delay/stats.transport_delay: 0.0
+  delay/stats.truncated: 0.0
