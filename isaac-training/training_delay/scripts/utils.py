@@ -1,3 +1,6 @@
+import os
+import time
+
 import torch
 import torch.nn as nn
 import wandb
@@ -232,8 +235,21 @@ def evaluate(
     )
     eval_transition_dt = max(eval_transition_dt, 1e-6)
     if render_callback is not None:
+        frames = render_callback.get_video_array(axes="t h w c")
+        video_dir = str(eval_cfg.get("video_dir", "videos"))
+        os.makedirs(video_dir, exist_ok=True)
+        video_path = os.path.join(
+            video_dir, f"delay_evaluation_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        )
+        try:
+            import imageio.v2 as imageio
+
+            imageio.mimsave(video_path, frames, fps=0.5 / eval_transition_dt)
+            print(f"[NavRL]: saved evaluation video to {os.path.abspath(video_path)}", flush=True)
+        except Exception as exc:
+            print(f"[NavRL]: warning: could not save evaluation video: {exc}", flush=True)
         info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
+            np.transpose(frames, (0, 3, 1, 2)),
             fps=0.5 / eval_transition_dt,
             format="mp4"
         )

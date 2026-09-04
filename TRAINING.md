@@ -212,3 +212,22 @@ export OMNI_DRONES_DISABLE_VIEWPORT=1
   enable_eval=false \
   record_eval_video=false \
   wandb.mode=offline
+
+
+## 8. 评估
+docker start navrl-train-gpu0-clean
+docker exec -it navrl-train-gpu0-clean bash
+
+cd /workspace/NavRL/isaac-training/delay_value
+
+export NAVRL_ISAAC_OFFLINE_ASSETS=1
+export OMNI_DRONES_DISABLE_VIEWPORT=0
+export PYTHONUNBUFFERED=1
+export TZ=Asia/Shanghai
+
+/isaac-sim/python.sh scripts/eval_random_delay.py \
+  delay_checkpoint=/workspace/NavRL/isaac-training/training_delay/wandb/run-20260903_040330-2wl73jsv/files/checkpoint_final.pt \
+  baseline_checkpoint=null \
+  gpu_id=0 \
+  eval.dataset_path=/workspace/NavRL/isaac-training/delay_value/environments/fixed_scenarios.pt \
+  eval.record_video=false

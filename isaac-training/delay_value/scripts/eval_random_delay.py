@@ -175,6 +175,7 @@ def main(cfg: DictConfig):
         cfg.device = f"cuda:{int(cfg.gpu_id)}"
         cfg.sim.device = cfg.device
         cfg.eval.dataset_path = _resolve_project_path(cfg.eval.dataset_path)
+        cfg.eval.video_dir = _resolve_project_path(cfg.eval.video_dir)
 
     dataset = torch.load(cfg.eval.dataset_path, map_location="cpu")
     expected = {
