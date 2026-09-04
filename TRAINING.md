@@ -192,3 +192,23 @@ docker exec navrl-train pkill -f 'training_delay/scripts/train.py'
 ```bash
 docker stop navrl-train
 ```
+
+docker start navrl-train-gpu0-clean
+docker exec -it navrl-train-gpu0-clean bash
+
+cd /workspace/NavRL/isaac-training
+
+export WANDB_MODE=offline
+export NAVRL_ISAAC_EXPERIENCE=/isaac-sim/apps/omni.isaac.sim.python.gym.headless.kit
+export NAVRL_ISAAC_ASSET_ROOT=/tmp/navrl-isaac-assets
+export NAVRL_ISAAC_EXTENSIONS=omni.syntheticdata
+export NAVRL_ISAAC_OFFLINE_ASSETS=1
+export OMNI_DRONES_MINIMAL_IMPORTS=1
+export OMNI_DRONES_DISABLE_VIEWPORT=1
+
+/isaac-sim/python.sh training_delay/scripts/train.py \
+  device=cuda:0 \
+  headless=True \
+  enable_eval=false \
+  record_eval_video=false \
+  wandb.mode=offline

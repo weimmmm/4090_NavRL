@@ -22,6 +22,8 @@
 
 
 import abc
+import os
+import random
 
 from typing import Dict, List, Optional, Tuple, Type, Union, Callable
 
@@ -43,16 +45,26 @@ from torchrl.envs import EnvBase
 from omni_drones.robots.robot import RobotBase
 from omni_drones.utils.torchrl import AgentSpec
 
-from omni.isaac.debug_draw import _debug_draw
+if os.environ.get("OMNI_DRONES_DISABLE_VIEWPORT", "0") == "1":
+    _debug_draw = None
+else:
+    from omni.isaac.debug_draw import _debug_draw
 
 class DebugDraw:
     def __init__(self):
-        self._draw = _debug_draw.acquire_debug_draw_interface()
+        self._draw = (
+            None
+            if _debug_draw is None
+            else _debug_draw.acquire_debug_draw_interface()
+        )
     
     def clear(self):
-        self._draw.clear_lines()
+        if self._draw is not None:
+            self._draw.clear_lines()
 
     def plot(self, x: torch.Tensor, size=2.0, color=(1., 1., 1., 1.)):
+        if self._draw is None:
+            return
         if not (x.ndim == 2) and (x.shape[1] == 3):
             raise ValueError("x must be a tensor of shape (N, 3).")
         x = x.cpu()
@@ -63,6 +75,8 @@ class DebugDraw:
         self._draw.draw_lines(point_list_0, point_list_1, colors, sizes)
         
     def vector(self, x: torch.Tensor, v: torch.Tensor, size=2.0, color=(0., 1., 1., 1.)):
+        if self._draw is None:
+            return
         x = x.cpu().reshape(-1, 3)
         v = v.cpu().reshape(-1, 3)
         if not (x.shape == v.shape):
@@ -88,7 +102,9 @@ class IsaacEnv(EnvBase):
         # store inputs to class
         self.cfg = cfg
         self.enable_render(not headless)
-        self.enable_viewport = True
+        self.enable_viewport = (
+            os.environ.get("OMNI_DRONES_DISABLE_VIEWPORT", "0") != "1"
+        )
         # extract commonly used parameters
         self.num_envs = self.cfg.env.num_envs
         self.max_episode_length = self.cfg.env.max_episode_length
@@ -155,10 +171,11 @@ class IsaacEnv(EnvBase):
         
         central_env_pos = self.envs_positions[self.central_env_idx].cpu().numpy()
         # print("central env pos: ", central_env_pos)
-        set_camera_view(
-            eye=np.asarray(self.cfg.viewer.eye), 
-            target=np.asarray(self.cfg.viewer.lookat)
-        )
+        if self.enable_viewport:
+            set_camera_view(
+                eye=np.asarray(self.cfg.viewer.eye),
+                target=np.asarray(self.cfg.viewer.lookat),
+            )
         
         RobotBase._envs_positions = self.envs_positions.unsqueeze(1)
 
@@ -286,8 +303,12 @@ class IsaacEnv(EnvBase):
         raise NotImplementedError
 
     def _set_seed(self, seed: Optional[int] = -1):
-        import omni.replicator.core as rep
-        rep.set_global_seed(seed)
+        if os.environ.get("OMNI_DRONES_DISABLE_VIEWPORT", "0") != "1":
+            import omni.replicator.core as rep
+
+            rep.set_global_seed(seed)
+        random.seed(seed)
+        np.random.seed(seed)
         torch.manual_seed(seed)
 
     def _configure_simulation_flags(self, sim_params: dict = None):
@@ -325,9 +346,9 @@ class IsaacEnv(EnvBase):
             if self.enable_viewport:
                 # extension for window status bar
                 enable_extension("omni.kit.window.status_bar")
-        # enable isaac replicator extension
-        # note: moved here since it requires to have the viewport extension to be enabled first.
-        enable_extension("omni.replicator.isaac")
+        # Replicator requires viewport extensions and is not used by headless training.
+        if self.enable_viewport:
+            enable_extension("omni.replicator.isaac")
 
     def to(self, device) -> EnvBase:
         if torch.device(device) != self.device:
@@ -381,9 +402,6 @@ class IsaacEnv(EnvBase):
     
     def _create_viewport_render_product(self):
         """Create a render product of the viewport for rendering."""
-        # set camera view for "/OmniverseKit_Persp" camera
-        set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
-
         # check if flatcache is enabled
         # this is needed to flush the flatcache data into Hydra manually when calling `env.render()`
         # ref: https://docs.omniverse.nvidia.com/prod_extensions/prod_extensions/ext_physics.html
@@ -395,6 +413,8 @@ class IsaacEnv(EnvBase):
 
         # check if viewport is enabled before creating render product
         if self.enable_viewport:
+            # set camera view for "/OmniverseKit_Persp" camera
+            set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
             import omni.replicator.core as rep
 
             # create render product

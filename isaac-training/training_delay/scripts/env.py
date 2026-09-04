@@ -14,6 +14,7 @@ from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
 from omni.isaac.core.utils.viewports import set_camera_view
 from utils import vec_to_new_frame, vec_to_world, construct_input
 import omni.isaac.core.utils.prims as prim_utils
+from omni.isaac.core.objects.ground_plane import GroundPlane
 import omni.isaac.orbit.sim as sim_utils
 import omni.isaac.orbit.utils.math as math_utils
 from omni.isaac.orbit.assets import RigidObject, RigidObjectCfg
@@ -236,8 +237,16 @@ class NavigationEnv(IsaacEnv):
         sky_light.spawn.func(sky_light.prim_path, sky_light.spawn)
         
         # Ground Plane
-        cfg_ground = sim_utils.GroundPlaneCfg(color=(0.1, 0.1, 0.1), size=(300., 300.))
-        cfg_ground.func("/World/defaultGroundPlane", cfg_ground, translation=(0, 0, 0.01))
+        if os.environ.get("NAVRL_ISAAC_OFFLINE_ASSETS", "0") == "1":
+            GroundPlane(
+                prim_path="/World/defaultGroundPlane",
+                size=300.0,
+                z_position=0.01,
+                color=np.asarray((0.1, 0.1, 0.1)),
+            )
+        else:
+            cfg_ground = sim_utils.GroundPlaneCfg(color=(0.1, 0.1, 0.1), size=(300., 300.))
+            cfg_ground.func("/World/defaultGroundPlane", cfg_ground, translation=(0, 0, 0.01))
 
         self.map_range = [20.0, 20.0, 4.5]
 
@@ -274,7 +283,7 @@ class NavigationEnv(IsaacEnv):
             visual_material = None,
             max_init_terrain_level=None,
             collision_group=-1,
-            debug_vis=True,
+            debug_vis=os.environ.get("NAVRL_ISAAC_OFFLINE_ASSETS", "0") != "1",
         )
         terrain_importer = TerrainImporter(terrain_cfg)
 

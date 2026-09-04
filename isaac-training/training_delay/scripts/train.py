@@ -183,8 +183,29 @@ def main(cfg):
             "active_gpu": int(str(cfg.device).split(":")[-1]),
             "physics_gpu": int(str(cfg.device).split(":")[-1]),
             "multi_gpu": False,
-        }
+        },
+        experience=os.environ.get("NAVRL_ISAAC_EXPERIENCE", ""),
     )
+
+    # Orbit probes a Nucleus server while importing its asset helpers.  The
+    # NavRL training assets are local, so an explicit local root avoids a
+    # blocking network probe when running the headless Gym experience.
+    asset_root = os.environ.get("NAVRL_ISAAC_ASSET_ROOT")
+    if asset_root:
+        import carb
+
+        settings = carb.settings.get_settings()
+        settings.set("/persistent/isaac/asset_root/default", asset_root)
+        settings.set("/persistent/isaac/asset_root/cloud", "")
+
+    extra_extensions = os.environ.get("NAVRL_ISAAC_EXTENSIONS", "")
+    if extra_extensions:
+        from omni.isaac.core.utils.extensions import enable_extension
+
+        for extension_name in extra_extensions.split(","):
+            extension_name = extension_name.strip()
+            if extension_name:
+                enable_extension(extension_name)
 
     from env import NavigationEnv
     from omni_drones.utils.torchrl import EpisodeStats, SyncDataCollector
