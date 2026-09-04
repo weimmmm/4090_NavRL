@@ -1,0 +1,61 @@
+implementation: training_delay_live_50hz_overlapping_transport
+created_at: '2026-09-04T08:11:32+00:00'
+training_source: /workspace/NavRL/isaac-training/training_delay
+dataset_path: /workspace/NavRL/isaac-training/delay_value/environments/fixed_scenarios.pt
+seed: 0
+environment:
+  num_envs: 256
+  num_static_obstacles: 350
+  num_dynamic_obstacles: 80
+  max_steps: 2200
+scenarios:
+  format_version: 1
+  sampling: training_independent_boundary_sides
+  seed: 0
+  terrain_seed: 0
+  mean_horizontal_distance: 35.947261810302734
+timing:
+  enabled: true
+  mode: overlapping_transport
+  sampling_mode: random_walk_steps
+  command_sampling_mode: random_walk_steps
+  command_publish_hz: 50.0
+  randomize_in_eval: true
+  reference_dt: 0.016
+  inference_delay:
+    min: 0.016
+    max: 0.096
+    eval: 0.032
+  command_delay:
+    min: 0.06
+    max: 0.15
+    eval: 0.1
+  change_probability: 0.2
+  max_step_change: 1
+checkpoints:
+  delay:
+    path: /workspace/NavRL/isaac-training/training_delay/wandb/run-20260903_040330-2wl73jsv/files/checkpoint_4000.pt
+    step: 4000
+metrics:
+  delay/stats.collision: 0.26171875
+  delay/stats.command_age_at_update: 0.051978327333927155
+  delay/stats.command_delay: 0.09734080731868744
+  delay/stats.command_publish_count: 1505.16796875
+  delay/stats.command_queue_depth: 3.5390625
+  delay/stats.command_update_count: 615.796875
+  delay/stats.controller_update_count: 1867.7578125
+  delay/stats.decision_count: 653.76953125
+  delay/stats.episode_len: 1867.02099609375
+  delay/stats.episode_time: 30.124876022338867
+  delay/stats.inference_delay: 0.05241820216178894
+  delay/stats.pending_command_age: 0.07459676265716553
+  delay/stats.publisher_wait_delay: 0.022492026910185814
+  delay/stats.reach_goal: 0.72265625
+  delay/stats.return: 8624.9560546875
+  delay/stats.sampled_command_delay: 0.08474041521549225
+  delay/stats.sampled_inference_delay: 0.04038558155298233
+  delay/stats.sampled_total_delay: 0.13715976476669312
+  delay/stats.total_delay: 0.14944398403167725
+  delay/stats.transition_dt: 0.022051408886909485
+  delay/stats.transport_delay: 0.07484878599643707
+  delay/stats.truncated: 0.73828125
