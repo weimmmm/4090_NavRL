@@ -88,7 +88,11 @@ class IsaacEnv(EnvBase):
         # store inputs to class
         self.cfg = cfg
         self.enable_render(not headless)
-        self.enable_viewport = True
+        # Headless training does not consume RGB frames. Avoid creating a
+        # viewport/render product unless a caller explicitly requests it.
+        self.enable_viewport = bool(
+            getattr(self.cfg.viewer, "enable_viewport", not headless)
+        )
         # extract commonly used parameters
         self.num_envs = self.cfg.env.num_envs
         self.max_episode_length = self.cfg.env.max_episode_length
@@ -155,10 +159,11 @@ class IsaacEnv(EnvBase):
         
         central_env_pos = self.envs_positions[self.central_env_idx].cpu().numpy()
         # print("central env pos: ", central_env_pos)
-        set_camera_view(
-            eye=np.asarray(self.cfg.viewer.eye), 
-            target=np.asarray(self.cfg.viewer.lookat)
-        )
+        if self.enable_viewport:
+            set_camera_view(
+                eye=np.asarray(self.cfg.viewer.eye),
+                target=np.asarray(self.cfg.viewer.lookat),
+            )
         
         RobotBase._envs_positions = self.envs_positions.unsqueeze(1)
 
@@ -382,7 +387,8 @@ class IsaacEnv(EnvBase):
     def _create_viewport_render_product(self):
         """Create a render product of the viewport for rendering."""
         # set camera view for "/OmniverseKit_Persp" camera
-        set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
+        if self.enable_viewport:
+            set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
 
         # check if flatcache is enabled
         # this is needed to flush the flatcache data into Hydra manually when calling `env.render()`

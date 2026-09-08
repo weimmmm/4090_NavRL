@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -279,6 +280,8 @@ class SAC(TensorDictModuleBase):
         self.bootstrap_gamma = self.gamma ** self.n_step
         self.learn_alpha = bool(getattr(cfg, "learn_alpha", True))
         self.update_step = 0
+        self._distributed = False
+        self._process_group = None
         # debug_log.log_grad_norm 由外部 set_debug_options() 注入，默认 false → 不算 grad norm。
         self._record_grad_norm = False
 
@@ -327,6 +330,60 @@ class SAC(TensorDictModuleBase):
         else:
             self.log_alpha.requires_grad_(False)
             self.alpha_optim = None
+
+    def enable_distributed(self, process_group=None):
+        """Synchronize parameters and average every optimizer gradient."""
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("torch.distributed must be initialized first")
+        self._distributed = True
+        self._process_group = process_group
+        for tensor in self.state_dict().values():
+            dist.broadcast(tensor, src=0, group=self._process_group)
+
+    def _average_gradients(self, parameters):
+        if not self._distributed:
+            return
+        grads = [param.grad for param in parameters if param.grad is not None]
+        if not grads:
+            return
+
+        # One flattened all-reduce per optimizer is substantially cheaper than
+        # issuing one NCCL collective for every small layer tensor.
+        flat_grad = torch.cat([grad.reshape(-1) for grad in grads])
+        dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM, group=self._process_group)
+        flat_grad.div_(dist.get_world_size(group=self._process_group))
+        offset = 0
+        for grad in grads:
+            numel = grad.numel()
+            grad.copy_(flat_grad[offset:offset + numel].view_as(grad))
+            offset += numel
+
+    def synchronize_parameters(self):
+        """Average full model state and report pre-sync replica drift.
+
+        Gradient averaging should keep replicas identical, but independent
+        replay buffers and optimizer kernels can still introduce small numeric
+        differences over a long run.  Periodic state averaging makes that
+        assumption explicit without adding a collective for every layer.
+        """
+        if not self._distributed:
+            return 0.0
+        parameters = list(self.parameters())
+        if not parameters:
+            return 0.0
+        with torch.no_grad():
+            flat = torch.cat([param.detach().reshape(-1) for param in parameters])
+            averaged = flat.clone()
+            dist.all_reduce(averaged, op=dist.ReduceOp.SUM, group=self._process_group)
+            averaged.div_(dist.get_world_size(group=self._process_group))
+            max_diff = (flat - averaged).abs().max()
+            dist.all_reduce(max_diff, op=dist.ReduceOp.MAX, group=self._process_group)
+            offset = 0
+            for param in parameters:
+                numel = param.numel()
+                param.copy_(averaged[offset:offset + numel].view_as(param))
+                offset += numel
+        return float(max_diff.item())
 
 
     def _init_actor_log_std_bias(self, log_std_init):
@@ -494,6 +551,7 @@ class SAC(TensorDictModuleBase):
             # Update critics
             self.critic1_optim.zero_grad(set_to_none=True)
             critic1_loss.backward()
+            self._average_gradients(self.critic1.parameters())
             if self.grad_clip_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), self.grad_clip_norm)
             grad_norm_c1 = self._grad_l2_norm(self.critic1.parameters()) if self._record_grad_norm else None
@@ -501,6 +559,7 @@ class SAC(TensorDictModuleBase):
 
             self.critic2_optim.zero_grad(set_to_none=True)
             critic2_loss.backward()
+            self._average_gradients(self.critic2.parameters())
             if self.grad_clip_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), self.grad_clip_norm)
             grad_norm_c2 = self._grad_l2_norm(self.critic2.parameters()) if self._record_grad_norm else None
@@ -525,6 +584,7 @@ class SAC(TensorDictModuleBase):
 
                     self.actor_optim.zero_grad(set_to_none=True)
                     actor_loss.backward()
+                    self._average_gradients(self.actor.parameters())
                     if self.grad_clip_norm > 0.0:
                         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
                     if self._record_grad_norm:
@@ -562,6 +622,7 @@ class SAC(TensorDictModuleBase):
                 alpha_loss = (self.log_alpha * (entropy - self.target_entropy)).mean()
                 self.alpha_optim.zero_grad(set_to_none=True)
                 alpha_loss.backward()
+                self._average_gradients([self.log_alpha])
                 self.alpha_optim.step()
                 if self.min_alpha > 0.0 or math.isfinite(self.max_alpha):
                     min_log_alpha = math.log(max(self.min_alpha, 1e-8))

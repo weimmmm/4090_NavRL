@@ -249,8 +249,13 @@ def main(cfg: DictConfig):
     dataset = torch.load(dataset_path, map_location="cpu")
     cfg.env.num_envs = int(dataset["num_envs"])
 
-    if cfg.baseline_checkpoint is None:
+    policy_mode = str(cfg.eval.get("policy", "both"))
+    if policy_mode not in {"both", "baseline", "delay"}:
+        raise ValueError("eval.policy must be one of: both, baseline, delay")
+    if policy_mode in {"both", "baseline"} and cfg.baseline_checkpoint is None:
         raise ValueError("Set baseline_checkpoint=/path/to/baseline.pt")
+    if policy_mode == "delay" and cfg.delay_checkpoint is None:
+        raise ValueError("Set delay_checkpoint=/path/to/delay.pt")
 
     sim_app = SimulationApp(
         {
@@ -263,32 +268,47 @@ def main(cfg: DictConfig):
     )
 
     try:
+        # OmniDrones imports Orbit assets during module import. In this image
+        # all required drone assets are bundled locally, so avoid a blocking
+        # Nucleus probe when the remote content server is unavailable.
+        import carb
+
+        local_asset_root = "/tmp/navrl_local_nucleus"
+        os.makedirs(os.path.join(local_asset_root, "Isaac"), exist_ok=True)
+        os.makedirs(os.path.join(local_asset_root, "NVIDIA"), exist_ok=True)
+        carb.settings.get_settings().set(
+            "/persistent/isaac/asset_root/default", f"file://{local_asset_root}"
+        )
+        print("[NavRL]: importing evaluation environment", flush=True)
         from eval_env import TwoStageDelayEvalEnv
         from ppo import PPO as DelayPPO
 
+        print("[NavRL]: creating evaluation environment", flush=True)
         env = TwoStageDelayEvalEnv(cfg)
+        print("[NavRL]: evaluation environment ready", flush=True)
         transformed_env = env.eval()
         transformed_env.set_seed(cfg.seed, static_seed=True)
 
-        baseline_ppo = _load_baseline_ppo()
-        baseline_action_spec = type(
-            "ActionSpecView", (), {"shape": (1, 3)}
-        )()
-        baseline_policy = _load_policy(
-            baseline_ppo,
-            cfg,
-            _BaselineObservationSpec(transformed_env.observation_spec),
-            baseline_action_spec,
-            cfg.baseline_checkpoint,
-            cfg.device,
-            None,
-        )
-        baseline_policy = _BaselinePolicy(baseline_policy)
-
         metrics = {}
-        if cfg.delay_checkpoint is None:
-            metrics.update(_evaluate_one(transformed_env, env, baseline_policy, "random_timing", cfg))
-        else:
+        if policy_mode in {"both", "baseline"}:
+            baseline_ppo = _load_baseline_ppo()
+            baseline_action_spec = type(
+                "ActionSpecView", (), {"shape": (1, 3)}
+            )()
+            baseline_policy = _load_policy(
+                baseline_ppo,
+                cfg,
+                _BaselineObservationSpec(transformed_env.observation_spec),
+                baseline_action_spec,
+                cfg.baseline_checkpoint,
+                cfg.device,
+                None,
+            )
+            baseline_policy = _BaselinePolicy(baseline_policy)
+            metrics.update(
+                _evaluate_one(transformed_env, env, baseline_policy, "baseline", cfg)
+            )
+        if policy_mode in {"both", "delay"}:
             delay_policy = _load_policy(
                 DelayPPO,
                 cfg,
@@ -298,13 +318,19 @@ def main(cfg: DictConfig):
                 cfg.device,
                 float(cfg.timing.reference_dt),
             )
-            metrics.update(_evaluate_one(transformed_env, env, baseline_policy, "baseline", cfg))
-            metrics.update(_evaluate_one(transformed_env, env, delay_policy, "delay", cfg))
+            metrics.update(
+                _evaluate_one(transformed_env, env, delay_policy, "delay", cfg)
+            )
         printable = {key: value for key, value in metrics.items()}
         print("[NavRL]: random-delay comparison results")
         print(OmegaConf.to_yaml(OmegaConf.create(printable), sort_keys=True))
         result_path = _save_results(cfg, printable)
         print(f"[NavRL]: saved evaluation results to {result_path}")
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         sim_app.close()
 

@@ -1,3 +1,5 @@
+import math
+
 import torch
 import einops
 import numpy as np
@@ -12,6 +14,7 @@ from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from omni_drones.controllers import LeePositionController
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
 from omni.isaac.core.utils.viewports import set_camera_view
+from omni.isaac.core.objects import GroundPlane
 from utils import vec_to_new_frame, vec_to_world, construct_input
 import omni.isaac.core.utils.prims as prim_utils
 import omni.isaac.orbit.sim as sim_utils
@@ -50,6 +53,11 @@ class NavigationEnv(IsaacEnv):
         self.lidar_vbeams = cfg.sensor.lidar_vbeams
         self.lidar_hres = cfg.sensor.lidar_hres
         self.lidar_hbeams = int(360/self.lidar_hres)
+        self.observation_state_dim = int(
+            cfg.timing.get("observation_state_dim", 19)
+        )
+        if self.observation_state_dim not in (10, 19):
+            raise ValueError("timing.observation_state_dim must be 10 or 19")
 
         super().__init__(cfg, cfg.headless)
         
@@ -70,8 +78,12 @@ class NavigationEnv(IsaacEnv):
             cfg.timing,
             physics_dt=self.dt,
             nominal_steps=self.substeps,
+            observation_dt=self.reference_dt,
         )
-        self.max_command_delay_steps = self.timing_schedule.command_range[1]
+        self.max_command_delay_steps = max(
+            self.timing_schedule.command_range[1],
+            math.ceil(self.timing_schedule.command_seconds[1] / self.dt - 1e-9),
+        )
 
         # The policy selects world-frame velocity commands. active_cmd_vel is
         # visible to the low-level controller. Actor outputs enter a persistent
@@ -86,6 +98,9 @@ class NavigationEnv(IsaacEnv):
         )
         self.command_delay = torch.zeros_like(self.inference_delay)
         self.total_delay = torch.zeros_like(self.inference_delay)
+        self.observed_inference_delay = torch.zeros_like(self.inference_delay)
+        self.observed_command_delay = torch.zeros_like(self.inference_delay)
+        self.observed_total_delay = torch.zeros_like(self.inference_delay)
         self.transition_dt = torch.full_like(self.inference_delay, self.reference_dt)
         self.command_age_at_update = torch.zeros_like(self.inference_delay)
         self.active_command_age = torch.zeros_like(self.inference_delay)
@@ -101,6 +116,7 @@ class NavigationEnv(IsaacEnv):
         # Keep the physical horizon equal to the no-delay environment.
         self.max_episode_time = float(self.max_episode_length * self.dt * self.substeps)
         self.nominal_command_dt = float(self.dt * self.substeps)
+        self.reward_time_scale = float(self.dt / self.reference_dt)
         self.episode_time = torch.zeros_like(self.inference_delay)
 
 
@@ -190,8 +206,12 @@ class NavigationEnv(IsaacEnv):
         sky_light.spawn.func(sky_light.prim_path, sky_light.spawn)
         
         # Ground Plane
-        cfg_ground = sim_utils.GroundPlaneCfg(color=(0.1, 0.1, 0.1), size=(300., 300.))
-        cfg_ground.func("/World/defaultGroundPlane", cfg_ground, translation=(0, 0, 0.01))
+        GroundPlane(
+            prim_path="/World/defaultGroundPlane",
+            size=300.0,
+            z_position=0.01,
+            color=np.asarray((0.1, 0.1, 0.1)),
+        )
 
         self.map_range = [20.0, 20.0, 4.5]
 
@@ -228,7 +248,9 @@ class NavigationEnv(IsaacEnv):
             visual_material = None,
             max_init_terrain_level=None,
             collision_group=-1,
-            debug_vis=True,
+            # Avoid Orbit's optional USD marker assets during headless eval;
+            # they are hosted on Nucleus and are not needed for observations.
+            debug_vis=False,
         )
         terrain_importer = TerrainImporter(terrain_cfg)
 
@@ -397,7 +419,9 @@ class NavigationEnv(IsaacEnv):
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
-                    "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
+            "state": UnboundedContinuousTensorSpec(
+                (self.observation_state_dim,), device=self.device
+            ),
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                     "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
@@ -439,6 +463,9 @@ class NavigationEnv(IsaacEnv):
             "inference_delay": UnboundedContinuousTensorSpec(1),
             "command_delay": UnboundedContinuousTensorSpec(1),
             "total_delay": UnboundedContinuousTensorSpec(1),
+            "observed_inference_delay": UnboundedContinuousTensorSpec(1),
+            "observed_command_delay": UnboundedContinuousTensorSpec(1),
+            "observed_total_delay": UnboundedContinuousTensorSpec(1),
             "sampled_inference_delay": UnboundedContinuousTensorSpec(1),
             "sampled_command_delay": UnboundedContinuousTensorSpec(1),
             "sampled_total_delay": UnboundedContinuousTensorSpec(1),
@@ -542,6 +569,9 @@ class NavigationEnv(IsaacEnv):
         self.inference_delay[env_ids] = 0.
         self.command_delay[env_ids] = 0.
         self.total_delay[env_ids] = 0.
+        self.observed_inference_delay[env_ids] = 0.
+        self.observed_command_delay[env_ids] = 0.
+        self.observed_total_delay[env_ids] = 0.
         self.transition_dt[env_ids] = self.nominal_command_dt
         self.command_age_at_update[env_ids] = 0.
         self.active_command_age[env_ids] = 0.
@@ -594,6 +624,8 @@ class NavigationEnv(IsaacEnv):
         mask: torch.Tensor,
         command_age_steps: torch.Tensor,
         inference_delay: float,
+        observed_inference_delay: float,
+        observed_command_delay: float,
     ):
         mask = mask.reshape(self.num_envs)
         self.command_age_at_update[mask] = self.active_command_age[mask]
@@ -602,6 +634,11 @@ class NavigationEnv(IsaacEnv):
         actual_command_delay = command_age_steps[mask].unsqueeze(-1) * self.dt
         self.command_delay[mask] = actual_command_delay
         self.total_delay[mask] = inference_delay + actual_command_delay
+        self.observed_inference_delay[mask] = observed_inference_delay
+        self.observed_command_delay[mask] = observed_command_delay
+        self.observed_total_delay[mask] = (
+            observed_inference_delay + observed_command_delay
+        )
         self.stats["command_update_count"][mask] += 1.
 
     def _enqueue_command(
@@ -610,6 +647,8 @@ class NavigationEnv(IsaacEnv):
         delay_steps: int,
         valid_mask: torch.Tensor,
         inference_delay: float,
+        observed_inference_delay: float,
+        observed_command_delay: float,
     ):
         valid_mask = valid_mask.reshape(self.num_envs).clone()
         if delay_steps == 0 and not self._command_queue:
@@ -620,6 +659,8 @@ class NavigationEnv(IsaacEnv):
                     self.num_envs, dtype=torch.long, device=self.device
                 ),
                 inference_delay=inference_delay,
+                observed_inference_delay=observed_inference_delay,
+                observed_command_delay=observed_command_delay,
             )
             return
 
@@ -644,6 +685,8 @@ class NavigationEnv(IsaacEnv):
             immediate,
             command_age_steps=torch.zeros_like(scheduled_steps),
             inference_delay=inference_delay,
+            observed_inference_delay=observed_inference_delay,
+            observed_command_delay=observed_command_delay,
         )
         queued = valid_mask & scheduled_steps.gt(0)
         self._command_queue.append(
@@ -652,6 +695,8 @@ class NavigationEnv(IsaacEnv):
                 "remaining_steps": scheduled_steps,
                 "age_steps": torch.zeros_like(scheduled_steps),
                 "inference_delay": float(inference_delay),
+                "observed_inference_delay": float(observed_inference_delay),
+                "observed_command_delay": float(observed_command_delay),
                 "valid": queued,
                 "retention_steps": max(1, self.max_command_delay_steps),
             }
@@ -670,6 +715,8 @@ class NavigationEnv(IsaacEnv):
                 due & alive_mask,
                 command_age_steps=entry["age_steps"],
                 inference_delay=entry["inference_delay"],
+                observed_inference_delay=entry["observed_inference_delay"],
+                observed_command_delay=entry["observed_command_delay"],
             )
             entry["valid"][due] = False
             entry["retention_steps"] -= 1
@@ -724,21 +771,30 @@ class NavigationEnv(IsaacEnv):
         pending_cmd_goal = vec_to_new_frame(
             self.next_pending_cmd_vel.unsqueeze(1), direction
         ).squeeze(1)
-        state[..., 8:11] = active_cmd_goal
-        state[..., 11:14] = pending_cmd_goal
-        state[..., 14:15] = self.inference_delay / self.reference_dt
-        state[..., 15:16] = self.command_delay / self.reference_dt
-        state[..., 16:17] = self.total_delay / self.reference_dt
-        state[..., 17:18] = self.pending_command_age / self.reference_dt
-        state[..., 18:19] = self.command_queue_depth
+        state[..., 8:9] = self.observed_inference_delay / self.reference_dt
+        state[..., 9:10] = self.observed_command_delay / self.reference_dt
+        if self.observation_state_dim == 19:
+            state[..., 8:11] = active_cmd_goal
+            state[..., 11:14] = pending_cmd_goal
+            state[..., 14:15] = self.observed_inference_delay / self.reference_dt
+            state[..., 15:16] = self.observed_command_delay / self.reference_dt
+            state[..., 16:17] = self.observed_total_delay / self.reference_dt
+            state[..., 17:18] = torch.floor(
+                self.pending_command_age / self.reference_dt + 1e-9
+            )
+            state[..., 18:19] = self.command_queue_depth
 
     def _step(self, tensordict: TensorDictBase):
         timing = self.timing_schedule.sample(self.training)
         self.pending_cmd_vel.copy_(self._read_actor_command(tensordict))
 
-        sampled_inference_delay = timing.inference_steps * self.dt
-        sampled_command_delay = timing.command_steps * self.dt
+        sampled_inference_delay = timing.inference_delay
+        sampled_command_delay = timing.command_delay
         sampled_total_delay = sampled_inference_delay + sampled_command_delay
+        observed_inference_delay = (
+            timing.observed_inference_steps * self.reference_dt
+        )
+        observed_command_delay = timing.observed_command_steps * self.reference_dt
         self.stats["sampled_inference_delay"].fill_(sampled_inference_delay)
         self.stats["sampled_command_delay"].fill_(sampled_command_delay)
         self.stats["sampled_total_delay"].fill_(sampled_total_delay)
@@ -761,12 +817,18 @@ class NavigationEnv(IsaacEnv):
         # of this nominal control interval.
         if timing.inference_steps == 0:
             valid = ~(terminated | truncated)
-            self.inference_delay[valid] = sampled_inference_delay
+            self.inference_delay[valid] = timing.inference_steps * self.dt
+            self.observed_inference_delay[valid] = observed_inference_delay
+            self.observed_total_delay[valid] = (
+                observed_inference_delay + self.observed_command_delay[valid]
+            )
             self._enqueue_command(
                 self.pending_cmd_vel,
                 timing.command_steps,
                 valid,
-                sampled_inference_delay,
+                timing.inference_steps * self.dt,
+                observed_inference_delay,
+                observed_command_delay,
             )
             self._refresh_command_queue_state()
             command_enqueued = True
@@ -776,8 +838,9 @@ class NavigationEnv(IsaacEnv):
             self.transition_dt += self.dt * alive.float()
             step_tensordict = self._advance_physics_tick(render_step, alive)
             transition_reward += (
-                (self.reward_gamma ** render_step)
+                (self.reward_gamma ** (render_step * self.reward_time_scale))
                 * self.reward
+                * self.reward_time_scale
                 * alive.float()
             )
             terminated |= self.terminated
@@ -788,12 +851,18 @@ class NavigationEnv(IsaacEnv):
             # countdown starts from this boundary and overlaps future inference.
             if not command_enqueued and render_step == timing.inference_steps:
                 valid = ~(terminated | truncated)
-                self.inference_delay[valid] = sampled_inference_delay
+                self.inference_delay[valid] = timing.inference_steps * self.dt
+                self.observed_inference_delay[valid] = observed_inference_delay
+                self.observed_total_delay[valid] = (
+                    observed_inference_delay + self.observed_command_delay[valid]
+                )
                 self._enqueue_command(
                     self.pending_cmd_vel,
                     timing.command_steps,
                     valid,
-                    sampled_inference_delay,
+                    timing.inference_steps * self.dt,
+                    observed_inference_delay,
+                    observed_command_delay,
                 )
                 self._refresh_command_queue_state()
                 command_enqueued = True
@@ -807,6 +876,9 @@ class NavigationEnv(IsaacEnv):
         self.stats["inference_delay"] = self.inference_delay
         self.stats["command_delay"] = self.command_delay
         self.stats["total_delay"] = self.total_delay
+        self.stats["observed_inference_delay"] = self.observed_inference_delay
+        self.stats["observed_command_delay"] = self.observed_command_delay
+        self.stats["observed_total_delay"] = self.observed_total_delay
         self.stats["transition_dt"] = self.transition_dt
         self.stats["command_age_at_update"] = self.command_age_at_update
         self.stats["pending_command_age"] = self.pending_command_age
@@ -877,19 +949,32 @@ class NavigationEnv(IsaacEnv):
         pending_cmd_goal = vec_to_new_frame(
             self.next_pending_cmd_vel.unsqueeze(1), target_dir_2d
         ).squeeze(1)
-        timing_state = torch.cat(
-            [
-                self.inference_delay / self.reference_dt,
-                self.command_delay / self.reference_dt,
-                self.total_delay / self.reference_dt,
-                self.pending_command_age / self.reference_dt,
-                self.command_queue_depth,
-            ],
-            dim=-1,
-        )
-        drone_state = torch.cat(
-            [drone_state, active_cmd_goal, pending_cmd_goal, timing_state], dim=-1
-        )
+        if self.observation_state_dim == 10:
+            timing_state = torch.cat(
+                [
+                    self.observed_inference_delay / self.reference_dt,
+                    self.observed_command_delay / self.reference_dt,
+                ],
+                dim=-1,
+            )
+        else:
+            timing_state = torch.cat(
+                [
+                    self.observed_inference_delay / self.reference_dt,
+                    self.observed_command_delay / self.reference_dt,
+                    self.observed_total_delay / self.reference_dt,
+                    self.pending_command_age / self.reference_dt,
+                    self.command_queue_depth,
+                ],
+                dim=-1,
+            )
+        if self.observation_state_dim == 10:
+            drone_state = torch.cat([drone_state, timing_state], dim=-1)
+        else:
+            drone_state = torch.cat(
+                [drone_state, active_cmd_goal, pending_cmd_goal, timing_state],
+                dim=-1,
+            )
 
         if (self.cfg.env_dyn.num_obstacles != 0):
             # ---------Network Input III: Dynamic obstacle states--------
@@ -985,8 +1070,8 @@ class NavigationEnv(IsaacEnv):
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
         collision = static_collision | dynamic_collision
         
-        # Reward is evaluated once per fixed physics tick. _step aggregates it
-        # with the same per-tick gamma used by PPO.
+        # Reward is evaluated once per physics tick. _step time-scales it back
+        # to the 16 ms policy reference interval used by PPO.
         if (self.cfg.env_dyn.num_obstacles != 0):
             reward_rate = reward_vel + 1. + reward_safety_static + reward_safety_dynamic - penalty_height * 8.0
         else:
@@ -1014,7 +1099,9 @@ class NavigationEnv(IsaacEnv):
                 self.drone.vel_w[..., :3],
                 self.prev_drone_vel_w,
             )
-            self.stats["return"] += self.reward * stats_mask
+            self.stats["return"] += (
+                self.reward * self.reward_time_scale * stats_mask
+            )
             self.stats["episode_len"][:] = (
                 self.episode_time / self.nominal_command_dt
             ).clamp(max=float(self.max_episode_length))

@@ -43,12 +43,15 @@ docker ps -a --filter name=navrl-train
 
 ```bash
 docker start -ai navrl-train
+
 ```
 
 容器已在后台运行时：
 
 ```bash
 docker exec -it navrl-train /bin/bash
+
+docker exec -it navrl-sac-gpu125 bash
 ```
 
 进入后确认代码挂载正常：

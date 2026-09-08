@@ -23,8 +23,7 @@ feature_extractor:
 #   2) alpha_learning_rate: 1e-5 -> 3e-4  借鉴 v16，alpha 在约 10M frames 内跌破 0.1
 #   3) warmup_steps: 200000 -> 5000000  借鉴 zdy（zdy 用 20M + batch=512，等效 batch 数 4×；
 #      我们 batch=2048，5M warmup 与 zdy 20M 等效铺数据时长）
-# 其它 v17 参数全部保留：gamma=0.95、log_std_max=0.5、UTD=2、buffer=10M、reward_scale=1.0、
-# critic.loss=mse、grad_clip=0、target_q_clip=0、actor_update_interval=1。
+# 其它 v17 参数全部保留：gamma=0.95、log_std_max=0.5、UTD≈2.65、buffer=10M、reward_scale=1.0。
 
 actor:
   # v1 用 5e-5，保持。
@@ -37,24 +36,24 @@ actor:
   log_std_max: 0.5
 
 critic:
-  learning_rate: 5e-4
-  loss: mse
+  # A lower critic step and Huber loss reduce the effect of rare +/-200
+  # terminal rewards on the long-run Q estimate.
+  learning_rate: 3e-4
+  loss: smooth_l1
 
-# UTD = 64 × 2048 / (2048 × 32) = 2.0  保持 v17，避免 v18 UTD=4 的早期崩坏。
+# 每卡 UTD = 128 × 2048 / (3096 × 32) ≈ 2.65，与修改前单卡配置一致。
 training_frame_num: 32
 n_step: 1
 num_minibatches: 128
-# buffer=10M 同 v17。GPU storage ~17 GB，A100-40GB 安全。
-buffer_size: 10000000
+# 3 卡全局容量；训练入口均分后每张卡仍使用原来的 10M CPU replay。
+buffer_size: 30000000
 # 修改①：warmup 200k -> 5M
-# 决策：zdy 用 batch=512、warmup=20M，warmup 期内 buffer 累积约 20M / 16k(每环境) ≈ 1250 个 batch；
-#       我们 batch=2048，warmup=5M 累积 ~76 个 batch（按 65536 frames/batch），
-#       与 zdy 等效"actor 看到第一次更新时 critic 已经稳"的语义对齐。
+# 每卡 warmup 仍为 5M，约 51 个 3096×32 的本地采集批次。
 # 副作用：5M warmup ≈ 1.5 分钟纯采样，相对 500M 总训练几乎不占成本。
 warmup_steps: 5000000
 batch_size: 2048
 gamma: 0.95
-tau: 0.004
+tau: 0.002
 
 # 修改②③：alpha 全部回到 v16 的快衰减
 # - alpha_init: 5.0 -> 1.0   ln(1)=0 起步，比 v17 的 ln(5)≈1.6 低 1.6，actor 一开始就有明显方向
@@ -81,7 +80,12 @@ target_entropy: -3.0
 min_alpha: 0.004
 max_alpha: .inf
 alpha_learning_rate: 3e-4
-actor_update_interval: 1
-grad_clip_norm: 0.0
-target_q_clip: 0.0
+# Delay actor updates while the critic target is settling. Critic UTD is
+# unchanged, so the per-GPU collector workload remains the same.
+actor_update_interval: 2
+# Protect all three optimizers from an occasional terminal-reward outlier.
+grad_clip_norm: 10.0
+# Q values in this task are far below 100; this only removes pathological
+# one-step targets and does not clip the normal training signal.
+target_q_clip: 100.0
 reward_scale: 1.0

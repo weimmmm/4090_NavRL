@@ -1,12 +1,9 @@
 # =========================================================================
-# GPU 启动约定（固定物理 GPU0）
+# GPU 启动约定（3 卡、一卡一进程）
 # -------------------------------------------------------------------------
-# 固定启动方式：
-#     python scripts/train_sac.py \
-#         device=cuda:0 sim.device=cuda:0 replay_buffer.storage_device=cuda:0 ...
-#
-# 脚本会强制 CUDA_VISIBLE_DEVICES=0；device、sim.device 与 replay buffer
-# 使用进程内 cuda:0，即物理 GPU0。
+# 固定启动方式：scripts/train_sac_3gpu.sh
+# env.num_envs / algo.buffer_size / max_frame_num 使用 3 卡全局总量；训练入口按
+# world_size 均分，每张卡仍运行原单卡配置：3096 env、10M CPU replay、655.36M frames。
 # =========================================================================
 defaults:
   - _self_
@@ -18,6 +15,17 @@ defaults:
 headless: True
 device: "cuda:0"   # 必须与 sim.device 一致
 seed: 3407
+# The generated /World/ground terrain is complete; this avoids an unused
+# Nucleus-hosted visual plane and keeps Docker training offline.
+skip_default_ground_plane: true
+
+distributed:
+  enabled: true
+  expected_world_size: 3
+  backend: nccl
+  # Average complete model state periodically as a guard against long-run
+  # numeric drift between the three independent Adam/replay replicas.
+  parameter_sync_interval: 16
 
 # ---- Warm-start (可选) ----
 # null = 冷启动；指向一个 SAC checkpoint(.pt) 则 load policy.state_dict 后再训。
@@ -80,17 +88,11 @@ save_eval_worlds: false
 # 仅在 save_full_state=true 时生效。
 save_full_state_with_buffer: false
 
-# Total Training Length
-# v20-B：在 v19 (500M) 基础上拉长到 1.2B (与 v17 同口径)，
-# 配合 algo/sac.yaml 的 min_alpha=0.005 (≈v19 alpha 实测下沿) 给后期一个软底。
-# 预期：500-800M 区间可能出现新 best（类似 v19 但有 floor 防退化）；
-#       800M-1.2B 区间 min_alpha 兜底防止"alpha→0、actor 退化"。
-# 若需要单变量复现 v19 原版，CLI 覆盖：max_frame_num=500000000 algo.min_alpha=0
-# 10,000 个 collector step：10,000 × num_envs(2048) × rollout(32) = 655,360,000 帧。
-max_frame_num: 655360000
-# Saves checkpoint_latest.pt by overwriting it; numbered checkpoints are disabled
-# to avoid filling the wandb run directory during long SAC runs.
-save_interval: 1000
+# 3 卡全局帧数；每张卡均分到 655,360,000 帧，与原单卡训练长度一致。
+max_frame_num: 1966080000
+# Saves a numbered checkpoint every interval and keeps the best training-policy
+# checkpoint separately as checkpoint_best_train.pt.
+save_interval: 500
 train_stats_window: 256
 best_metric: eval_deterministic/stats.reach_goal
 # v19-aggressive：best_min_step=1500（约 98M frames）。
@@ -153,7 +155,7 @@ deterministic_eval:
   # 总长度只有 500M（≈ 7600 step），interval=200 全程约 38 次评估，足够锁定早期峰值；
   # P0-3 修复后 eval 不污染训练，加密 eval 安全。
   # 代价：每次 eval ~7s × 38 ≈ 4.5 分钟，相对总训练时长可忽略。
-  enabled: true
+  enabled: false
   interval: 200
   seed: 3407
   max_steps: 2200
@@ -187,7 +189,7 @@ reward:
 
 # Training Environment
 env:
-  num_envs: 3096
+  num_envs: 9288
   max_episode_length: 2200
   env_spacing: 8.0
   num_obstacles: 350
@@ -249,6 +251,11 @@ replay_buffer:
   pin_memory: true
   prefetch: 0
   store_full_transitions: false
+  # Keep terminal transitions in a second compact FIFO. The main 10M replay
+  # remains unchanged per GPU, while successful/collision endpoints cannot be
+  # completely flushed out by a late policy distribution shift.
+  terminal_capacity: 200000
+  terminal_fraction: 0.10
 
 simple_eval:
   # Every saved checkpoint is evaluated on the same frozen eval_3407.pt world.

@@ -1,8 +1,8 @@
 defaults:
-  - _self_
   - drone
   - ppo
   - sim
+  - _self_
 
 headless: true
 gpu_id: 1
@@ -26,8 +26,9 @@ env_dyn:
 
 eval:
   enabled: true
+  policy: both
   # This file fixes only scenarios. Physics, rewards, observations and timing
-  # all come from the training_delay NavigationEnv implementation.
+  # all come from the delay_value NavigationEnv implementation.
   dataset_path: environments/fixed_scenarios.pt
   max_steps: 2200
   record_video: true
@@ -39,6 +40,14 @@ timing:
   mode: overlapping_transport
   # Keep both stages random while env.training is false.
   randomize_in_eval: true
+  # Sample requested delays at 1 ms resolution. The policy-facing timing
+  # features use floor(delay / reference_dt), while transport executes on ticks.
+  continuous_in_eval: true
+  delay_resolution: 0.001
+  observation_quantization: floor
+  # checkpoint_final.pt in training_delay uses the original 10-D state:
+  # 8 base features plus inference and command delay.
+  observation_state_dim: 10
   reference_dt: 0.016
   inference_delay:
     min: 0.016
@@ -50,6 +59,12 @@ timing:
     eval: 0.016
   change_probability: 0.2
   max_step_change: 1
+
+# Evaluation-only 1 ms physics resolution makes integer-millisecond delays
+# take effect at their requested time. A nominal policy interval remains 16 ms.
+sim:
+  dt: 0.001
+  substeps: 16
 
 viewer:
   eye: [0.0, 40.0, 40.0]

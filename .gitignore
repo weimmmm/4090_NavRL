@@ -95,6 +95,20 @@ docker-compose.override.yml
 
 # Ignore generated experiment outputs from nested training variants
 **/outputs/
+**/results/
+**/videos/
+*.mp4
+
+# Training artifacts: checkpoints and run metadata
+**/checkpoints/
+**/eval_worlds/
+**/checkpoint*.pt
+**/checkpoint*.pth
+**/checkpoint*.ckpt
+**/training_config.yaml
+**/training_config.yml
+**/training_metadata.json
+**/*_metadata.json
 
 # Ignore Isaac Orbit symlink
 isaac-training/third_party/orbit/_isaac_sim
