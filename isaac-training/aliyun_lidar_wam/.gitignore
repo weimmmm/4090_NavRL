@@ -1,0 +1,21 @@
+# Generated datasets and portable archives
+/datasets/
+/lidar_WAM.tar.gz
+
+# Training checkpoints, latent caches, and experiment outputs
+/lidar_WAM/outputs/
+/isaac_eval/outputs/
+
+# Evaluation artifacts are reproducible and should stay outside Git
+/isaac_eval/results/
+
+# Python/test caches and runtime logs
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/*.log
+
+# Editor and OS metadata
+**/.DS_Store
+**/.idea/
+**/.vscode/
