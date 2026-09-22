@@ -1,8 +1,9 @@
-"""Compare policies under the same two-stage random timing schedule."""
+"""Compare policies with command publication-to-controller delay."""
 
 import importlib.util
 import os
 import sys
+import gc
 from datetime import datetime
 
 import hydra
@@ -12,6 +13,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from omni.isaac.kit import SimulationApp
 from torchrl.envs.utils import ExplorationType, set_exploration_type
+from startup import clear_navigation_simulation, navigation_asset_imports
 
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
@@ -42,38 +44,37 @@ def _load_baseline_ppo():
 
 
 class _BaselineObservationSpec:
-    """Give baseline PPO a zero observation with its original 8-D state."""
+    """Initialize an old 8-D baseline from the shared 12-D environment."""
 
-    def __init__(self, spec):
-        self.spec = spec
+    def __init__(self, observation_spec):
+        self.observation_spec = observation_spec
 
     def zero(self):
-        tensordict = self.spec.zero()
-        state_key = ("agents", "observation", "state")
-        tensordict.set(state_key, tensordict.get(state_key)[..., :8].contiguous())
-        return tensordict
+        sample = self.observation_spec.zero()
+        key = ("agents", "observation", "state")
+        sample.set(key, sample.get(key)[..., :8])
+        return sample
 
 
-class _BaselinePolicy:
-    """Remove timing-aware state features before calling the old policy."""
+class _BaselinePolicyAdapter:
+    """Keep the environment's 12-D state while the baseline consumes 8-D."""
 
     def __init__(self, policy):
         self.policy = policy
 
     def __call__(self, tensordict):
-        policy_input = tensordict.clone()
-        state_key = ("agents", "observation", "state")
-        policy_input.set(state_key, policy_input.get(state_key)[..., :8].contiguous())
-        self.policy(policy_input)
-        for key in (("agents", "action_normalized"), ("agents", "action")):
-            tensordict.set(key, policy_input.get(key))
+        baseline_input = tensordict.clone()
+        key = ("agents", "observation", "state")
+        baseline_input.set(key, baseline_input.get(key)[..., :8])
+        baseline_output = self.policy(baseline_input)
+        tensordict.set(("agents", "action"), baseline_output.get(("agents", "action")))
         return tensordict
 
 
 class _TimedRenderCallback:
     """Render frames and keep each outer policy transition duration."""
 
-    def __init__(self, base_env, interval=2):
+    def __init__(self, base_env, interval=50):
         from omni_drones.utils.torchrl import RenderCallback
 
         self.base_env = base_env
@@ -92,21 +93,22 @@ class _TimedRenderCallback:
         return self._callback.get_video_array(*args, **kwargs)
 
 
-def _load_policy(policy_cls, cfg, observation_spec, action_spec, checkpoint, device, timing_reference):
+def _load_policy(policy_cls, cfg, observation_spec, action_spec, checkpoint, device):
     policy = policy_cls(
-        cfg.algo,
-        observation_spec,
-        action_spec,
-        device,
-        timing_reference,
-    ) if timing_reference is not None else policy_cls(
         cfg.algo,
         observation_spec,
         action_spec,
         device,
     )
     state_dict = torch.load(to_absolute_path(checkpoint), map_location=device)
-    policy.load_state_dict(state_dict)
+    try:
+        policy.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        state_dim = observation_spec.zero()["agents", "observation", "state"].shape[-1]
+        raise RuntimeError(
+            f"Checkpoint is incompatible with this {state_dim}-D policy. "
+            "Use a checkpoint trained for this observation layout."
+        ) from exc
     return policy
 
 
@@ -118,10 +120,13 @@ def _save_results(cfg, metrics):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_path = os.path.join(result_dir, f"evaluation_{timestamp}.yaml")
     payload = {
-        "implementation": "two_stage_async_fifo",
-        "environment": "training_delay.NavigationEnv",
+        "implementation": "physics_tick_command_delivery",
+        "environment": "delay_value.CommandDelayEvaluationEnv(training_delay.NavigationEnv)",
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "baseline_checkpoint": to_absolute_path(str(cfg.baseline_checkpoint)),
+        "baseline_checkpoint": (
+            to_absolute_path(str(cfg.baseline_checkpoint))
+            if cfg.baseline_checkpoint is not None else None
+        ),
         "delay_checkpoint": (
             to_absolute_path(str(cfg.delay_checkpoint))
             if cfg.delay_checkpoint is not None
@@ -130,6 +135,11 @@ def _save_results(cfg, metrics):
         "dataset_path": _resolve_project_path(cfg.eval.dataset_path),
         "seed": int(cfg.seed),
         "timing": OmegaConf.to_container(cfg.timing, resolve=True),
+        "physics_dt": float(cfg.sim.dt),
+        "policy_dt": float(cfg.sim.dt) * int(cfg.sim.substeps),
+        "reward_dt": float(cfg.sim.dt * cfg.sim.substeps),
+        "discount_dt": float(cfg.sim.dt * cfg.sim.substeps),
+        "observation_state_dim": 12,
         "metrics": metrics,
     }
     OmegaConf.save(OmegaConf.create(payload), result_path)
@@ -159,8 +169,7 @@ def _evaluate_one(env, base_env, policy, name, cfg):
     seed = int(cfg.seed)
     env.eval()
     env.set_seed(seed, static_seed=True)
-    # A dedicated timing RNG makes both policies see the same inference and
-    # command delay sequence, independent of policy-dependent episode resets.
+    # Replay the same command-delay sequence for each policy.
     base_env.reset_timing_schedule(seed)
     env.reset()
 
@@ -168,7 +177,7 @@ def _evaluate_one(env, base_env, policy, name, cfg):
     env.enable_render(record_video)
     callback = None
     if record_video:
-        callback = _TimedRenderCallback(base_env, interval=2)
+        callback = _TimedRenderCallback(base_env, interval=50)
 
     rollout_kwargs = {
         "max_steps": int(cfg.eval.max_steps),
@@ -188,15 +197,6 @@ def _evaluate_one(env, base_env, policy, name, cfg):
         for key, value in stats.items()
     }
 
-    # episode_len is already reported in equivalent nominal control steps by
-    # the delay environment. Expose the physical-time equivalent separately;
-    # decision_count remains the raw number of policy commands.
-    if "episode_len" in stats and "episode_time" in stats:
-        nominal_dt = float(cfg.sim.dt) * float(cfg.sim.substeps)
-        metrics[f"{name}/equivalent_episode_len"] = (
-            float(stats["episode_time"].float().mean()) / nominal_dt
-        )
-
     if callback is not None:
         import imageio_ffmpeg
 
@@ -212,12 +212,12 @@ def _evaluate_one(env, base_env, policy, name, cfg):
             video_array = np.clip(video_array, 0.0, 255.0).astype(np.uint8)
         video_array = np.ascontiguousarray(video_array)
         height, width = video_array.shape[1:3]
-        # Frames are captured every two policy decisions. Use the measured
+        # Frames are captured every 50 policy decisions. Use the measured
         # transition duration so playback follows simulated physical time.
         if callback.transition_dts:
             mean_transition_dt = float(np.mean(callback.transition_dts))
         else:
-            mean_transition_dt = float(cfg.timing.reference_dt)
+            mean_transition_dt = float(cfg.sim.dt) * int(cfg.sim.substeps)
         fps = max(1, int(round(1.0 / (mean_transition_dt * callback.interval))))
         metrics[f"{name}/mean_transition_dt"] = mean_transition_dt
         metrics[f"{name}/video_fps"] = fps
@@ -254,9 +254,10 @@ def main(cfg: DictConfig):
         raise ValueError("eval.policy must be one of: both, baseline, delay")
     if policy_mode in {"both", "baseline"} and cfg.baseline_checkpoint is None:
         raise ValueError("Set baseline_checkpoint=/path/to/baseline.pt")
-    if policy_mode == "delay" and cfg.delay_checkpoint is None:
+    if policy_mode in {"both", "delay"} and cfg.delay_checkpoint is None:
         raise ValueError("Set delay_checkpoint=/path/to/delay.pt")
 
+    torch.cuda.set_device(torch.device(cfg.device))
     sim_app = SimulationApp(
         {
             "headless": cfg.headless,
@@ -267,24 +268,16 @@ def main(cfg: DictConfig):
         }
     )
 
+    env = None
+    transformed_env = None
     try:
-        # OmniDrones imports Orbit assets during module import. In this image
-        # all required drone assets are bundled locally, so avoid a blocking
-        # Nucleus probe when the remote content server is unavailable.
-        import carb
-
-        local_asset_root = "/tmp/navrl_local_nucleus"
-        os.makedirs(os.path.join(local_asset_root, "Isaac"), exist_ok=True)
-        os.makedirs(os.path.join(local_asset_root, "NVIDIA"), exist_ok=True)
-        carb.settings.get_settings().set(
-            "/persistent/isaac/asset_root/default", f"file://{local_asset_root}"
-        )
         print("[NavRL]: importing evaluation environment", flush=True)
-        from eval_env import TwoStageDelayEvalEnv
-        from ppo import PPO as DelayPPO
+        with navigation_asset_imports():
+            from eval_env import CommandDelayEvalEnv
+            from ppo import PPO as DelayPPO
 
         print("[NavRL]: creating evaluation environment", flush=True)
-        env = TwoStageDelayEvalEnv(cfg)
+        env = CommandDelayEvalEnv(cfg)
         print("[NavRL]: evaluation environment ready", flush=True)
         transformed_env = env.eval()
         transformed_env.set_seed(cfg.seed, static_seed=True)
@@ -302,11 +295,12 @@ def main(cfg: DictConfig):
                 baseline_action_spec,
                 cfg.baseline_checkpoint,
                 cfg.device,
-                None,
             )
-            baseline_policy = _BaselinePolicy(baseline_policy)
             metrics.update(
-                _evaluate_one(transformed_env, env, baseline_policy, "baseline", cfg)
+                _evaluate_one(
+                    transformed_env, env, _BaselinePolicyAdapter(baseline_policy),
+                    "baseline", cfg,
+                )
             )
         if policy_mode in {"both", "delay"}:
             delay_policy = _load_policy(
@@ -316,7 +310,6 @@ def main(cfg: DictConfig):
                 transformed_env.action_spec,
                 cfg.delay_checkpoint,
                 cfg.device,
-                float(cfg.timing.reference_dt),
             )
             metrics.update(
                 _evaluate_one(transformed_env, env, delay_policy, "delay", cfg)
@@ -332,6 +325,13 @@ def main(cfg: DictConfig):
         traceback.print_exc()
         raise
     finally:
+        if env is not None:
+            clear_navigation_simulation(env)
+            transformed_env = None
+            env = None
+            gc.collect()
+        sys.stdout.flush()
+        sys.stderr.flush()
         sim_app.close()
 
 

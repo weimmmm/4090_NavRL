@@ -6,25 +6,20 @@ from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDict
 from einops.layers.torch import Rearrange
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
+from lidar_encoder import RangeImageEncoder
 from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
 
 
 
 class PPO(TensorDictModuleBase):
-    def __init__(self, cfg, observation_spec, action_spec, device):
+    def __init__(self, cfg, observation_spec, action_spec, device, lidar_range):
         super().__init__()
         self.cfg = cfg
         self.device = device
 
         
-        # Feature extractor for LiDAR
-        feature_extractor_network = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
-            Rearrange("n c w h -> n (c w h)"),
-            nn.LazyLinear(128), nn.LayerNorm(128),
-        ).to(self.device)
+        # Normalized range image with circular azimuth and zero-padded elevation.
+        feature_extractor_network = RangeImageEncoder(lidar_range).to(self.device)
         
         # Dynamic obstacle information extractor
         dynamic_obstacle_network = nn.Sequential(

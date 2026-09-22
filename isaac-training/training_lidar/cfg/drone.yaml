@@ -1,0 +1,12 @@
+drone:  
+  model_name: "hummingbird"
+
+sensor:
+  lidar_range: 10.
+  lidar_hfov: 360. # degree
+  lidar_vfov: [-7., 52.] # degree
+  lidar_vbeams: 6 # policy grid vertical beams
+  lidar_hres: 10. # policy grid angular step: 360 / 10 = 36 beams
+  lidar_h_sample: 3 # raw horizontal beams: 36 * 3 = 108
+  lidar_v_sample: 3 # raw vertical beams: 6 * 3 = 18
+  

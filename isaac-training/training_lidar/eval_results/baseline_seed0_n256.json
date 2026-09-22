@@ -1,0 +1,27 @@
+{
+  "variant": "baseline",
+  "checkpoint": "/workspace/NavRL/isaac-training/wandb/run-20260831_141527-yza88ur1/files/checkpoint_final.pt",
+  "seed": 0,
+  "num_envs": 256,
+  "max_episode_length": 2200,
+  "scene": {
+    "terrain_seed": 0,
+    "static_obstacles": 350,
+    "dynamic_obstacles": 80,
+    "mesh_prim_path": "/World/ground"
+  },
+  "sensor": {
+    "range": 4.0,
+    "vertical_beams": 4,
+    "horizontal_resolution": 10.0
+  },
+  "success_rate": 0.0,
+  "collision_rate": 0.8359375,
+  "out_of_bounds_rate": 0.01171875,
+  "timeout_rate": 0.15234375,
+  "mean_success_steps": null,
+  "mean_success_path_length": null,
+  "mean_return": 1411.0068359375,
+  "completed_steps": 2200,
+  "wall_time_seconds": 202.96479224099312
+}

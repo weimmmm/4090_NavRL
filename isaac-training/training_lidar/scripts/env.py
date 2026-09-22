@@ -12,6 +12,7 @@ from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
 from omni.isaac.core.utils.viewports import set_camera_view
 from utils import vec_to_new_frame, vec_to_world, construct_input
+from lidar_encoder import min_pool_ranges
 import omni.isaac.core.utils.prims as prim_utils
 import omni.isaac.orbit.sim as sim_utils
 import omni.isaac.orbit.utils.math as math_utils
@@ -32,10 +33,20 @@ class NavigationEnv(IsaacEnv):
         print("[Navigation Environment]: Initializing Env...")
         # LiDAR params:
         self.lidar_range = cfg.sensor.lidar_range
+        self.lidar_hfov = cfg.sensor.lidar_hfov
         self.lidar_vfov = (max(-89., cfg.sensor.lidar_vfov[0]), min(89., cfg.sensor.lidar_vfov[1]))
         self.lidar_vbeams = cfg.sensor.lidar_vbeams
         self.lidar_hres = cfg.sensor.lidar_hres
-        self.lidar_hbeams = int(360/self.lidar_hres)
+        self.lidar_hbeams = int(self.lidar_hfov/self.lidar_hres)
+        self.lidar_h_sample = cfg.sensor.lidar_h_sample
+        self.lidar_v_sample = cfg.sensor.lidar_v_sample
+        if self.lidar_h_sample <= 0 or self.lidar_v_sample <= 0:
+            raise ValueError("LiDAR sample factors must be positive")
+        self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams)
+        self.lidar_raw_resolution = (
+            self.lidar_hbeams * self.lidar_h_sample,
+            self.lidar_vbeams * self.lidar_v_sample,
+        )
 
         super().__init__(cfg, cfg.headless)
         
@@ -51,17 +62,16 @@ class NavigationEnv(IsaacEnv):
             attach_yaw_only=True,
             # attach_yaw_only=False,
             pattern_cfg=patterns.BpearlPatternCfg(
-                horizontal_res=self.lidar_hres, # horizontal default is set to 10
-                vertical_ray_angles=torch.linspace(*self.lidar_vfov, self.lidar_vbeams) 
+                horizontal_fov=self.lidar_hfov,
+                horizontal_res=self.lidar_hres / self.lidar_h_sample,
+                vertical_ray_angles=torch.linspace(*self.lidar_vfov, self.lidar_raw_resolution[1])
             ),
             debug_vis=False,
-            mesh_prim_paths=[self.cfg.sensor.get(
-                "mesh_prim_path", "/World/defaultGroundPlane"
-            )],
+            # The generated terrain mesh includes the floor and static obstacles.
+            mesh_prim_paths=["/World/ground"],
         )
         self.lidar = RayCaster(ray_caster_cfg)
         self.lidar._initialize_impl()
-        self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams) 
         
         # start and target 
         with torch.device(self.device):
@@ -306,7 +316,7 @@ class NavigationEnv(IsaacEnv):
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
-                    "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
+                    "lidar": UnboundedContinuousTensorSpec((1, self.lidar_vbeams, self.lidar_hbeams), device=self.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                     "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
                 }),
@@ -440,12 +450,18 @@ class NavigationEnv(IsaacEnv):
 
         # >>>>>>>>>>>>The relevant code starts from here<<<<<<<<<<<<
         # -----------Network Input I: LiDAR range data--------------
-        self.lidar_scan = self.lidar_range - (
+        lidar_distance_raw = (
             (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
             .norm(dim=-1)
             .clamp_max(self.lidar_range)
-            .reshape(self.num_envs, 1, *self.lidar_resolution)
-        ) # lidar scan store the data that is range - distance and it is in lidar's local frame
+            .reshape(self.num_envs, 1, *self.lidar_raw_resolution)
+        )
+        lidar_distance = min_pool_ranges(
+            lidar_distance_raw, self.lidar_h_sample, self.lidar_v_sample
+        )
+        self.lidar_range_image = lidar_distance.transpose(-2, -1).contiguous()
+        # Rewards retain the range-minus-distance convention and original axis order.
+        self.lidar_scan = self.lidar_range - lidar_distance
 
         # Optional render for LiDAR
         if self._should_render(0):
@@ -455,7 +471,7 @@ class NavigationEnv(IsaacEnv):
             #     eye=x.cpu() + torch.as_tensor(self.cfg.viewer.eye),
             #     target=x.cpu() + torch.as_tensor(self.cfg.viewer.lookat)                        
             # )
-            v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_resolution, 3)
+            v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_raw_resolution, 3)
             # self.debug_draw.vector(x.expand_as(v[:, 0]), v[:, 0])
             # self.debug_draw.vector(x.expand_as(v[:, -1]), v[:, -1])
             self.debug_draw.vector(x.expand_as(v[:, 0])[0], v[0, 0])
@@ -544,7 +560,7 @@ class NavigationEnv(IsaacEnv):
         # -----------------Network Input Final--------------
         obs = {
             "state": drone_state,
-            "lidar": self.lidar_scan,
+            "lidar": self.lidar_range_image,
             "direction": target_dir_2d,
             "dynamic_obstacle": dyn_obs_states
         }

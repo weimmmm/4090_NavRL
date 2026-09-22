@@ -4,20 +4,23 @@ defaults:
   - ppo
   - sim
 
-headless: False
+headless: True
+# Override at launch to select a GPU, for example: device=cuda:7
 device: "cuda:0"
 seed: 0
+checkpoint_path: null
 
 # Total Training Length
-max_frame_num: 12e8 # max frame 
-eval_interval: 1000 # evaluate the policy for every N training steps
-save_interval: 1000
+max_frame_num: 1200000000 # max frame
+enable_eval: false
+record_eval_video: false
+eval_interval: 500 # evaluate the policy for every N training steps
+save_interval: 500
 
 # Training Environment
 env:
-  num_envs: 2 # Number of drones for training
-  # 17,600 x 2 ms = 35.2 s, matching the former 2,200 x 16 ms horizon.
-  max_episode_length: 17600
+  num_envs: 2048 # Number of drones for training
+  max_episode_length: 2200
   env_spacing: 8.0 
   num_obstacles: 350
 
@@ -33,6 +36,6 @@ viewer:
 
 wandb:
   project: End_to_End_Navigation_4090_PPO
-  name: ppo_delay
+  name: baseline_PPO
   entity: null
-  mode: online
+  mode: offline

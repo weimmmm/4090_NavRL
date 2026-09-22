@@ -1,18 +1,20 @@
 import argparse
 import os
+import sys
+import time
+
+OMNIDRONES_SOURCE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "OmniDrones")
+)
+if OMNIDRONES_SOURCE not in sys.path:
+    sys.path.insert(0, OMNIDRONES_SOURCE)
+
 import hydra
 import datetime
 import wandb
 import torch
 from omegaconf import DictConfig, OmegaConf
 from omni.isaac.kit import SimulationApp
-from ppo import PPO
-from omni_drones.controllers import LeePositionController
-from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
-from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
-from torchrl.envs.transforms import TransformedEnv, Compose
-from utils import evaluate
-from torchrl.envs.utils import ExplorationType
 
 
 
@@ -21,10 +23,27 @@ FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
     # Simulation App
-    sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
+    gpu_id = int(str(cfg.device).split(":")[-1])
+    sim_app = SimulationApp({
+        "headless": cfg.headless,
+        "anti_aliasing": 1,
+        "active_gpu": gpu_id,
+        "physics_gpu": gpu_id,
+        "multi_gpu": False,
+    })
+
+    # Isaac Sim must be initialized before importing OmniDrones extensions.
+    from ppo import PPO
+    from omni_drones.controllers import LeePositionController
+    from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
+    from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
+    from torchrl.envs.transforms import TransformedEnv, Compose
+    from utils import evaluate
+    from torchrl.envs.utils import ExplorationType
 
     # Use Wandb to monitor training
-    if (cfg.wandb.run_id is None):
+    run_id = cfg.wandb.get("run_id")
+    if run_id is None:
         run = wandb.init(
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
@@ -40,23 +59,13 @@ def main(cfg):
             entity=cfg.wandb.entity,
             config=cfg,
             mode=cfg.wandb.mode,
-            id=cfg.wandb.run_id,
+            id=run_id,
             resume="must"
         )
 
     # Navigation Training Environment
     from env import NavigationEnv
     env = NavigationEnv(cfg)
-    control_dt = env.dt * env.substeps
-    if abs(env.dt - 0.002) > 1e-9 or env.substeps != 1:
-        raise ValueError(
-            "training_delay requires one 2-ms physics step per controller update"
-        )
-    print(
-        f"[NavRL]: physics_dt={env.dt:.3f}s, "
-        f"controller_dt={control_dt:.3f}s",
-        flush=True,
-    )
 
     # Transformed Environment
     transforms = []
@@ -67,7 +76,11 @@ def main(cfg):
     transformed_env = TransformedEnv(env, Compose(*transforms)).train()
     transformed_env.set_seed(cfg.seed)    
     # PPO Policy
-    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec,
+                 cfg.device, lidar_range=cfg.sensor.lidar_range)
+    if cfg.checkpoint_path:
+        policy.load_state_dict(torch.load(cfg.checkpoint_path, map_location=cfg.device))
+        print(f"[NavRL]: loaded policy weights: {cfg.checkpoint_path}", flush=True)
 
     # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
     # checkpoint = "/home/xinmingh/RLDrones/navigation/scripts/nav-ros/navigation_runner/ckpts/checkpoint_36000.pt"
@@ -92,6 +105,7 @@ def main(cfg):
     )
 
     # Training Loop
+    training_start = time.perf_counter()
     for i, data in enumerate(collector):
         # print("data: ", data)
         # print("============================")
@@ -112,9 +126,8 @@ def main(cfg):
             info.update(stats)
 
         # Evaluate policy and log info
-        if i % cfg.eval_interval == 0:
+        if cfg.enable_eval and i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
-            env.enable_render(True)
             env.eval()
             eval_info = evaluate(
                 env=transformed_env, 
@@ -131,6 +144,15 @@ def main(cfg):
         
         # Update wand info
         run.log(info)
+        if i % 10 == 0:
+            print(
+                f"[NavRL]: step={i} frames={collector._frames} "
+                f"rollout_fps={collector._fps:.1f} "
+                f"total_fps={collector._frames / (time.perf_counter() - training_start):.1f} "
+                f"actor_loss={train_loss_stats['actor_loss']:.6f} "
+                f"critic_loss={train_loss_stats['critic_loss']:.6f}",
+                flush=True,
+            )
 
 
         # Save Model
@@ -142,6 +164,7 @@ def main(cfg):
     ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
     torch.save(policy.state_dict(), ckpt_path)
     wandb.finish()
+    env.sim.stop()
     sim_app.close()
 
 if __name__ == "__main__":

@@ -1,0 +1,27 @@
+{
+  "variant": "range_image",
+  "checkpoint": "/workspace/run/wandb/offline-run-20260914_122128-plo5cbe4/files/checkpoint_final.pt",
+  "seed": 0,
+  "num_envs": 256,
+  "max_episode_length": 2200,
+  "scene": {
+    "terrain_seed": 0,
+    "static_obstacles": 350,
+    "dynamic_obstacles": 80,
+    "mesh_prim_path": "/World/ground"
+  },
+  "sensor": {
+    "range": 10.0,
+    "vertical_beams": 6,
+    "horizontal_resolution": 10.0
+  },
+  "success_rate": 0.53515625,
+  "collision_rate": 0.45703125,
+  "out_of_bounds_rate": 0.00390625,
+  "timeout_rate": 0.00390625,
+  "mean_success_steps": 1806.8175048828125,
+  "mean_success_path_length": 52.476226806640625,
+  "mean_return": 8122.0322265625,
+  "completed_steps": 2200,
+  "wall_time_seconds": 215.55031312600477
+}

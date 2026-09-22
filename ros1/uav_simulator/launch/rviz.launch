@@ -1,3 +1,0 @@
-<launch>
-    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find uav_simulator)/rviz/simulator.rviz" required="true"/>
-</launch>

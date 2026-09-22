@@ -1,6 +1,5 @@
 algo:
-  # Per-physics-tick discount parameters. Variable-duration transitions use
-  # gamma^n and lambda^n, where n = transition_dt / 0.016.
+  # One policy transition represents 100 ms (50 x 2-ms physics ticks).
   gamma: 0.99
   gae_lambda: 0.95
   feature_extractor:
@@ -19,4 +18,4 @@ algo:
   entropy_loss_coefficient: 1e-3 # encourage exploration
   training_frame_num: 32
   training_epoch_num: 4
-  num_minibatches: 16 # split into N minibatches
+  num_minibatches: 16
