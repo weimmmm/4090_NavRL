@@ -22,8 +22,36 @@ from lidar_wam.runner.world_direct_horizon import (
 )
 from lidar_wam.runner.action_expert_joint import (
     _action_validation_gate,
+    _cosine_lr_scale,
     _joint_schedule,
 )
+from lidar_wam.models.action_expert import (
+    ActionFlowExpert,
+    JointWorldActionModel,
+)
+
+
+class _DummyCondition(torch.nn.Module):
+    def forward(self, actions, state):
+        value = actions.mean((1, 2, 3))[:, None, None].expand(-1, 1, 768)
+        padding = torch.zeros(
+            len(state), 768-state.shape[-1], device=state.device,
+            dtype=state.dtype)
+        state_token = torch.cat((state, padding), dim=-1).unsqueeze(1)
+        return torch.cat((value, state_token), dim=1)
+
+
+class _DummyUNet(torch.nn.Module):
+    def forward(self, sample, timestep, encoder_hidden_states):
+        condition = encoder_hidden_states.mean((1, 2))[:, None, None, None]
+        return SimpleNamespace(sample=sample[:, :4] * 0.25 + condition)
+
+
+class _DummyWorld(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.condition = _DummyCondition()
+        self.unet = _DummyUNet()
 
 
 class CoordinateSemanticsTest(unittest.TestCase):
@@ -112,6 +140,13 @@ class SquaredChamferTest(unittest.TestCase):
 
 
 class JointTrainingPolicyTest(unittest.TestCase):
+    def test_cosine_lr_scale_starts_at_one_and_ends_at_minimum(self):
+        args = SimpleNamespace(
+            lr_decay_start=6000, lr_min_scale=0.1, steps=100000)
+        self.assertEqual(_cosine_lr_scale(6000, args), 1.0)
+        self.assertAlmostEqual(_cosine_lr_scale(53000, args), 0.55)
+        self.assertAlmostEqual(_cosine_lr_scale(100000, args), 0.1)
+
     def test_world_schedule_freezes_then_ramps(self):
         args = SimpleNamespace(
             world_freeze_steps=500, world_ramp_end=1500,
@@ -139,6 +174,45 @@ class JointTrainingPolicyTest(unittest.TestCase):
         summary["turning_first_10_mae"] = 0.285
         self.assertFalse(_action_validation_gate(summary)["passed"])
 
+    def test_zero_future_gate_preserves_pretrained_action_output(self):
+        expert = ActionFlowExpert(
+            width=16, depth=2, heads=4, ffn_width=32,
+            future_attention_layers=1)
+        torch.nn.init.normal_(expert.out.weight, std=0.02)
+        batch = 2
+        values = (
+            torch.randn(batch, 30, 3), torch.rand(batch) * 1000,
+            torch.randn(batch, 135, 16), torch.randn(batch, 4),
+            torch.randn(batch, 10), torch.randn(batch, 10, 3),
+            torch.ones(batch, 10),
+        )
+        without_future = expert(*values)
+        with_future = expert(*values, future_tokens=torch.randn(batch, 135, 16))
+        self.assertTrue(torch.equal(without_future, with_future))
+
+    def test_joint_forward_is_bidirectional_and_shape_safe(self):
+        model = JointWorldActionModel(
+            _DummyWorld(), width=16, depth=2, heads=4, ffn_width=32,
+            future_attention_layers=1)
+        torch.nn.init.normal_(model.action_expert.out.weight, std=0.02)
+        batch = 2
+        refined, future = model(
+            torch.randn(batch, 30, 3), torch.rand(batch) * 1000,
+            torch.randn(batch, 4, 27, 5), torch.randn(batch, 4),
+            torch.randn(batch, 10), torch.randn(batch, 10, 3),
+            torch.ones(batch, 10),
+            noisy_future=torch.randn(batch, 4, 27, 5),
+            world_state=torch.randn(batch, 5),
+            world_timestep=torch.randint(0, 1000, (batch,)),
+            action_logit_mean=torch.zeros(3),
+            action_logit_std=torch.ones(3),
+        )
+        provisional = model._last_provisional_velocity
+        self.assertEqual(tuple(refined.shape), (batch, 30, 3))
+        self.assertEqual(tuple(provisional.shape), (batch, 30, 3))
+        self.assertEqual(tuple(future.shape), (batch, 4, 27, 5))
+        self.assertEqual(
+            tuple(model.future_adapter(future).shape), (batch, 135, 16))
 
 if __name__ == "__main__":
     unittest.main()

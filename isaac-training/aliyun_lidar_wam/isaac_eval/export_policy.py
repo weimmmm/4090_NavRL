@@ -8,6 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPACT_FORMAT = "navrl-action-expert-policy-v2"
+JOINT_FORMATS = {
+    "navrl-joint-world-action-policy-v3",
+    "navrl-joint-world-action-training-v3",
+}
 
 
 def torch_load(path: Path):
@@ -26,6 +30,10 @@ def export_compact_checkpoint(source: Path, destination: Path,
     payload = torch_load(source)
     if not isinstance(payload, dict) or "model" not in payload or "stats" not in payload:
         raise ValueError(f"Unsupported checkpoint format: {source}")
+    if payload.get("format") in JOINT_FORMATS:
+        raise ValueError(
+            "The v3 joint policy depends on its Future UNet and cannot be "
+            "exported as an Action-only compact checkpoint.")
     if "semantics" not in payload and not allow_legacy_body:
         raise ValueError(
             "Legacy checkpoint has no coordinate metadata; pass --allow-legacy-body "

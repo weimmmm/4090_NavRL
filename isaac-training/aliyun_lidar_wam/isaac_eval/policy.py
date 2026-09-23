@@ -22,9 +22,10 @@ DIFFUSERS_ROOT = WAM_ROOT / "third_party" / "diffusers" / "src"
 if str(DIFFUSERS_ROOT) not in sys.path:
     sys.path.insert(0, str(DIFFUSERS_ROOT))
 
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKL, DDIMScheduler
 from lidar_wam.models.action_expert import (
-    ActionFlowExpert, LiDARObservationEncoder)
+    ActionFlowExpert, JointWorldActionModel, LiDARObservationEncoder)
+from lidar_wam.models.world import DirectHorizonWorldModel
 from lidar_wam.coordinates import (
     ACTION_FRAME,
     CONDITION_FRAME,
@@ -42,6 +43,8 @@ EXECUTION_HORIZON = 10
 ACTION_DIM = 3
 FLOW_EPS = 1e-4
 COMPACT_FORMAT = "navrl-action-expert-policy-v2"
+JOINT_POLICY_FORMAT = "navrl-joint-world-action-policy-v3"
+JOINT_TRAINING_FORMAT = "navrl-joint-world-action-training-v3"
 
 
 def load_circular_vae(device: torch.device):
@@ -75,7 +78,8 @@ class DeploymentActionModel(nn.Module):
         super().__init__()
         self.observation = LiDARObservationEncoder(width)
         self.action_expert = ActionFlowExpert(
-            width=width, depth=depth, heads=heads, ffn_width=ffn_width)
+            width=width, depth=depth, heads=heads, ffn_width=ffn_width,
+            future_attention_layers=0)
 
     def forward(self, noisy_action: torch.Tensor, timestep: torch.Tensor,
                 current_latent: torch.Tensor, goal: torch.Tensor,
@@ -120,14 +124,21 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
     depth = int(architecture.get("depth", 8))
     heads = int(architecture.get("heads", 8))
     ffn_width = int(architecture.get("ffn_width", 2048))
-    model = DeploymentActionModel(width, depth, heads, ffn_width)
     state = payload["model"]
-    if payload.get("format") != COMPACT_FORMAT:
-        state = _policy_state_dict(state)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        raise ValueError(
-            f"checkpoint/model mismatch: missing={missing}, unexpected={unexpected}")
+    if payload.get("format") in (JOINT_POLICY_FORMAT, JOINT_TRAINING_FORMAT):
+        model = JointWorldActionModel(
+            DirectHorizonWorldModel(), width, depth, heads, ffn_width,
+            int(architecture.get("future_attention_layers", 2)))
+        model.load_state_dict(state, strict=True)
+    else:
+        model = DeploymentActionModel(width, depth, heads, ffn_width)
+        if payload.get("format") != COMPACT_FORMAT:
+            state = _policy_state_dict(state)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise ValueError(
+                "checkpoint/model mismatch: "
+                f"missing={missing}, unexpected={unexpected}")
     model.to(device=device, dtype=torch.float32).eval()
     return model, payload["stats"], int(payload.get("step", -1)), semantics
 
@@ -137,6 +148,10 @@ def export_compact_checkpoint(source: Path, destination: Path,
     payload = torch_load(source, "cpu")
     if not isinstance(payload, dict) or "model" not in payload or "stats" not in payload:
         raise ValueError(f"Unsupported checkpoint format: {source}")
+    if payload.get("format") in (JOINT_POLICY_FORMAT, JOINT_TRAINING_FORMAT):
+        raise ValueError(
+            "A v3 joint policy cannot be stripped to Action-only: its deployed "
+            "action depends on the Future UNet and FutureTokenAdapter.")
     if "semantics" not in payload and not allow_legacy_body:
         raise ValueError("refusing to export legacy checkpoint without coordinate semantics")
     selected = _policy_state_dict(payload["model"])
@@ -269,7 +284,7 @@ def route_stable_action_noise(seeds: torch.Tensor, device: torch.device,
 
 
 @torch.no_grad()
-def sample_actions(model: DeploymentActionModel, latent: torch.Tensor,
+def sample_actions(model: nn.Module, latent: torch.Tensor,
                    goal: torch.Tensor, proprio: torch.Tensor,
                    past: torch.Tensor, past_mask: torch.Tensor,
                    stats: dict[str, Any], steps: int,
@@ -279,16 +294,52 @@ def sample_actions(model: DeploymentActionModel, latent: torch.Tensor,
             f"Expected one policy seed per route, got {seeds.numel()} for "
             f"batch {len(latent)}")
     value = route_stable_action_noise(seeds, latent.device, latent.dtype)
+    raw_proprio = proprio
     goal = normalize_condition(goal, stats, "goal")
     proprio = normalize_condition(proprio, stats, "proprio")
     past = action_to_flow(past, stats) * past_mask.unsqueeze(-1)
-    observation = model.observation(latent)
+    observation = (model.encode_current(latent)
+                   if isinstance(model, JointWorldActionModel)
+                   else model.observation(latent))
     sigmas = torch.linspace(1, 0, steps + 1, device=latent.device, dtype=latent.dtype)
-    for current, following in zip(sigmas[:-1], sigmas[1:]):
+    joint = isinstance(model, JointWorldActionModel)
+    if joint:
+        scheduler = DDIMScheduler(
+            num_train_timesteps=1000, prediction_type="epsilon",
+            clip_sample=False)
+        scheduler.set_timesteps(steps, device=latent.device)
+        future_rows = []
+        for seed in seeds.detach().cpu().reshape(-1).tolist():
+            generator = torch.Generator(device="cpu").manual_seed(
+                (int(seed) + 97_409) % (2**63 - 1))
+            future_rows.append(torch.randn(
+                (4, 27, 5), generator=generator, dtype=torch.float32))
+        future = torch.stack(future_rows).to(
+            device=latent.device, dtype=latent.dtype, non_blocking=True)
+        zero = torch.zeros(len(latent), device=latent.device,
+                           dtype=latent.dtype)
+        world_state = torch.stack((
+            raw_proprio[:, 1], raw_proprio[:, 2], zero, zero,
+            raw_proprio[:, 6]), dim=-1)
+        action_mean = _stat_tensor(stats, "action_logit_mean", value)
+        action_std = _stat_tensor(stats, "action_logit_std", value)
+        world_timesteps = scheduler.timesteps
+    else:
+        world_timesteps = [None] * steps
+    for current, following, world_timestep in zip(
+            sigmas[:-1], sigmas[1:], world_timesteps):
         timestep = torch.full((len(latent),), float(current * 1000),
                               device=latent.device, dtype=latent.dtype)
-        velocity = model.action_expert(
-            value, timestep, observation, goal, proprio, past, past_mask)
+        if joint:
+            velocity, epsilon, _ = model.predict_joint_velocity(
+                value, timestep, future, world_timestep, latent, goal,
+                proprio, past, past_mask, world_state, action_mean,
+                action_std, observation_tokens=observation)
+            future = scheduler.step(
+                epsilon, world_timestep, future, eta=0.0).prev_sample
+        else:
+            velocity = model.action_expert(
+                value, timestep, observation, goal, proprio, past, past_mask)
         value = value + (following - current) * velocity
     return flow_to_action(value, stats)
 
@@ -308,7 +359,9 @@ class RecedingHorizonPolicy:
          self.semantics) = load_deployment_policy(
             checkpoint, device, allow_legacy_body=allow_legacy_body)
         self.condition_frame = self.semantics["condition_frame"]
-        self.executed_head = "flow30"
+        self.executed_head = (
+            "joint_world_action_flow30"
+            if isinstance(self.model, JointWorldActionModel) else "flow30")
         expected_limit = float(self.semantics.get("action_limit_mps", action_limit))
         if abs(expected_limit-self.action_limit) > 1e-6:
             raise ValueError(

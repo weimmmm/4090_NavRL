@@ -67,6 +67,8 @@ ACTION_HORIZON = 30
 ACTION_DIM = 3
 FLOW_EPS = 1e-4
 TRAINING_FORMAT_V2 = "navrl-action-expert-training-v2"
+JOINT_TRAINING_FORMAT_V3 = "navrl-joint-world-action-training-v3"
+JOINT_POLICY_FORMAT_V3 = "navrl-joint-world-action-policy-v3"
 
 
 def _decode(value):
@@ -342,7 +344,7 @@ def world_diffusion_loss(model, previous, target, actions, state, target_image,
 
 @torch.no_grad()
 def sample_actions(model, previous, goal, proprio, past, past_mask, stats,
-                   steps=10, seed=42):
+                   steps=10, seed=42, world_state=None):
     generator = torch.Generator(device=previous.device).manual_seed(int(seed))
     value = torch.randn((len(previous), ACTION_HORIZON, ACTION_DIM),
                         device=previous.device, dtype=previous.dtype,
@@ -353,12 +355,37 @@ def sample_actions(model, previous, goal, proprio, past, past_mask, stats,
     observation = model.encode_current(previous)
     sigmas = torch.linspace(1, 0, steps+1, device=previous.device,
                             dtype=previous.dtype)
-    for current, following in zip(sigmas[:-1], sigmas[1:]):
+    joint = isinstance(model, JointWorldActionModel)
+    if joint:
+        if world_state is None:
+            raise ValueError("joint action sampling requires the causal world state")
+        scheduler = stage1.DDIMScheduler(
+            num_train_timesteps=1000, prediction_type="epsilon",
+            clip_sample=False)
+        scheduler.set_timesteps(steps, device=previous.device)
+        future = torch.randn(
+            previous.shape, generator=generator, device=previous.device,
+            dtype=previous.dtype)
+        world_timesteps = scheduler.timesteps
+        action_mean = _tensor_stats(stats, "action_logit_mean", value)
+        action_std = _tensor_stats(stats, "action_logit_std", value)
+    else:
+        world_timesteps = [None] * steps
+    for (current, following, world_timestep) in zip(
+            sigmas[:-1], sigmas[1:], world_timesteps):
         timestep = torch.full((len(previous),), float(current*1000),
                               device=previous.device, dtype=previous.dtype)
-        velocity = model.predict_action_velocity(
-            value, timestep, previous, goal, proprio, past, past_mask,
-            observation_tokens=observation)
+        if joint:
+            velocity, epsilon, _ = model.predict_joint_velocity(
+                value, timestep, future, world_timestep, previous,
+                goal, proprio, past, past_mask, world_state,
+                action_mean, action_std, observation_tokens=observation)
+            future = scheduler.step(
+                epsilon, world_timestep, future, eta=0.0).prev_sample
+        else:
+            velocity = model.predict_action_velocity(
+                value, timestep, previous, goal, proprio, past, past_mask,
+                observation_tokens=observation)
         value = value + (following-current) * velocity
     return flow_to_action(value, stats)
 
@@ -385,11 +412,11 @@ def evaluate_actions(model, dataset, stats, args, save_rows=False):
                         num_workers=args.workers)
     offset = 0
     for batch in loader:
-        (previous, _target, actions, _state, _image, source,
+        (previous, _target, actions, state, _image, source,
          goal, proprio, past, past_mask) = [v.to(stage1.DEVICE) for v in batch]
         prediction = sample_actions(
             model, previous, goal, proprio, past, past_mask, stats,
-            args.flow_steps, args.seed + offset)
+            args.flow_steps, args.seed + offset, world_state=state)
         last = torch.where(
             past_mask[:, -1:, None].bool(), past[:, -1:, :],
             torch.as_tensor(stats["action_raw_mean"], device=past.device)[None, None]
@@ -670,8 +697,12 @@ def _v2_action_terms(model, previous, actions, goal, proprio, past,
     # All 30 commands remain supervised.  Checkpoint selection, rather than a
     # hidden per-timestep training reweighting, prioritizes the ten commands
     # that are actually executed before receding-horizon replanning.
-    horizon_weight = torch.ones(
-        (1, ACTION_HORIZON, 1), device=target.device, dtype=target.dtype)
+    horizon_weight = torch.cat((
+        torch.ones(10, device=target.device, dtype=target.dtype),
+        torch.full((10,), 0.3, device=target.device, dtype=target.dtype),
+        torch.full((10,), 0.1, device=target.device, dtype=target.dtype),
+    )).reshape(1, ACTION_HORIZON, 1)
+    horizon_weight = horizon_weight / horizon_weight.mean()
     flow = ((velocity-target_velocity).square()*horizon_weight).mean()
     x0 = noisy - sigma[:, None, None] * velocity
     endpoint = ((x0-target).abs()*horizon_weight).mean()
@@ -697,12 +728,12 @@ def evaluate_actions_v2(model, dataset, stats, args, device):
                         num_workers=args.workers, pin_memory=device.type == "cuda")
     offset = 0
     for batch in loader:
-        (previous, _target, actions, _state, _image, _source,
+        (previous, _target, actions, state, _image, _source,
          goal, proprio, past, past_mask) = [v.to(device, non_blocking=True) for v in batch]
         with _autocast(device, args.precision):
             prediction = sample_actions(
                 model, previous, goal, proprio, past, past_mask, stats,
-                args.flow_steps, args.seed + offset)
+                args.flow_steps, args.seed + offset, world_state=state)
         target = actions.flatten(1, 2)
         fallback = torch.as_tensor(
             stats["action_raw_mean"], device=device, dtype=past.dtype)[None, None]
@@ -720,11 +751,14 @@ def evaluate_actions_v2(model, dataset, stats, args, device):
     repeat_error = (repeat-target).abs()
     repeat_per_sample = repeat_error.mean((1, 2))
     repeat_first_per_sample = repeat_error[:, :10].mean((1, 2))
-    low = torch.from_numpy(dataset.clearance <= float(stats["clearance_q25"]))
-    turning = torch.from_numpy(dataset.turn_score >= float(stats["turn_score_q75"]))
+    used = len(target)
+    low = torch.from_numpy(
+        dataset.clearance[:used] <= float(stats["clearance_q25"]))
+    turning = torch.from_numpy(
+        dataset.turn_score[:used] >= float(stats["turn_score_q75"]))
     summary = summarize_action(prediction, target)
     summary.update({
-        "samples": len(dataset),
+        "samples": used,
         "low_clearance_mae": float(per_sample[low].mean()),
         "turning_mae": float(per_sample[turning].mean()),
         "low_clearance_first_10_mae": float(first_per_sample[low].mean()),
@@ -798,15 +832,22 @@ def _make_v2_model(args):
     world, world_step = _load_world_v2(args.world_checkpoint)
     model = JointWorldActionModel(
         world, width=args.action_width, depth=args.action_depth,
-        heads=args.action_heads, ffn_width=args.action_ffn_width)
+        heads=args.action_heads, ffn_width=args.action_ffn_width,
+        future_attention_layers=args.future_attention_layers)
     action_payload = torch.load(
         args.action_checkpoint, map_location="cpu", weights_only=False)
     action_state = action_payload["model"]
     selected = {key: value for key, value in action_state.items()
                 if key.startswith(("observation.", "action_expert."))}
     incompatible = model.load_state_dict(selected, strict=False)
-    allowed = {key for key in model.state_dict()
-               if key.startswith(("world.", "observation_to_world."))}
+    allowed = {
+        key for key in model.state_dict()
+        if (key.startswith(("world.", "observation_to_world.",
+                            "future_adapter."))
+            or ".future_attn." in key
+            or ".norm_future." in key
+            or key.endswith(".future_gate"))
+    }
     if set(incompatible.missing_keys) != allowed or incompatible.unexpected_keys:
         raise ValueError(
             f"action checkpoint merge mismatch: missing={incompatible.missing_keys}, "
@@ -816,8 +857,20 @@ def _make_v2_model(args):
 
 def _v2_optimizer(model, args):
     raw = _unwrap(model)
+    fusion_parameters = []
+    if isinstance(raw, JointWorldActionModel):
+        fusion_parameters.extend(raw.future_adapter.parameters())
+        for block in raw.action_expert.blocks:
+            if block.future_attention:
+                fusion_parameters.extend(block.norm_future.parameters())
+                fusion_parameters.extend(block.future_attn.parameters())
+                fusion_parameters.append(block.future_gate)
+    fusion_ids = {id(parameter) for parameter in fusion_parameters}
+    action_parameters = [
+        parameter for parameter in raw.action_expert.parameters()
+        if id(parameter) not in fusion_ids]
     groups = [
-        {"params": raw.action_expert.parameters(), "lr": args.action_lr,
+        {"params": action_parameters, "lr": args.action_lr,
          "name": "action"},
         {"params": raw.observation.parameters(), "lr": args.shared_lr,
          "name": "observation"},
@@ -826,11 +879,33 @@ def _v2_optimizer(model, args):
         groups.extend([
             {"params": raw.observation_to_world.parameters(), "lr": args.shared_lr,
              "name": "observation_to_world"},
+            {"params": fusion_parameters, "lr": args.fusion_lr,
+             "name": "future_adapter"},
             # Keeping the parameters trainable avoids changing DDP's graph;
             # the step schedule freezes the pretrained UNet with LR=0 first.
             {"params": raw.world.parameters(), "lr": 0.0, "name": "world"},
         ])
     return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+
+
+def _freeze_joint_world_branch(model):
+    """Freeze future generation/fusion while preserving its differentiable path.
+
+    Gradients can still flow through the fixed world model and future adapter
+    into the provisional action and shared observation tokens.  Excluding the
+    fixed parameters from autograd keeps their gradients out of global clipping
+    and the divergence guard.
+    """
+    if not isinstance(model, JointWorldActionModel):
+        raise TypeError("world-branch freezing requires JointWorldActionModel")
+    model.world.requires_grad_(False)
+    model.observation_to_world.requires_grad_(False)
+    model.future_adapter.requires_grad_(False)
+    for block in model.action_expert.blocks:
+        if block.future_attention:
+            block.norm_future.requires_grad_(False)
+            block.future_attn.requires_grad_(False)
+            block.future_gate.requires_grad_(False)
 
 
 def _joint_schedule(step, args):
@@ -851,6 +926,16 @@ def _joint_schedule(step, args):
     return float(weight), float(world_lr)
 
 
+def _cosine_lr_scale(step, args):
+    """Cosine-decay multiplier for stable long joint fine-tuning."""
+    start = int(getattr(args, "lr_decay_start", 0))
+    minimum = float(getattr(args, "lr_min_scale", 1.0))
+    if start <= 0 or step <= start:
+        return 1.0
+    progress = min(max((step-start) / max(args.steps-start, 1), 0.0), 1.0)
+    return minimum + 0.5 * (1.0-minimum) * (1.0+math.cos(math.pi*progress))
+
+
 def _set_optimizer_lr(optimizer, name, value):
     matches = [group for group in optimizer.param_groups
                if group.get("name") == name]
@@ -867,6 +952,20 @@ def _parameter_grad_norm(parameters):
         value = parameter.grad.detach().float().square().sum()
         squared = value if squared is None else squared + value
     return 0.0 if squared is None else float(squared.sqrt())
+
+
+def _tensorboard_write(writer, prefix, value, step):
+    """Recursively write numeric training/validation values to TensorBoard."""
+    if writer is None:
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _tensorboard_write(writer, f"{prefix}/{key}", child, step)
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _tensorboard_write(writer, f"{prefix}/{index}", child, step)
+    elif isinstance(value, (bool, int, float)) and math.isfinite(float(value)):
+        writer.add_scalar(prefix, float(value), int(step))
 
 
 class _JointWorldEvaluationView(torch.nn.Module):
@@ -917,17 +1016,23 @@ def _combined_validation(model, vae, action_dataset, world_dataset,
 
 
 def _checkpoint_v2(path, model, optimizer, step, stats, args, world_step,
-                   validation, best_score):
+                   validation, best_score, validation_step=None):
+    is_joint = isinstance(_unwrap(model), JointWorldActionModel)
     payload = {
-        "format": TRAINING_FORMAT_V2, "model": _unwrap(model).state_dict(),
+        "format": (JOINT_TRAINING_FORMAT_V3 if is_joint else TRAINING_FORMAT_V2),
+        "model": _unwrap(model).state_dict(),
         "optimizer": optimizer.state_dict(), "step": int(step), "stats": stats,
         "world_initial_step": int(world_step), "validation": validation,
+        "validation_step": int(
+            step if validation_step is None else validation_step),
         "best_selection_score": float(best_score),
         "semantics": coordinate_semantics(),
         "architecture": {
             "action_horizon": ACTION_HORIZON, "action_dim": ACTION_DIM,
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
+            "future_attention_layers": (
+                args.future_attention_layers if is_joint else 0),
         },
         "training_schedule": {
             "world_freeze_steps": getattr(args, "world_freeze_steps", 0),
@@ -935,6 +1040,17 @@ def _checkpoint_v2(path, model, optimizer, step, stats, args, world_step,
             "world_weight_start": getattr(args, "world_weight_start", 0.0),
             "world_weight_mid": getattr(args, "world_weight_mid", 0.0),
             "world_weight_final": getattr(args, "world_weight", 0.0),
+            "fusion_warmup_steps": getattr(args, "fusion_warmup_steps", 0),
+            "world_action_teacher_forcing": getattr(
+                args, "world_action_teacher_forcing", 0.0),
+            "action_lr": args.action_lr,
+            "shared_lr": args.shared_lr,
+            "fusion_lr": args.fusion_lr,
+            "world_lr": args.world_lr,
+            "lr_decay_start": args.lr_decay_start,
+            "lr_min_scale": args.lr_min_scale,
+            "max_preclip_grad_norm": args.max_preclip_grad_norm,
+            "reset_optimizer": bool(args.reset_optimizer),
         },
         "provenance": {
             "dataset_manifest_sha256": file_sha256(args.dataset_root / "manifest.json"),
@@ -978,7 +1094,7 @@ def _candidate_joint_policy_v2(path, model, step, stats, args, validation):
     if not isinstance(raw, JointWorldActionModel):
         return
     payload = {
-        "format": "navrl-joint-world-action-policy-v2",
+        "format": JOINT_POLICY_FORMAT_V3,
         "model": raw.state_dict(), "step": int(step), "stats": stats,
         "validation": validation, "semantics": coordinate_semantics(),
         "architecture": {
@@ -986,6 +1102,8 @@ def _candidate_joint_policy_v2(path, model, step, stats, args, validation):
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
             "world_horizon": 3,
+            "future_attention_layers": args.future_attention_layers,
+            "joint_denoising": True,
         },
         "provenance": {
             "dataset_manifest_sha256": file_sha256(args.dataset_root/"manifest.json"),
@@ -1051,28 +1169,44 @@ def train_v2(args):
     # before DataLoader workers are forked; workers reopen independent handles.
     train_data.close()
     model, world_step = _make_v2_model(args)
+    if (args.command == "train-joint"
+            and getattr(args, "freeze_world_branch", False)):
+        _freeze_joint_world_branch(model)
     model = model.to(device).float()
     if distributed:
         model = DistributedDataParallel(model, device_ids=[local_rank],
                                          output_device=local_rank,
                                          broadcast_buffers=False)
     optimizer = _v2_optimizer(model, args)
-    first_step, best_score = 1, math.inf
-    if args.resume:
-        payload = torch.load(run_dir / "latest.pt", map_location="cpu", weights_only=False)
+    first_step, best_score, best_accepted_score = 1, math.inf, math.inf
+    last_validation, last_validation_step = {}, -1
+    resume_path = getattr(args, "resume_from", None)
+    if args.resume and resume_path is None:
+        resume_path = run_dir / "latest.pt"
+    if resume_path is not None:
+        payload = torch.load(resume_path, map_location="cpu", weights_only=False)
         _unwrap(model).load_state_dict(payload["model"], strict=True)
-        optimizer.load_state_dict(payload["optimizer"])
+        if not args.reset_optimizer:
+            optimizer.load_state_dict(payload["optimizer"])
         stats = payload["stats"]
         first_step = int(payload["step"])+1
         best_score = float(payload.get("best_selection_score", math.inf))
+        last_validation = payload.get("validation", {})
+        last_validation_step = int(payload.get(
+            "validation_step", payload.get("step", -1)))
+        best_accepted_score = best_score
 
-    if is_main:
-        stage1.save_json(run_dir / "config.json", {
-            "format": TRAINING_FORMAT_V2, "command": args.command,
+    config = {
+            "format": (JOINT_TRAINING_FORMAT_V3
+                       if args.command == "train-joint"
+                       else TRAINING_FORMAT_V2),
             "dataset_root": str(args.dataset_root), "latent_root": str(args.latent_root),
             "index_root": str(args.index_root), "steps": args.steps,
             "micro_batch_size": args.micro_batch_size,
             "gradient_accumulation": args.grad_accumulation,
+            "checkpoint_every": args.checkpoint_every,
+            "resume_from": str(resume_path) if resume_path is not None else None,
+            "reset_optimizer": bool(args.reset_optimizer),
             "world_size": world_size,
             "global_batch_size": args.micro_batch_size*args.grad_accumulation*world_size,
             "precision": args.precision, "semantics": coordinate_semantics(),
@@ -1083,11 +1217,24 @@ def train_v2(args):
                 "flow_weight": 1.0,
                 "x0_weight": args.action_x0_weight,
                 "delta_weight": args.action_delta_weight,
-                "horizon_chunk_weights": [1.0, 1.0, 1.0],
+                "horizon_chunk_weights": [1.0, 0.3, 0.1],
             },
             "selection": (
                 "0.40*first10 + 0.25*low_clearance_first10 + "
                 "0.25*turning_first10 + 0.10*overall"),
+            "optimizer_stability": {
+                "action_lr": args.action_lr,
+                "shared_lr": args.shared_lr,
+                "fusion_lr": args.fusion_lr,
+                "world_lr": args.world_lr,
+                "freeze_world_branch": bool(getattr(
+                    args, "freeze_world_branch", False)),
+                "lr_decay_start": args.lr_decay_start,
+                "lr_min_scale": args.lr_min_scale,
+                "max_preclip_grad_norm": args.max_preclip_grad_norm,
+                "early_stop_patience": args.early_stop_patience,
+                "early_stop_min_delta": args.early_stop_min_delta,
+            },
             "joint_schedule": ({
                 "world_lr": args.world_lr,
                 "world_lr_zero_through_step": args.world_freeze_steps,
@@ -1095,9 +1242,31 @@ def train_v2(args):
                 "world_weight_mid": args.world_weight_mid,
                 "world_weight_final": args.world_weight,
                 "world_weight_ramp_end": args.world_ramp_end,
+                "future_attention_layers": args.future_attention_layers,
+                "fusion_warmup_steps": args.fusion_warmup_steps,
+                "world_action_teacher_forcing": (
+                    args.world_action_teacher_forcing),
             } if args.command == "train-joint" else None),
             "normalization": stats,
-        })
+        }
+    if is_main:
+        stage1.save_json(run_dir / "config.json", config)
+
+    writer = None
+    if is_main:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as error:
+            raise RuntimeError(
+                "TensorBoard logging requires the tensorboard package in the "
+                "training environment") from error
+        writer = SummaryWriter(
+            log_dir=str(run_dir / "tensorboard"),
+            purge_step=(first_step if args.resume and args.resume_from is None
+                        else None))
+        writer.add_text(
+            "run/config_json", json.dumps(config, indent=2, sort_keys=True),
+            global_step=max(first_step-1, 0))
 
     sampler = StratifiedSampler(
         train_data,
@@ -1118,19 +1287,52 @@ def train_v2(args):
 
     history_path = run_dir/"history.json"
     history = (json.loads(history_path.read_text())
-               if args.resume and history_path.exists() else [])
+               if args.resume and args.resume_from is None
+               and history_path.exists() else [])
     started = time.monotonic()
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    validations_without_improvement = 0
     try:
         for step in range(first_step, args.steps+1):
             model.train()
+            if (args.command == "train-joint"
+                    and args.freeze_world_branch):
+                _unwrap(model).world.eval()
             optimizer.zero_grad(set_to_none=True)
             totals = defaultdict(float)
             scheduled_world_weight = 0.0
             world_lr = 0.0
+            lr_scale = _cosine_lr_scale(step, args)
             if args.command == "train-joint":
                 scheduled_world_weight, world_lr = _joint_schedule(step, args)
+                world_lr *= lr_scale
+                if args.freeze_world_branch:
+                    # Keep the joint forward path active so the Action Expert
+                    # still consumes predicted-future tokens, but prevent the
+                    # pretrained world/fusion parameters and auxiliary world
+                    # objective from drifting during stabilization.
+                    scheduled_world_weight = 0.0
+                    world_lr = 0.0
                 _set_optimizer_lr(optimizer, "world", world_lr)
+                warmup = step <= args.fusion_warmup_steps
+                _set_optimizer_lr(
+                    optimizer, "action",
+                    0.0 if warmup else args.action_lr*lr_scale)
+                _set_optimizer_lr(
+                    optimizer, "observation",
+                    0.0 if warmup else args.shared_lr*lr_scale)
+                _set_optimizer_lr(
+                    optimizer, "observation_to_world",
+                    0.0 if warmup or args.freeze_world_branch
+                    else args.shared_lr*lr_scale)
+                _set_optimizer_lr(
+                    optimizer, "future_adapter",
+                    0.0 if warmup or args.freeze_world_branch
+                    else args.fusion_lr*lr_scale)
+            else:
+                _set_optimizer_lr(optimizer, "action", args.action_lr*lr_scale)
+                _set_optimizer_lr(
+                    optimizer, "observation", args.shared_lr*lr_scale)
             for micro_step in range(args.grad_accumulation):
                 batch = [value.to(device, non_blocking=True) for value in next(loader)]
                 (previous, target, actions, state, target_image, _source,
@@ -1142,16 +1344,23 @@ def train_v2(args):
                     noise = timesteps = noisy_future = None
                     if args.command == "train-joint":
                         noise = torch.randn_like(target)
-                        timesteps = torch.randint(0, 1000, (len(target),), device=device)
-                        noisy_future = noise_scheduler.add_noise(target, noise, timesteps)
+                        timesteps = torch.randint(
+                            0, 1000, (len(target),), device=device)
+                        noisy_future = noise_scheduler.add_noise(
+                            target, noise, timesteps)
                         joint_inputs = {
                             "noisy_future": noisy_future, "world_actions": actions,
                             "world_state": state, "world_timestep": timesteps,
+                            "action_logit_mean": torch.as_tensor(
+                                stats["action_logit_mean"], device=device),
+                            "action_logit_std": torch.as_tensor(
+                                stats["action_logit_std"], device=device),
+                            "teacher_forcing": args.world_action_teacher_forcing,
                         }
                     action_loss, epsilon, action_parts = _v2_action_terms(
-                        model, previous, actions, goal, proprio, past, past_mask,
-                        stats, joint_inputs, args.action_x0_weight,
-                        args.action_delta_weight)
+                        model, previous, actions, goal, proprio, past,
+                        past_mask, stats, joint_inputs,
+                        args.action_x0_weight, args.action_delta_weight)
                     world_loss = action_loss*0
                     world_parts = {}
                     if epsilon is not None:
@@ -1195,28 +1404,63 @@ def train_v2(args):
             grad = torch.nn.utils.clip_grad_norm_(parameters, args.grad_clip)
             if not torch.isfinite(grad):
                 raise FloatingPointError(f"non-finite gradient at step {step}")
+            skip_update = bool(
+                args.max_preclip_grad_norm > 0
+                and float(grad) > args.max_preclip_grad_norm)
+            if distributed:
+                skip_flag = torch.tensor(
+                    int(skip_update), device=device, dtype=torch.int32)
+                dist.all_reduce(skip_flag, op=dist.ReduceOp.MAX)
+                skip_update = bool(skip_flag.item())
             adapter_grad_norm = 0.0
             if args.command == "train-joint":
                 adapter_grad_norm = _parameter_grad_norm(
                     _unwrap(model).observation_to_world.parameters())
-            optimizer.step()
+            if skip_update:
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                optimizer.step()
 
             if is_main and (step == 1 or step % args.log_every == 0):
                 record = {"step": step, **totals, "grad_norm": float(grad),
+                          "optimizer_step_skipped": skip_update,
                           "elapsed_min": round((time.monotonic()-started)/60, 2),
                           "world_weight": scheduled_world_weight,
-                          "world_lr": world_lr}
+                          "world_lr": world_lr,
+                          "lr_scale": lr_scale,
+                          "fusion_warmup": bool(
+                              args.command == "train-joint"
+                              and step <= args.fusion_warmup_steps)}
                 if args.command == "train-joint":
+                    raw_model = _unwrap(model)
+                    future_attention_parameters = []
+                    future_gates = [
+                        float(block.future_gate.detach())
+                        for block in raw_model.action_expert.blocks
+                        if block.future_attention]
+                    for block in raw_model.action_expert.blocks:
+                        if block.future_attention:
+                            future_attention_parameters.extend(
+                                block.norm_future.parameters())
+                            future_attention_parameters.extend(
+                                block.future_attn.parameters())
+                            future_attention_parameters.append(block.future_gate)
                     record.update({
                         "world_adapter_grad_norm": adapter_grad_norm,
                         "world_adapter_weight_norm": float(
-                            _unwrap(model).observation_to_world.weight.detach()
+                            raw_model.observation_to_world.weight.detach()
                             .float().norm()),
+                        "future_adapter_grad_norm": _parameter_grad_norm(
+                            raw_model.future_adapter.parameters()),
+                        "future_attention_grad_norm": _parameter_grad_norm(
+                            future_attention_parameters),
+                        "future_attention_gates": future_gates,
                     })
                 if device.type == "cuda":
                     record["peak_allocated_gib"] = torch.cuda.max_memory_allocated(device)/2**30
                 history.append(record)
                 print(json.dumps(record), flush=True)
+                _tensorboard_write(writer, "train", record, step)
             if args.memory_smoke:
                 # Run more than one iteration so DDP bucket rebuilding and
                 # optimizer-state allocation are included in the peak.
@@ -1224,6 +1468,10 @@ def train_v2(args):
                     dist.barrier()
                 continue
             evaluate_now = step % args.eval_every == 0 or step == args.steps
+            checkpoint_now = (
+                args.checkpoint_every > 0
+                and step % args.checkpoint_every == 0)
+            stop_training = False
             if evaluate_now:
                 if distributed:
                     dist.barrier()
@@ -1231,42 +1479,111 @@ def train_v2(args):
                     validation = _combined_validation(
                         model, vae, val_data, world_val_data,
                         stats, args, device)
+                    last_validation = validation
+                    last_validation_step = step
                     score = float(validation["selection_score"])
                     print(json.dumps({"step": step, "validation": validation}), flush=True)
+                    _tensorboard_write(writer, "validation", validation, step)
+                    writer.flush()
+                    improved = score < best_score-args.early_stop_min_delta
+                    if improved:
+                        best_score = score
+                        validations_without_improvement = 0
+                    else:
+                        validations_without_improvement += 1
                     _checkpoint_v2(run_dir/"latest.pt", model, optimizer, step,
                                    stats, args, world_step, validation,
-                                   min(best_score, score))
+                                   best_score, step)
                     if validation["passed"]:
-                        candidate = run_dir/f"candidate_step_{step:06d}.pt"
-                        _candidate_policy_v2(
-                            candidate, model, step, stats, args, validation)
                         joint_candidate = None
                         if args.command == "train-joint":
-                            joint_candidate = run_dir/f"candidate_joint_step_{step:06d}.pt"
+                            candidate = run_dir/f"candidate_joint_step_{step:06d}.pt"
                             _candidate_joint_policy_v2(
-                                joint_candidate, model, step, stats, args, validation)
+                                candidate, model, step, stats, args, validation)
+                        else:
+                            candidate = run_dir/f"candidate_step_{step:06d}.pt"
+                            _candidate_policy_v2(
+                                candidate, model, step, stats, args, validation)
                         _update_candidates(
                             run_dir, score, step, candidate, joint_candidate)
-                    if validation["passed"] and score < best_score:
-                        best_score = score
+                    retain_best = bool(score < best_accepted_score)
+                    if retain_best:
+                        best_accepted_score = score
                         _checkpoint_v2(run_dir/"best.pt", model, optimizer, step,
-                                       stats, args, world_step, validation, best_score)
-                        _candidate_policy_v2(
-                            run_dir/"best_action_policy.pt", model, step, stats,
-                            args, validation)
-                        _candidate_joint_policy_v2(
-                            run_dir/"best_joint_policy.pt", model, step, stats,
-                            args, validation)
+                                       stats, args, world_step, validation,
+                                       best_score, step)
+                        if args.command == "train-joint":
+                            _candidate_joint_policy_v2(
+                                run_dir/"best_joint_policy.pt", model, step,
+                                stats, args, validation)
+                        else:
+                            _candidate_policy_v2(
+                                run_dir/"best_action_policy.pt", model, step,
+                                stats, args, validation)
                         stage1.save_json(run_dir/"best_metrics.json",
                                          {"step": step, **validation})
+                        print(json.dumps({
+                            "step": step,
+                            "best_checkpoint": str(run_dir/"best.pt"),
+                            "best_selection_score": best_accepted_score,
+                            "hard_gate_passed": bool(validation["passed"]),
+                        }), flush=True)
+                    stop_training = bool(
+                        args.early_stop_patience > 0
+                        and validations_without_improvement
+                        >= args.early_stop_patience)
+                    if stop_training:
+                        early_stop = {
+                            "step": step,
+                            "reason": "validation_selection_score_plateau",
+                            "validations_without_improvement": (
+                                validations_without_improvement),
+                            "patience": args.early_stop_patience,
+                            "min_delta": args.early_stop_min_delta,
+                            "best_selection_score": best_score,
+                            "current_selection_score": score,
+                        }
+                        stage1.save_json(run_dir/"early_stop.json", early_stop)
+                        print(json.dumps({"early_stop": early_stop}), flush=True)
                     if args.overfit and step == args.steps:
                         gate = {"step": step, **validation}
                         stage1.save_json(run_dir/"overfit_gate.json", gate)
                         print(json.dumps({"overfit_gate": gate}), flush=True)
                     stage1.save_json(run_dir/"history.json", history)
                 if distributed:
+                    stop_flag = torch.tensor(
+                        int(stop_training) if is_main else 0,
+                        device=device, dtype=torch.int32)
+                    dist.broadcast(stop_flag, src=0)
+                    stop_training = bool(stop_flag.item())
                     dist.barrier()
+            elif checkpoint_now:
+                # Keep every rank at the same optimizer step while rank zero
+                # serializes the multi-gigabyte recovery checkpoint. Without
+                # the barriers, the other ranks can enter the next all-reduce
+                # and time out while rank zero is still writing the file.
+                if distributed:
+                    dist.barrier()
+                if is_main:
+                    _checkpoint_v2(
+                        run_dir/"latest.pt", model, optimizer, step, stats,
+                        args, world_step, last_validation, best_score,
+                        last_validation_step)
+                    _tensorboard_write(writer, "checkpoint/step", step, step)
+                    writer.flush()
+                    print(json.dumps({
+                        "step": step,
+                        "checkpoint": str(run_dir/"latest.pt"),
+                        "validation_step": last_validation_step,
+                    }), flush=True)
+                if distributed:
+                    dist.barrier()
+            if stop_training:
+                break
     finally:
+        if writer is not None:
+            writer.flush()
+            writer.close()
         train_data.close()
         if val_data is not train_data:
             val_data.close()
@@ -1281,15 +1598,24 @@ def evaluate_v2(args):
     if rank != 0:
         return
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if payload.get("format") != TRAINING_FORMAT_V2:
-        raise ValueError("evaluate-v2 requires a v2 training checkpoint")
+    if payload.get("format") not in (TRAINING_FORMAT_V2,
+                                      JOINT_TRAINING_FORMAT_V3):
+        raise ValueError("evaluate-v2 requires a v2 action or v3 joint checkpoint")
     architecture = payload["architecture"]
-    model = ActionOnlyModel(
-        architecture["width"], architecture["depth"], architecture["heads"],
-        architecture["ffn_width"])
-    selected = {key: value for key, value in payload["model"].items()
-                if key.startswith(("observation.", "action_expert."))}
-    model.load_state_dict(selected, strict=True)
+    if payload.get("format") == JOINT_TRAINING_FORMAT_V3:
+        model = JointWorldActionModel(
+            DirectHorizonWorldModel(), architecture["width"],
+            architecture["depth"], architecture["heads"],
+            architecture["ffn_width"],
+            architecture.get("future_attention_layers", 2))
+        model.load_state_dict(payload["model"], strict=True)
+    else:
+        model = ActionOnlyModel(
+            architecture["width"], architecture["depth"], architecture["heads"],
+            architecture["ffn_width"])
+        selected = {key: value for key, value in payload["model"].items()
+                    if key.startswith(("observation.", "action_expert."))}
+        model.load_state_dict(selected, strict=True)
     model.to(device).eval()
     dataset = _v2_dataset(args.split, args, samples=args.eval_samples)
     summary = evaluate_actions_v2(model, dataset, payload["stats"], args, device)
@@ -1310,6 +1636,7 @@ def _v2_common(parser):
     parser.add_argument("--action-depth", type=int, default=8)
     parser.add_argument("--action-heads", type=int, default=8)
     parser.add_argument("--action-ffn-width", type=int, default=2048)
+    parser.add_argument("--future-attention-layers", type=int, default=2)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--eval-samples", type=int, default=4096)
@@ -1325,18 +1652,41 @@ def _v2_train_arguments(parser, joint=False):
     parser.add_argument("--micro-batch-size", type=int, default=1 if joint else 4)
     parser.add_argument("--grad-accumulation", type=int, default=4 if joint else 8)
     parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=0,
+        help=("Save latest.pt at this optimizer-step interval without running "
+              "validation; zero saves only on validation steps."))
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--run-name")
     parser.add_argument("--action-lr", type=float, default=3e-5 if joint else 1e-4)
     parser.add_argument("--shared-lr", type=float, default=1e-5 if joint else 5e-5)
+    parser.add_argument("--fusion-lr", type=float, default=1e-4)
     parser.add_argument("--world-lr", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--max-preclip-grad-norm", type=float, default=0.0,
+        help=("Skip an optimizer update when the gradient norm before clipping "
+              "exceeds this value; zero disables the guard."))
+    parser.add_argument(
+        "--lr-decay-start", type=int, default=0,
+        help=("Optimizer step where cosine LR decay begins; zero disables "
+              "decay."))
+    parser.add_argument(
+        "--lr-min-scale", type=float, default=0.1,
+        help="Final cosine-decay learning-rate multiplier.")
+    parser.add_argument(
+        "--early-stop-patience", type=int, default=0,
+        help=("Stop after this many consecutive validations without a lower "
+              "selection score; zero disables early stopping."))
+    parser.add_argument(
+        "--early-stop-min-delta", type=float, default=0.0,
+        help="Minimum selection-score decrease counted as an improvement.")
     parser.add_argument("--action-weight", type=float, default=1.0)
     parser.add_argument("--world-weight", type=float, default=0.25 if joint else 0.0)
     parser.add_argument("--world-weight-start", type=float, default=0.05)
     parser.add_argument("--world-weight-mid", type=float, default=0.15)
-    parser.add_argument("--world-freeze-steps", type=int, default=500)
+    parser.add_argument("--world-freeze-steps", type=int, default=1000)
     parser.add_argument("--world-ramp-end", type=int, default=1500)
     parser.add_argument("--action-x0-weight", type=float, default=0.0)
     parser.add_argument("--action-delta-weight", type=float, default=0.20)
@@ -1346,12 +1696,31 @@ def _v2_train_arguments(parser, joint=False):
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--resume-from", type=Path,
+        help="Resume model/statistics/step from an explicit checkpoint path.")
+    parser.add_argument(
+        "--reset-optimizer", action="store_true",
+        help="When resuming, initialize a fresh AdamW optimizer state.")
+    parser.add_argument(
         "--memory-smoke", action="store_true",
         help="Run steady-state optimizer steps and skip validation/checkpoints.")
     parser.add_argument("--memory-smoke-steps", type=int, default=2)
     if joint:
         parser.add_argument("--action-checkpoint", type=Path, required=True)
         parser.add_argument("--world-checkpoint", type=Path, required=True)
+        parser.add_argument(
+            "--world-action-teacher-forcing", type=float, default=0.0,
+            help=("Blend ground-truth actions into the world condition. Keep at "
+                  "zero for train/deployment-consistent joint denoising."))
+        parser.add_argument(
+            "--fusion-warmup-steps", type=int, default=1000,
+            help=("Only train FutureTokenAdapter and future cross-attention "
+                  "during this zero-gated warmup."))
+        parser.add_argument(
+            "--freeze-world-branch", action="store_true",
+            help=("Keep joint future-token conditioning active while freezing "
+                  "the world UNet, world adapter, and future-fusion weights; "
+                  "also disable the auxiliary world loss."))
 
 
 def _common(parser):
@@ -1430,11 +1799,31 @@ def main():
             args.action_checkpoint = args.action_checkpoint.expanduser().resolve()
         if getattr(args, "world_checkpoint", None) is not None:
             args.world_checkpoint = args.world_checkpoint.expanduser().resolve()
+        if getattr(args, "resume_from", None) is not None:
+            args.resume_from = args.resume_from.expanduser().resolve()
+            if not args.resume_from.is_file():
+                parser.error(f"resume checkpoint does not exist: {args.resume_from}")
         if args.command == "evaluate-v2":
             evaluate_v2(args)
         else:
             if args.grad_accumulation <= 0 or args.micro_batch_size <= 0:
                 parser.error("batch sizes and gradient accumulation must be positive")
+            if args.eval_every <= 0 or args.checkpoint_every < 0:
+                parser.error(
+                    "--eval-every must be positive and --checkpoint-every "
+                    "must be nonnegative")
+            if args.reset_optimizer and not (args.resume or args.resume_from):
+                parser.error("--reset-optimizer requires --resume or --resume-from")
+            if args.lr_decay_start < 0 or args.lr_decay_start >= args.steps:
+                parser.error("--lr-decay-start must satisfy 0 <= start < steps")
+            if not 0 < args.lr_min_scale <= 1:
+                parser.error("--lr-min-scale must be in (0, 1]")
+            if args.max_preclip_grad_norm < 0:
+                parser.error("--max-preclip-grad-norm must be nonnegative")
+            if args.early_stop_patience < 0:
+                parser.error("--early-stop-patience must be nonnegative")
+            if args.early_stop_min_delta < 0:
+                parser.error("--early-stop-min-delta must be nonnegative")
             if (args.world_freeze_steps < 0
                     or args.world_ramp_end < args.world_freeze_steps):
                 parser.error("world schedule requires 0 <= freeze_steps <= ramp_end")

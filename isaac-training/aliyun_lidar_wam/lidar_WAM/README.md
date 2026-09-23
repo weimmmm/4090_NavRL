@@ -788,4 +788,4 @@ Wan2.2 Video DiT 的独立 1→4 LiDAR 实验见 [WAN_LIDAR.md](WAN_LIDAR.md)。
 
 直接预测 0.48 秒后单帧的 UNet diffusion 实验见 [DIRECT_T3.md](DIRECT_T3.md)。它输入当前 latent 和连续三段真实动作，直接生成 `t+3`，并与复制帧、一步模型三次自回归和恒速度运动重投影在固定样本上统一比较。
 
-不使用 Wan、直接把 Fast-WAM 风格 Action Expert 接到现有 `t+3` UNet 的联合训练入口见 [ACTION_EXPERT.md](ACTION_EXPERT.md)。它共同优化世界 diffusion 与 30 步动作 flow matching；动作分支只读取当前 LiDAR、当前目标/自身状态和过去动作，不读取未来雷达或未来状态。
+不使用 Wan、直接把 Action Flow Expert 接到现有 `t+3` UNet 的双向联合训练入口见 [ACTION_EXPERT.md](ACTION_EXPERT.md)。V3 保留 UNet 的 Action→Future 条件，并把预测的 Future token 通过末两层零门控 Cross-Attention 返回 Action 分支；训练与部署均不读取真实未来雷达或未来状态。
