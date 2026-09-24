@@ -59,16 +59,21 @@ from lidar_wam.runner.world_direct_horizon import (
     WorldV2View,
     evaluate_world_v2,
     frame_metrics,
+    weighted_future_loss,
 )
 
 
 RUN_NAME = "action_expert_joint"
-ACTION_HORIZON = 30
+ACTION_HORIZON = 10
 ACTION_DIM = 3
 FLOW_EPS = 1e-4
 TRAINING_FORMAT_V2 = "navrl-action-expert-training-v2"
 JOINT_TRAINING_FORMAT_V3 = "navrl-joint-world-action-training-v3"
 JOINT_POLICY_FORMAT_V3 = "navrl-joint-world-action-policy-v3"
+JOINT_TRAINING_FORMAT_V4 = "navrl-bidirectional-world-action-training-v4"
+JOINT_POLICY_FORMAT_V4 = "navrl-bidirectional-world-action-policy-v4"
+JOINT_TRAINING_FORMAT_V5 = "navrl-single-future-action10-training-v5"
+JOINT_POLICY_FORMAT_V5 = "navrl-single-future-action10-policy-v5"
 
 
 def _decode(value):
@@ -364,7 +369,8 @@ def sample_actions(model, previous, goal, proprio, past, past_mask, stats,
             clip_sample=False)
         scheduler.set_timesteps(steps, device=previous.device)
         future = torch.randn(
-            previous.shape, generator=generator, device=previous.device,
+            (len(previous), *previous.shape[1:]), generator=generator,
+            device=previous.device,
             dtype=previous.dtype)
         world_timesteps = scheduler.timesteps
         action_mean = _tensor_stats(stats, "action_logit_mean", value)
@@ -379,7 +385,9 @@ def sample_actions(model, previous, goal, proprio, past, past_mask, stats,
             velocity, epsilon, _ = model.predict_joint_velocity(
                 value, timestep, future, world_timestep, previous,
                 goal, proprio, past, past_mask, world_state,
-                action_mean, action_std, observation_tokens=observation)
+                action_mean, action_std,
+                scheduler.alphas_cumprod[world_timestep].expand(len(previous)),
+                observation_tokens=observation)
             future = scheduler.step(
                 epsilon, world_timestep, future, eta=0.0).prev_sample
         else:
@@ -399,8 +407,7 @@ def summarize_action(prediction, target):
     }
     for axis in range(3):
         result[f"axis_{axis}_mae"] = float(error[:, :, axis].mean())
-    for chunk in range(3):
-        result[f"chunk_{chunk+1}_mae"] = float(error[:, chunk*10:(chunk+1)*10].mean())
+    result["chunk_1_mae"] = float(error.mean())
     return result
 
 
@@ -668,7 +675,7 @@ def _v2_dataset(split, args, overfit=False, samples=None, limit=None):
     return V2WindowDataset(
         split, args.dataset_root, args.latent_root, args.index_root,
         overfit=overfit, samples_per_seed=samples, random_seed=args.seed,
-        limit=limit)
+        limit=limit, all_future_targets=args.command == "train-joint")
 
 
 def _broadcast_stats(dataset, rank):
@@ -680,8 +687,11 @@ def _broadcast_stats(dataset, rank):
 
 def _v2_action_terms(model, previous, actions, goal, proprio, past,
                      past_mask, stats, joint_inputs=None,
-                     x0_weight=0.0, delta_weight=0.20):
-    target = action_to_flow(actions.flatten(1, 2), stats)
+                     x0_weight=0.0, delta_weight=0.20,
+                     candidate_weight=0.10):
+    if actions.ndim == 4:
+        actions = actions[:, 0]
+    target = action_to_flow(actions, stats)
     noise = torch.randn_like(target)
     sigma = torch.rand(len(target), device=target.device, dtype=target.dtype)
     noisy = (1-sigma[:, None, None])*target + sigma[:, None, None]*noise
@@ -694,29 +704,41 @@ def _v2_action_terms(model, previous, actions, goal, proprio, past,
         noisy, timestep, previous, normalized_goal, normalized_proprio,
         past_flow, past_mask, **kwargs)
     target_velocity = noise - target
-    # All 30 commands remain supervised.  Checkpoint selection, rather than a
-    # hidden per-timestep training reweighting, prioritizes the ten commands
-    # that are actually executed before receding-horizon replanning.
-    horizon_weight = torch.cat((
-        torch.ones(10, device=target.device, dtype=target.dtype),
-        torch.full((10,), 0.3, device=target.device, dtype=target.dtype),
-        torch.full((10,), 0.1, device=target.device, dtype=target.dtype),
-    )).reshape(1, ACTION_HORIZON, 1)
-    horizon_weight = horizon_weight / horizon_weight.mean()
-    flow = ((velocity-target_velocity).square()*horizon_weight).mean()
+    flow_error = (velocity-target_velocity).square()
+    flow = flow_error.mean()
     x0 = noisy - sigma[:, None, None] * velocity
-    endpoint = ((x0-target).abs()*horizon_weight).mean()
-    delta_weight_by_step = 0.5 * (
-        horizon_weight[:, 1:] + horizon_weight[:, :-1])
-    delta = (((x0[:, 1:] - x0[:, :-1])
-              - (target[:, 1:] - target[:, :-1])).abs()
-             * delta_weight_by_step).mean()
-    total = flow + float(x0_weight)*endpoint + float(delta_weight)*delta
-    return total, world_epsilon, {
+    endpoint_error = (x0-target).abs()
+    endpoint = endpoint_error.mean()
+    delta_error = ((x0[:, 1:] - x0[:, :-1])
+                   - (target[:, 1:] - target[:, :-1])).abs()
+    delta = delta_error.mean()
+    candidate = flow*0
+    if joint_inputs is not None:
+        raw_model = _unwrap(model)
+        candidate_velocity = raw_model._last_candidate_velocity
+        candidate = F.mse_loss(candidate_velocity, target_velocity)
+    total = (flow + float(x0_weight)*endpoint
+             + float(delta_weight)*delta + float(candidate_weight)*candidate)
+    metrics = {
         "action_flow_mse": flow.detach(),
         "action_x0_l1": endpoint.detach(),
         "action_delta_l1": delta.detach(),
+        "candidate_flow_mse": candidate.detach(),
+        "candidate_loss_weight": float(candidate_weight),
+        "action_horizon_10_flow_mse": flow.detach(),
+        "action_horizon_10_x0_l1": endpoint.detach(),
+        "action_horizon_10_delta_l1": delta.detach(),
     }
+    if joint_inputs is not None:
+        feedback = raw_model._last_predicted_future.detach()
+        metrics.update({
+            "candidate_velocity_mean": candidate_velocity.detach().mean(),
+            "candidate_velocity_std": candidate_velocity.detach().float().std(),
+            "feedback_future_mean": feedback.mean(),
+            "feedback_future_std": feedback.float().std(),
+            "feedback_future_abs_max": feedback.abs().max(),
+        })
+    return total, world_epsilon, metrics
 
 
 @torch.no_grad()
@@ -734,7 +756,7 @@ def evaluate_actions_v2(model, dataset, stats, args, device):
             prediction = sample_actions(
                 model, previous, goal, proprio, past, past_mask, stats,
                 args.flow_steps, args.seed + offset, world_state=state)
-        target = actions.flatten(1, 2)
+        target = actions[:, 0] if actions.ndim == 4 else actions
         fallback = torch.as_tensor(
             stats["action_raw_mean"], device=device, dtype=past.dtype)[None, None]
         repeat = torch.where(past_mask[:, -1:, None].bool(), past[:, -1:, :],
@@ -771,8 +793,6 @@ def evaluate_actions_v2(model, dataset, stats, args, device):
             repeat_first_per_sample[turning].mean()),
         "repeat_last_baseline_mae": float(repeat_error.mean()),
         "repeat_last_first_10_mae": float(repeat_error[:, :10].mean()),
-        "repeat_last_middle_10_mae": float(repeat_error[:, 10:20].mean()),
-        "repeat_last_final_10_mae": float(repeat_error[:, 20:].mean()),
         "mean_action_baseline_mae": float((
             torch.as_tensor(stats["action_raw_mean"])[None, None] - target
         ).abs().mean()),
@@ -813,6 +833,13 @@ def _load_world_v2(path: Path):
         state = {key[len("world."):]: value for key, value in state.items()
                  if key.startswith("world.")}
     model = DirectHorizonWorldModel()
+    # Older direct-horizon checkpoints predate this non-learned conditioning
+    # buffer.  Preserve the checkpoint's learnable tensors and use the model
+    # default only for that deterministic compatibility field.
+    expected = model.state_dict()
+    if "condition.horizon" not in state and "condition.horizon" in expected:
+        state = dict(state)
+        state["condition.horizon"] = expected["condition.horizon"]
     model.load_state_dict(state, strict=True)
     return model, int(payload.get("step", -1))
 
@@ -825,10 +852,12 @@ def _make_v2_model(args):
     world_payload = torch.load(
         args.world_checkpoint, map_location="cpu", weights_only=False)
     world_gate = world_payload.get("validation", {}).get("gate", {})
-    if not bool(world_gate.get("passed", False)):
+    if not bool(world_gate.get("passed", False)) and not args.allow_world_gate_failure:
         raise RuntimeError(
             "World checkpoint did not pass the required 10% copy improvement "
-            "and 5% shuffled-action degradation gate")
+            "and 5% shuffled-action degradation gate; pass "
+            "--allow-world-gate-failure only for an explicitly audited "
+            "experimental joint run")
     world, world_step = _load_world_v2(args.world_checkpoint)
     model = JointWorldActionModel(
         world, width=args.action_width, depth=args.action_depth,
@@ -839,19 +868,29 @@ def _make_v2_model(args):
     action_state = action_payload["model"]
     selected = {key: value for key, value in action_state.items()
                 if key.startswith(("observation.", "action_expert."))}
+    position_key = "action_expert.action_position"
+    if (position_key in selected
+            and selected[position_key].shape[1] != ACTION_HORIZON):
+        selected[position_key] = selected[position_key][:, :ACTION_HORIZON].clone()
+    candidate_missing = not any(
+        key.startswith("action_expert.candidate_") for key in selected)
     incompatible = model.load_state_dict(selected, strict=False)
     allowed = {
         key for key in model.state_dict()
         if (key.startswith(("world.", "observation_to_world.",
-                            "future_adapter."))
+                            "future_adapter.", "action_semantic_adapter."))
             or ".future_attn." in key
             or ".norm_future." in key
-            or key.endswith(".future_gate"))
+            or key.endswith(".future_gate")
+            or (candidate_missing
+                and key.startswith("action_expert.candidate_")))
     }
     if set(incompatible.missing_keys) != allowed or incompatible.unexpected_keys:
         raise ValueError(
             f"action checkpoint merge mismatch: missing={incompatible.missing_keys}, "
             f"unexpected={incompatible.unexpected_keys}")
+    if candidate_missing:
+        model.action_expert.initialize_candidate_head()
     return model, world_step
 
 
@@ -860,6 +899,9 @@ def _v2_optimizer(model, args):
     fusion_parameters = []
     if isinstance(raw, JointWorldActionModel):
         fusion_parameters.extend(raw.future_adapter.parameters())
+        fusion_parameters.extend(raw.action_semantic_adapter.parameters())
+        fusion_parameters.extend(raw.action_expert.candidate_norm.parameters())
+        fusion_parameters.extend(raw.action_expert.candidate_out.parameters())
         for block in raw.action_expert.blocks:
             if block.future_attention:
                 fusion_parameters.extend(block.norm_future.parameters())
@@ -868,7 +910,7 @@ def _v2_optimizer(model, args):
     fusion_ids = {id(parameter) for parameter in fusion_parameters}
     action_parameters = [
         parameter for parameter in raw.action_expert.parameters()
-        if id(parameter) not in fusion_ids]
+        if parameter.requires_grad and id(parameter) not in fusion_ids]
     groups = [
         {"params": action_parameters, "lr": args.action_lr,
          "name": "action"},
@@ -901,6 +943,9 @@ def _freeze_joint_world_branch(model):
     model.world.requires_grad_(False)
     model.observation_to_world.requires_grad_(False)
     model.future_adapter.requires_grad_(False)
+    model.action_semantic_adapter.requires_grad_(False)
+    model.action_expert.candidate_norm.requires_grad_(False)
+    model.action_expert.candidate_out.requires_grad_(False)
     for block in model.action_expert.blocks:
         if block.future_attention:
             block.norm_future.requires_grad_(False)
@@ -982,9 +1027,15 @@ class _JointWorldEvaluationView(torch.nn.Module):
     def forward(self, noisy, previous, actions, state, timestep):
         if self._observation is None or len(self._observation) != len(previous):
             raise RuntimeError("world evaluation view was not prepared for this batch")
-        return self.joint.predict_world(
-            noisy, previous, actions, state, timestep,
+        # The shared evaluator still allocates three horizon slots.  Only t+1
+        # is part of this model; leave the other slots inert and discard their
+        # metrics below.
+        epsilon = self.joint.predict_world(
+            noisy[:, 0], previous, actions[:, 0], state, timestep,
             observation_tokens=self._observation)
+        result = torch.zeros_like(noisy)
+        result[:, 0] = epsilon
+        return result
 
 
 def _combined_validation(model, vae, action_dataset, world_dataset,
@@ -996,9 +1047,14 @@ def _combined_validation(model, vae, action_dataset, world_dataset,
         world = evaluate_world_v2(
             _JointWorldEvaluationView(_unwrap(model)), vae,
             WorldV2View(world_dataset), args, device)
-        prediction_cd = float(world["prediction"]["cd_paper_m2"])
-        copy_cd = float(world["copy"]["cd_paper_m2"])
-        shuffled_cd = float(world["shuffled"]["cd_paper_m2"])
+        t1 = world["by_horizon"]["t+1"]
+        world["prediction"] = t1["prediction"]
+        world["copy"] = t1["copy"]
+        world["shuffled"] = t1["shuffled"]
+        world["evaluated_horizons"] = ["t+1"]
+        prediction_cd = float(t1["prediction"]["cd_paper_m2"])
+        copy_cd = float(t1["copy"]["cd_paper_m2"])
+        shuffled_cd = float(t1["shuffled"]["cd_paper_m2"])
         world["gate"] = {
             "metric": "cd_paper_m2",
             "prediction_improvement": 1-prediction_cd/max(copy_cd, 1e-8),
@@ -1016,16 +1072,20 @@ def _combined_validation(model, vae, action_dataset, world_dataset,
 
 
 def _checkpoint_v2(path, model, optimizer, step, stats, args, world_step,
-                   validation, best_score, validation_step=None):
+                   validation, best_score, validation_step=None,
+                   best_chamfer_m2=math.inf):
     is_joint = isinstance(_unwrap(model), JointWorldActionModel)
     payload = {
-        "format": (JOINT_TRAINING_FORMAT_V3 if is_joint else TRAINING_FORMAT_V2),
+        "format": (JOINT_TRAINING_FORMAT_V5 if is_joint else TRAINING_FORMAT_V2),
         "model": _unwrap(model).state_dict(),
         "optimizer": optimizer.state_dict(), "step": int(step), "stats": stats,
         "world_initial_step": int(world_step), "validation": validation,
         "validation_step": int(
             step if validation_step is None else validation_step),
         "best_selection_score": float(best_score),
+        # The value is meaningful for joint runs.  Keep it in every checkpoint
+        # so latest/best snapshots can be compared without external logs.
+        "best_prediction_cd_paper_m2": float(best_chamfer_m2),
         "semantics": coordinate_semantics(),
         "architecture": {
             "action_horizon": ACTION_HORIZON, "action_dim": ACTION_DIM,
@@ -1033,6 +1093,8 @@ def _checkpoint_v2(path, model, optimizer, step, stats, args, world_step,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
             "future_attention_layers": (
                 args.future_attention_layers if is_joint else 0),
+            "world_horizon": 1 if is_joint else 0,
+            "bidirectional_semantic_fusion": bool(is_joint),
         },
         "training_schedule": {
             "world_freeze_steps": getattr(args, "world_freeze_steps", 0),
@@ -1041,8 +1103,10 @@ def _checkpoint_v2(path, model, optimizer, step, stats, args, world_step,
             "world_weight_mid": getattr(args, "world_weight_mid", 0.0),
             "world_weight_final": getattr(args, "world_weight", 0.0),
             "fusion_warmup_steps": getattr(args, "fusion_warmup_steps", 0),
-            "world_action_teacher_forcing": getattr(
-                args, "world_action_teacher_forcing", 0.0),
+            "candidate_weight": getattr(args, "candidate_weight", 0.0),
+            "feedback_ddim_steps": getattr(args, "feedback_ddim_steps", 0),
+            "feedback_gradient_steps": getattr(
+                args, "feedback_gradient_steps", 0),
             "action_lr": args.action_lr,
             "shared_lr": args.shared_lr,
             "fusion_lr": args.fusion_lr,
@@ -1094,16 +1158,17 @@ def _candidate_joint_policy_v2(path, model, step, stats, args, validation):
     if not isinstance(raw, JointWorldActionModel):
         return
     payload = {
-        "format": JOINT_POLICY_FORMAT_V3,
+        "format": JOINT_POLICY_FORMAT_V5,
         "model": raw.state_dict(), "step": int(step), "stats": stats,
         "validation": validation, "semantics": coordinate_semantics(),
         "architecture": {
             "action_horizon": ACTION_HORIZON, "action_dim": ACTION_DIM,
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
-            "world_horizon": 3,
+            "world_horizon": 1,
             "future_attention_layers": args.future_attention_layers,
             "joint_denoising": True,
+            "bidirectional_semantic_fusion": True,
         },
         "provenance": {
             "dataset_manifest_sha256": file_sha256(args.dataset_root/"manifest.json"),
@@ -1155,15 +1220,17 @@ def train_v2(args):
     if distributed:
         dist.barrier()
     train_data = _v2_dataset("train", args, overfit=args.overfit)
-    val_data = (_v2_dataset("train", args, overfit=True, limit=args.eval_samples)
-                if args.overfit else
-                _v2_dataset("val", args, samples=args.eval_samples))
+    # Validation limits are global random-window counts, not per-seed counts.
+    # Keeping the seeded subset fixed across validation rounds makes the
+    # TensorBoard curves comparable while avoiding a full validation scan.
+    val_data = _v2_dataset(
+        "train" if args.overfit else "val", args, overfit=args.overfit,
+        limit=args.eval_samples)
     world_val_data = val_data
     if args.command == "train-joint":
-        world_val_data = (_v2_dataset(
-            "train", args, overfit=True, limit=args.world_eval_samples)
-            if args.overfit else _v2_dataset(
-                "val", args, samples=args.world_eval_samples))
+        world_val_data = _v2_dataset(
+            "train" if args.overfit else "val", args, overfit=args.overfit,
+            limit=args.world_eval_samples)
     stats = _broadcast_stats(train_data, rank)
     # ``compute_condition_stats`` opens HDF5 handles on rank zero.  Close them
     # before DataLoader workers are forked; workers reopen independent handles.
@@ -1179,25 +1246,74 @@ def train_v2(args):
                                          broadcast_buffers=False)
     optimizer = _v2_optimizer(model, args)
     first_step, best_score, best_accepted_score = 1, math.inf, math.inf
+    best_chamfer_m2 = math.inf
     last_validation, last_validation_step = {}, -1
     resume_path = getattr(args, "resume_from", None)
     if args.resume and resume_path is None:
         resume_path = run_dir / "latest.pt"
     if resume_path is not None:
         payload = torch.load(resume_path, map_location="cpu", weights_only=False)
-        _unwrap(model).load_state_dict(payload["model"], strict=True)
+        resume_state = payload["model"]
+        if args.command == "train-action":
+            # A joint checkpoint is the usual source for an Action Expert
+            # fine-tune.  Deliberately retain only the deployment-visible
+            # current-observation/action branch; world and future tokens must
+            # not leak into an action-only run.
+            target_keys = set(_unwrap(model).state_dict())
+            if set(resume_state) != target_keys:
+                resume_state = {
+                    key: value for key, value in resume_state.items()
+                    if key in target_keys
+                }
+            position_key = "action_expert.action_position"
+            if (position_key in resume_state
+                    and resume_state[position_key].shape[1] != ACTION_HORIZON):
+                resume_state = dict(resume_state)
+                resume_state[position_key] = resume_state[position_key][
+                    :, :ACTION_HORIZON].clone()
+        if args.command == "train-action":
+            incompatible = _unwrap(model).load_state_dict(
+                resume_state, strict=False)
+            allowed_missing = {
+                key for key in _unwrap(model).state_dict()
+                if key.startswith("action_expert.candidate_")
+            }
+            if (set(incompatible.missing_keys) not in (set(), allowed_missing)
+                    or incompatible.unexpected_keys):
+                raise ValueError(
+                    f"action resume mismatch: missing={incompatible.missing_keys}, "
+                    f"unexpected={incompatible.unexpected_keys}")
+            if set(incompatible.missing_keys) == allowed_missing:
+                _unwrap(model).action_expert.initialize_candidate_head()
+        else:
+            _unwrap(model).load_state_dict(resume_state, strict=True)
         if not args.reset_optimizer:
             optimizer.load_state_dict(payload["optimizer"])
-        stats = payload["stats"]
+        # Keep the model weights when the physical data distribution changes,
+        # but let the new train split define its own goal/proprio/action
+        # normalization.  This is essential for randomized-terrain fine-tunes.
+        if not args.reset_stats:
+            stats = payload["stats"]
         first_step = int(payload["step"])+1
         best_score = float(payload.get("best_selection_score", math.inf))
+        best_chamfer_m2 = float(payload.get(
+            "best_prediction_cd_paper_m2", math.inf))
         last_validation = payload.get("validation", {})
         last_validation_step = int(payload.get(
             "validation_step", payload.get("step", -1)))
         best_accepted_score = best_score
+        if args.reset_best_score:
+            # Start a run-local model-selection history while retaining the
+            # resumed model/optimizer/step.  This is useful when the training
+            # distribution changes: the previous checkpoint remains intact,
+            # while best.pt in the new run records the best validation result
+            # obtained on the new distribution.
+            best_score = math.inf
+            best_accepted_score = math.inf
+            best_chamfer_m2 = math.inf
 
     config = {
-            "format": (JOINT_TRAINING_FORMAT_V3
+            "format": (JOINT_TRAINING_FORMAT_V5
                        if args.command == "train-joint"
                        else TRAINING_FORMAT_V2),
             "dataset_root": str(args.dataset_root), "latent_root": str(args.latent_root),
@@ -1207,21 +1323,35 @@ def train_v2(args):
             "checkpoint_every": args.checkpoint_every,
             "resume_from": str(resume_path) if resume_path is not None else None,
             "reset_optimizer": bool(args.reset_optimizer),
+            "reset_best_score": bool(args.reset_best_score),
+            "reset_stats": bool(args.reset_stats),
             "world_size": world_size,
             "global_batch_size": args.micro_batch_size*args.grad_accumulation*world_size,
             "precision": args.precision, "semantics": coordinate_semantics(),
             "action_validation_samples": len(val_data),
             "world_validation_samples": len(world_val_data),
+            "validation_sampling": {
+                "method": "global_random_without_replacement",
+                "fixed_across_validations": True,
+                "random_seed": args.seed,
+            },
             "sampling": {"uniform": 0.5, "low_clearance": 0.25, "turning": 0.25},
             "action_loss": {
                 "flow_weight": 1.0,
                 "x0_weight": args.action_x0_weight,
                 "delta_weight": args.action_delta_weight,
-                "horizon_chunk_weights": [1.0, 0.3, 0.1],
+                "candidate_weight": args.candidate_weight,
+                "horizon": "commands 1-10",
             },
             "selection": (
                 "0.40*first10 + 0.25*low_clearance_first10 + "
                 "0.25*turning_first10 + 0.10*overall"),
+            "checkpoint_selection": {
+                "best.pt": "lowest action validation selection_score",
+                "best_chamfer_m2.pt": (
+                    "lowest joint validation world.prediction.cd_paper_m2"),
+                "latest.pt": "most recently saved optimizer state",
+            },
             "optimizer_stability": {
                 "action_lr": args.action_lr,
                 "shared_lr": args.shared_lr,
@@ -1244,8 +1374,15 @@ def train_v2(args):
                 "world_weight_ramp_end": args.world_ramp_end,
                 "future_attention_layers": args.future_attention_layers,
                 "fusion_warmup_steps": args.fusion_warmup_steps,
-                "world_action_teacher_forcing": (
-                    args.world_action_teacher_forcing),
+                "allow_world_gate_failure": bool(
+                    args.allow_world_gate_failure),
+                "future_targets": ["t+1"],
+                "action_targets": ["1:10"],
+                "coupling": (
+                    "candidate action tokens -> single-future UNet; pure-noise "
+                    "DDIM prediction -> final action blocks"),
+                "feedback_ddim_steps": args.feedback_ddim_steps,
+                "feedback_gradient_steps": args.feedback_gradient_steps,
             } if args.command == "train-joint" else None),
             "normalization": stats,
         }
@@ -1279,18 +1416,29 @@ def train_v2(args):
         persistent_workers=args.workers > 0))
     vae = None
     noise_scheduler = None
+    feedback_scheduler = None
     if args.command == "train-joint":
         vae = stage1.load_circular_vae()
         vae.requires_grad_(False)
         noise_scheduler = stage1.DDPMScheduler(
             num_train_timesteps=1000, prediction_type="epsilon")
+        feedback_scheduler = stage1.DDIMScheduler(
+            num_train_timesteps=1000, prediction_type="epsilon",
+            clip_sample=False)
+        feedback_scheduler.set_timesteps(
+            args.feedback_ddim_steps, device=device)
+        feedback_timesteps = feedback_scheduler.timesteps
+        feedback_alphas = feedback_scheduler.alphas_cumprod.to(device)[
+            feedback_timesteps]
+        feedback_previous_alphas = torch.cat((
+            feedback_alphas[1:], torch.ones(
+                1, device=device, dtype=feedback_alphas.dtype)))
 
     history_path = run_dir/"history.json"
     history = (json.loads(history_path.read_text())
                if args.resume and args.resume_from is None
                and history_path.exists() else [])
     started = time.monotonic()
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     validations_without_improvement = 0
     try:
         for step in range(first_step, args.steps+1):
@@ -1323,11 +1471,12 @@ def train_v2(args):
                     0.0 if warmup else args.shared_lr*lr_scale)
                 _set_optimizer_lr(
                     optimizer, "observation_to_world",
-                    0.0 if warmup or args.freeze_world_branch
-                    else args.shared_lr*lr_scale)
+                    0.0 if args.freeze_world_branch else (
+                        args.fusion_lr*lr_scale if warmup
+                        else args.shared_lr*lr_scale))
                 _set_optimizer_lr(
                     optimizer, "future_adapter",
-                    0.0 if warmup or args.freeze_world_branch
+                    0.0 if args.freeze_world_branch
                     else args.fusion_lr*lr_scale)
             else:
                 _set_optimizer_lr(optimizer, "action", args.action_lr*lr_scale)
@@ -1343,6 +1492,9 @@ def train_v2(args):
                     joint_inputs = None
                     noise = timesteps = noisy_future = None
                     if args.command == "train-joint":
+                        target = target[:, 0]
+                        target_image = target_image[:, 0]
+                        actions = actions[:, 0]
                         noise = torch.randn_like(target)
                         timesteps = torch.randint(
                             0, 1000, (len(target),), device=device)
@@ -1351,37 +1503,54 @@ def train_v2(args):
                         joint_inputs = {
                             "noisy_future": noisy_future, "world_actions": actions,
                             "world_state": state, "world_timestep": timesteps,
+                            "world_alpha_cumprod": (
+                                noise_scheduler.alphas_cumprod.to(device)[timesteps]),
+                            "feedback_noise": torch.randn_like(target),
+                            "feedback_timesteps": feedback_timesteps,
+                            "feedback_alphas": feedback_alphas,
+                            "feedback_previous_alphas": feedback_previous_alphas,
+                            "feedback_gradient_steps": args.feedback_gradient_steps,
                             "action_logit_mean": torch.as_tensor(
                                 stats["action_logit_mean"], device=device),
                             "action_logit_std": torch.as_tensor(
                                 stats["action_logit_std"], device=device),
-                            "teacher_forcing": args.world_action_teacher_forcing,
                         }
                     action_loss, epsilon, action_parts = _v2_action_terms(
                         model, previous, actions, goal, proprio, past,
                         past_mask, stats, joint_inputs,
-                        args.action_x0_weight, args.action_delta_weight)
+                        args.action_x0_weight, args.action_delta_weight,
+                        args.candidate_weight)
                     world_loss = action_loss*0
                     world_parts = {}
                     if epsilon is not None:
                         epsilon_loss = F.mse_loss(epsilon, noise)
+                        zero = epsilon_loss*0
+                        latent = mask = empty_mask = range_loss = presence = empty = zero
                         eligible = select_aux_indices(
                             timesteps, target_image, args.aux_t_max,
                             args.aux_batch_max, args.aux_empty_max)
-                        zero = epsilon_loss*0
-                        latent = mask = empty_mask = range_loss = presence = empty = zero
                         if len(eligible):
-                            x0 = predicted_x0(noisy_future[eligible], epsilon[eligible],
-                                              timesteps[eligible], noise_scheduler)
+                            x0 = predicted_x0(
+                                noisy_future[eligible], epsilon[eligible],
+                                timesteps[eligible], noise_scheduler)
                             latent = F.l1_loss(x0, target[eligible])
-                            (mask, empty_mask, range_loss, presence, empty, _, _) = decoded_losses(
-                                vae, x0, target_image[eligible], train_data.scale,
-                                1.5, 8, 0.5)
+                            decoded = decoded_losses(
+                                vae, x0, target_image[eligible],
+                                train_data.scale, 1.5, 8, 0.5)
+                            mask, empty_mask, range_loss = decoded[:3]
+                            presence, empty = decoded[3:5]
                         world_loss = (epsilon_loss + 0.1*latent + 0.1*mask
                                       + 0.1*empty_mask + 0.05*range_loss
                                       + 0.02*presence + 0.2*empty)
-                        world_parts = {"world_epsilon_mse": epsilon_loss.detach(),
-                                       "world_x0_l1": latent.detach()}
+                        world_parts = {
+                            "world_epsilon_mse": epsilon_loss.detach(),
+                            "world_x0_l1": latent.detach(),
+                            "world_mask_bce": mask.detach(),
+                            "world_empty_mask_bce": empty_mask.detach(),
+                            "world_range_l1": range_loss.detach(),
+                            "world_presence_loss": presence.detach(),
+                            "world_empty_loss": empty.detach(),
+                        }
                     loss = (args.action_weight*action_loss
                             + scheduled_world_weight*world_loss) / args.grad_accumulation
                 if (args.command == "train-joint"
@@ -1401,7 +1570,19 @@ def train_v2(args):
                 totals["world_loss"] += float(world_loss.detach())/args.grad_accumulation
                 for key, value in {**action_parts, **world_parts}.items():
                     totals[key] += float(value)/args.grad_accumulation
-            grad = torch.nn.utils.clip_grad_norm_(parameters, args.grad_clip)
+            # LR-zero groups remain in the graph so gradients can flow through
+            # pretrained modules into the new fusion adapters.  They must not
+            # dominate clipping during fusion warmup, however.
+            active_parameters = [
+                parameter
+                for group in optimizer.param_groups if float(group["lr"]) > 0
+                for parameter in group["params"]
+                if parameter.requires_grad and parameter.grad is not None
+            ]
+            if not active_parameters:
+                raise RuntimeError("no optimizer parameters have a positive learning rate")
+            grad = torch.nn.utils.clip_grad_norm_(
+                active_parameters, args.grad_clip)
             if not torch.isfinite(grad):
                 raise FloatingPointError(f"non-finite gradient at step {step}")
             skip_update = bool(
@@ -1431,6 +1612,8 @@ def train_v2(args):
                           "fusion_warmup": bool(
                               args.command == "train-joint"
                               and step <= args.fusion_warmup_steps)}
+                for group in optimizer.param_groups:
+                    record[f"lr/{group.get('name', 'unnamed')}"] = float(group["lr"])
                 if args.command == "train-joint":
                     raw_model = _unwrap(model)
                     future_attention_parameters = []
@@ -1452,6 +1635,14 @@ def train_v2(args):
                             .float().norm()),
                         "future_adapter_grad_norm": _parameter_grad_norm(
                             raw_model.future_adapter.parameters()),
+                        "action_semantic_adapter_grad_norm": _parameter_grad_norm(
+                            raw_model.action_semantic_adapter.parameters()),
+                        "action_semantic_gate": float(
+                            raw_model.action_semantic_adapter.gate.detach()),
+                        "candidate_head_grad_norm": _parameter_grad_norm([
+                            *raw_model.action_expert.candidate_norm.parameters(),
+                            *raw_model.action_expert.candidate_out.parameters(),
+                        ]),
                         "future_attention_grad_norm": _parameter_grad_norm(
                             future_attention_parameters),
                         "future_attention_gates": future_gates,
@@ -1491,9 +1682,33 @@ def train_v2(args):
                         validations_without_improvement = 0
                     else:
                         validations_without_improvement += 1
+                    prediction_chamfer_m2 = (
+                        float(validation["world"]["prediction"]["cd_paper_m2"])
+                        if "world" in validation else math.inf)
+                    if prediction_chamfer_m2 < best_chamfer_m2:
+                        best_chamfer_m2 = prediction_chamfer_m2
+                        _checkpoint_v2(
+                            run_dir/"best_chamfer_m2.pt", model, optimizer,
+                            step, stats, args, world_step, validation,
+                            best_score, step, best_chamfer_m2)
+                        if args.command == "train-joint":
+                            _candidate_joint_policy_v2(
+                                run_dir/"best_chamfer_joint_policy.pt", model,
+                                step, stats, args, validation)
+                        stage1.save_json(
+                            run_dir/"best_chamfer_metrics.json",
+                            {"step": step,
+                             "prediction_cd_paper_m2": best_chamfer_m2,
+                             **validation})
+                        print(json.dumps({
+                            "step": step,
+                            "best_chamfer_checkpoint": str(
+                                run_dir/"best_chamfer_m2.pt"),
+                            "best_prediction_cd_paper_m2": best_chamfer_m2,
+                        }), flush=True)
                     _checkpoint_v2(run_dir/"latest.pt", model, optimizer, step,
                                    stats, args, world_step, validation,
-                                   best_score, step)
+                                   best_score, step, best_chamfer_m2)
                     if validation["passed"]:
                         joint_candidate = None
                         if args.command == "train-joint":
@@ -1511,7 +1726,7 @@ def train_v2(args):
                         best_accepted_score = score
                         _checkpoint_v2(run_dir/"best.pt", model, optimizer, step,
                                        stats, args, world_step, validation,
-                                       best_score, step)
+                                       best_score, step, best_chamfer_m2)
                         if args.command == "train-joint":
                             _candidate_joint_policy_v2(
                                 run_dir/"best_joint_policy.pt", model, step,
@@ -1568,7 +1783,7 @@ def train_v2(args):
                     _checkpoint_v2(
                         run_dir/"latest.pt", model, optimizer, step, stats,
                         args, world_step, last_validation, best_score,
-                        last_validation_step)
+                        last_validation_step, best_chamfer_m2)
                     _tensorboard_write(writer, "checkpoint/step", step, step)
                     writer.flush()
                     print(json.dumps({
@@ -1598,26 +1813,39 @@ def evaluate_v2(args):
     if rank != 0:
         return
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if payload.get("format") not in (TRAINING_FORMAT_V2,
-                                      JOINT_TRAINING_FORMAT_V3):
-        raise ValueError("evaluate-v2 requires a v2 action or v3 joint checkpoint")
+    if payload.get("format") not in (
+            TRAINING_FORMAT_V2, JOINT_TRAINING_FORMAT_V3,
+            JOINT_TRAINING_FORMAT_V4, JOINT_TRAINING_FORMAT_V5):
+        raise ValueError("evaluate-v2 requires a supported action/joint checkpoint")
     architecture = payload["architecture"]
-    if payload.get("format") == JOINT_TRAINING_FORMAT_V3:
+    if payload.get("format") == JOINT_TRAINING_FORMAT_V5:
         model = JointWorldActionModel(
             DirectHorizonWorldModel(), architecture["width"],
             architecture["depth"], architecture["heads"],
             architecture["ffn_width"],
             architecture.get("future_attention_layers", 2))
         model.load_state_dict(payload["model"], strict=True)
+    elif payload.get("format") in (JOINT_TRAINING_FORMAT_V3,
+                                   JOINT_TRAINING_FORMAT_V4):
+        raise ValueError(
+            "30-action/3-future joint checkpoints must be evaluated with the "
+            "legacy runner; initialize a v5 model from their component weights")
     else:
         model = ActionOnlyModel(
             architecture["width"], architecture["depth"], architecture["heads"],
             architecture["ffn_width"])
         selected = {key: value for key, value in payload["model"].items()
                     if key.startswith(("observation.", "action_expert."))}
-        model.load_state_dict(selected, strict=True)
+        position_key = "action_expert.action_position"
+        if selected[position_key].shape[1] != ACTION_HORIZON:
+            selected[position_key] = selected[position_key][:, :ACTION_HORIZON]
+        incompatible = model.load_state_dict(selected, strict=False)
+        allowed = {key for key in model.state_dict()
+                   if key.startswith("action_expert.candidate_")}
+        if set(incompatible.missing_keys) not in (set(), allowed):
+            raise ValueError(f"action checkpoint mismatch: {incompatible}")
     model.to(device).eval()
-    dataset = _v2_dataset(args.split, args, samples=args.eval_samples)
+    dataset = _v2_dataset(args.split, args, limit=args.eval_samples)
     summary = evaluate_actions_v2(model, dataset, payload["stats"], args, device)
     result = {"checkpoint": str(args.checkpoint), "step": payload["step"],
               "split": args.split, "summary": summary}
@@ -1639,8 +1867,12 @@ def _v2_common(parser):
     parser.add_argument("--future-attention-layers", type=int, default=2)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     parser.add_argument("--eval-batch-size", type=int, default=64)
-    parser.add_argument("--eval-samples", type=int, default=4096)
-    parser.add_argument("--world-eval-samples", type=int, default=1024)
+    parser.add_argument(
+        "--eval-samples", type=int, default=1024,
+        help="Total random windows used for Action validation (not per seed).")
+    parser.add_argument(
+        "--world-eval-samples", type=int, default=256,
+        help="Total random windows used for Future validation (not per seed).")
     parser.add_argument("--flow-steps", type=int, default=10)
     parser.add_argument("--ddim-steps", type=int, default=20)
     parser.add_argument("--mask-threshold", type=float, default=1.5)
@@ -1690,6 +1922,9 @@ def _v2_train_arguments(parser, joint=False):
     parser.add_argument("--world-ramp-end", type=int, default=1500)
     parser.add_argument("--action-x0-weight", type=float, default=0.0)
     parser.add_argument("--action-delta-weight", type=float, default=0.20)
+    parser.add_argument(
+        "--candidate-weight", type=float, default=0.10,
+        help="Auxiliary flow loss weight for the pre-fusion candidate head.")
     parser.add_argument("--aux-t-max", type=int, default=500)
     parser.add_argument("--aux-batch-max", type=int, default=64)
     parser.add_argument("--aux-empty-max", type=int, default=16)
@@ -1702,6 +1937,14 @@ def _v2_train_arguments(parser, joint=False):
         "--reset-optimizer", action="store_true",
         help="When resuming, initialize a fresh AdamW optimizer state.")
     parser.add_argument(
+        "--reset-best-score", action="store_true",
+        help=("When resuming, keep model/optimizer/step but start a new "
+              "run-local best.pt selection history."))
+    parser.add_argument(
+        "--reset-stats", action="store_true",
+        help=("When resuming on a changed dataset, retain model weights but "
+              "recompute normalization statistics from the new train split."))
+    parser.add_argument(
         "--memory-smoke", action="store_true",
         help="Run steady-state optimizer steps and skip validation/checkpoints.")
     parser.add_argument("--memory-smoke-steps", type=int, default=2)
@@ -1709,13 +1952,20 @@ def _v2_train_arguments(parser, joint=False):
         parser.add_argument("--action-checkpoint", type=Path, required=True)
         parser.add_argument("--world-checkpoint", type=Path, required=True)
         parser.add_argument(
-            "--world-action-teacher-forcing", type=float, default=0.0,
-            help=("Blend ground-truth actions into the world condition. Keep at "
-                  "zero for train/deployment-consistent joint denoising."))
+            "--allow-world-gate-failure", action="store_true",
+            help=("Allow an experimental joint run from a world checkpoint that "
+                  "failed its offline world-model quality gate. The override is "
+                  "recorded in the run configuration."))
         parser.add_argument(
             "--fusion-warmup-steps", type=int, default=1000,
             help=("Only train FutureTokenAdapter and future cross-attention "
                   "during this zero-gated warmup."))
+        parser.add_argument(
+            "--feedback-ddim-steps", type=int, default=4,
+            help="Pure-noise DDIM steps used by the action-feedback path.")
+        parser.add_argument(
+            "--feedback-gradient-steps", type=int, default=1,
+            help="Final feedback DDIM steps retained for backpropagation.")
         parser.add_argument(
             "--freeze-world-branch", action="store_true",
             help=("Keep joint future-token conditioning active while freezing "
@@ -1784,7 +2034,8 @@ def main():
     evaluate_v2_parser = commands.add_parser("evaluate-v2")
     _v2_common(evaluate_v2_parser)
     evaluate_v2_parser.add_argument("--checkpoint", type=Path, required=True)
-    evaluate_v2_parser.add_argument("--split", choices=("val", "test"), default="val")
+    evaluate_v2_parser.add_argument(
+        "--split", choices=("val", "test", "unseen"), default="val")
 
     args = parser.parse_args()
     if args.command in ("train-action", "train-joint", "evaluate-v2"):
@@ -1812,8 +2063,9 @@ def main():
                 parser.error(
                     "--eval-every must be positive and --checkpoint-every "
                     "must be nonnegative")
-            if args.reset_optimizer and not (args.resume or args.resume_from):
-                parser.error("--reset-optimizer requires --resume or --resume-from")
+            if (args.reset_optimizer or args.reset_stats) and not (
+                    args.resume or args.resume_from):
+                parser.error("--reset-optimizer/--reset-stats requires --resume or --resume-from")
             if args.lr_decay_start < 0 or args.lr_decay_start >= args.steps:
                 parser.error("--lr-decay-start must satisfy 0 <= start < steps")
             if not 0 < args.lr_min_scale <= 1:
@@ -1824,12 +2076,22 @@ def main():
                 parser.error("--early-stop-patience must be nonnegative")
             if args.early_stop_min_delta < 0:
                 parser.error("--early-stop-min-delta must be nonnegative")
-            if (args.world_freeze_steps < 0
-                    or args.world_ramp_end < args.world_freeze_steps):
-                parser.error("world schedule requires 0 <= freeze_steps <= ramp_end")
-            if not (0 <= args.world_weight_start <= args.world_weight_mid
-                    <= args.world_weight):
-                parser.error("world weights must be nonnegative and monotonic")
+            if args.candidate_weight < 0:
+                parser.error("--candidate-weight must be nonnegative")
+            if args.command == "train-joint":
+                if (args.feedback_ddim_steps <= 0
+                        or not 1 <= args.feedback_gradient_steps
+                        <= args.feedback_ddim_steps):
+                    parser.error(
+                        "feedback steps require 1 <= gradient_steps <= ddim_steps")
+                if (args.world_freeze_steps < 0
+                        or args.world_ramp_end < args.world_freeze_steps):
+                    parser.error(
+                        "world schedule requires 0 <= freeze_steps <= ramp_end")
+                if not (0 <= args.world_weight_start <= args.world_weight_mid
+                        <= args.world_weight):
+                    parser.error(
+                        "world weights must be nonnegative and monotonic")
             if args.overfit and args.steps == (10000 if args.command == "train-joint" else 20000):
                 args.steps = 500 if args.command == "train-joint" else 1000
                 args.eval_every = min(args.eval_every, 200)

@@ -1,11 +1,10 @@
-"""Joint world/action flow model for causal LiDAR navigation.
+"""Bidirectionally coupled world/action model for causal LiDAR navigation.
 
-The world UNet already conditions on the action chunk (action -> future).  This
-module adds the missing reverse connection (future -> action): the UNet's
-spatial denoising prediction is converted to LiDAR-shaped tokens and exposed to
-the last action blocks through zero-gated cross-attention.  A joint forward
-therefore denoises future LiDAR and actions together without exposing a clean
-future target to the policy.
+The first action blocks produce semantic action tokens.  Those tokens condition
+the future UNet (action -> future); the UNet's reconstructed clean future
+latents are then converted to directional tokens and consumed by the final
+action blocks (future -> action).  Clean future targets never enter the action
+path.
 """
 
 from __future__ import annotations
@@ -103,16 +102,49 @@ class FutureTokenAdapter(nn.Module):
             persistent=False)
 
     def forward(self, future_prediction: torch.Tensor) -> torch.Tensor:
+        multi_horizon = future_prediction.ndim == 5
+        if multi_horizon:
+            batch, horizons = future_prediction.shape[:2]
+            future_prediction = future_prediction.flatten(0, 1)
         if (future_prediction.ndim != 4
                 or tuple(future_prediction.shape[1:]) != (4, 27, 5)):
             raise ValueError(
-                "Expected future prediction [B,4,27,5], got "
+                "Expected future prediction [B,4,27,5] or [B,H,4,27,5], got "
                 f"{tuple(future_prediction.shape)}")
         feature = self.net(future_prediction)
         tokens = self.norm(feature.flatten(2).transpose(1, 2))
         position = self.polar_position.to(
             device=tokens.device, dtype=tokens.dtype)
-        return tokens + 0.10 * position + self.type_embedding.to(tokens.dtype)
+        tokens = tokens + 0.10 * position + self.type_embedding.to(tokens.dtype)
+        if multi_horizon:
+            tokens = tokens.reshape(batch, horizons, tokens.shape[1], -1)
+            horizon_ids = torch.arange(
+                1, horizons+1, device=tokens.device, dtype=tokens.dtype)
+            horizon_encoding = sinusoidal_embedding(horizon_ids, tokens.shape[-1])
+            tokens = tokens + 0.10*horizon_encoding[None, :, None]
+            tokens = tokens.flatten(1, 2)
+        return tokens
+
+
+class ActionSemanticAdapter(nn.Module):
+    """Project the executed ten-action chunk into UNet conditioning."""
+
+    def __init__(self, input_width: int = 512, output_width: int = 768,
+                 horizon: int = 10):
+        super().__init__()
+        self.horizon = int(horizon)
+        self.norm = nn.LayerNorm(input_width)
+        self.projection = nn.Linear(input_width, output_width)
+        # Preserve the pretrained world's exact behavior at initialization.
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def forward(self, action_tokens: torch.Tensor) -> torch.Tensor:
+        if action_tokens.ndim != 3 or action_tokens.shape[1] != self.horizon:
+            raise ValueError(
+                f"Expected action tokens [B,{self.horizon},C], got "
+                f"{tuple(action_tokens.shape)}")
+        value = self.projection(self.norm(action_tokens))
+        return torch.tanh(self.gate) * value
 
 
 class ActionFlowBlock(nn.Module):
@@ -170,9 +202,9 @@ class ActionFlowBlock(nn.Module):
 
 
 class ActionFlowExpert(nn.Module):
-    """Generate a 30-step normalized PPO action chunk by rectified flow."""
+    """Generate the next ten normalized PPO actions by rectified flow."""
 
-    def __init__(self, action_dim: int = 3, horizon: int = 30,
+    def __init__(self, action_dim: int = 3, horizon: int = 10,
                  width: int = 512, depth: int = 8, heads: int = 8,
                  ffn_width: int = 2048, goal_dim: int = 4,
                  proprio_dim: int = 10, past_horizon: int = 10,
@@ -204,14 +236,17 @@ class ActionFlowExpert(nn.Module):
         ])
         self.norm = nn.LayerNorm(width)
         self.out = nn.Linear(width, action_dim)
+        self.candidate_norm = nn.LayerNorm(width)
+        self.candidate_out = nn.Linear(width, action_dim)
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
+        nn.init.zeros_(self.candidate_out.weight)
+        nn.init.zeros_(self.candidate_out.bias)
 
-    def forward(self, noisy_action: torch.Tensor, timestep: torch.Tensor,
+    def _inputs(self, noisy_action: torch.Tensor, timestep: torch.Tensor,
                 observation_tokens: torch.Tensor, goal: torch.Tensor,
                 proprio: torch.Tensor, past_actions: torch.Tensor,
-                past_mask: torch.Tensor,
-                future_tokens: torch.Tensor | None = None) -> torch.Tensor:
+                past_mask: torch.Tensor):
         if tuple(noisy_action.shape[1:]) != (self.horizon, self.action_dim):
             raise ValueError(
                 f"Expected noisy actions [B,{self.horizon},{self.action_dim}], "
@@ -228,12 +263,49 @@ class ActionFlowExpert(nn.Module):
         value = self.action_in(noisy_action) + self.action_position
         time = self.time(sinusoidal_embedding(timestep, self.width))
         value = value + time[:, None]
+        return value, context, time
+
+    def encode_semantics(self, noisy_action: torch.Tensor,
+                         timestep: torch.Tensor,
+                         observation_tokens: torch.Tensor, goal: torch.Tensor,
+                         proprio: torch.Tensor, past_actions: torch.Tensor,
+                         past_mask: torch.Tensor):
+        """Run the pre-fusion blocks and return action semantic tokens."""
+        value, context, time = self._inputs(
+            noisy_action, timestep, observation_tokens, goal, proprio,
+            past_actions, past_mask)
         first_future_block = len(self.blocks) - self.future_attention_layers
-        for index, block in enumerate(self.blocks):
-            block_future = (future_tokens
-                            if index >= first_future_block else None)
-            value = block(value, context, time, block_future)
+        for block in self.blocks[:first_future_block]:
+            value = block(value, context, time)
+        return value, context, time
+
+    def decode_semantics(self, value: torch.Tensor, context: torch.Tensor,
+                         time: torch.Tensor,
+                         future_tokens: torch.Tensor | None = None):
+        """Run post-fusion blocks and map hidden tokens to flow velocity."""
+        first_future_block = len(self.blocks) - self.future_attention_layers
+        for block in self.blocks[first_future_block:]:
+            value = block(value, context, time, future_tokens)
         return self.out(self.norm(value))
+
+    def semantic_velocity(self, value: torch.Tensor) -> torch.Tensor:
+        """Candidate velocity from a separately supervised pre-fusion head."""
+        return self.candidate_out(self.candidate_norm(value))
+
+    def initialize_candidate_head(self) -> None:
+        """Initialize the candidate head from a pretrained final action head."""
+        self.candidate_norm.load_state_dict(self.norm.state_dict())
+        self.candidate_out.load_state_dict(self.out.state_dict())
+
+    def forward(self, noisy_action: torch.Tensor, timestep: torch.Tensor,
+                observation_tokens: torch.Tensor, goal: torch.Tensor,
+                proprio: torch.Tensor, past_actions: torch.Tensor,
+                past_mask: torch.Tensor,
+                future_tokens: torch.Tensor | None = None) -> torch.Tensor:
+        value, context, time = self.encode_semantics(
+            noisy_action, timestep, observation_tokens, goal, proprio,
+            past_actions, past_mask)
+        return self.decode_semantics(value, context, time, future_tokens)
 
 
 class JointWorldActionModel(nn.Module):
@@ -249,6 +321,7 @@ class JointWorldActionModel(nn.Module):
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
             future_attention_layers=future_attention_layers)
         self.future_adapter = FutureTokenAdapter(width)
+        self.action_semantic_adapter = ActionSemanticAdapter(width)
         # Zero initialization makes the first world forward exactly the loaded
         # checkpoint behavior. Joint training then learns how much shared
         # current-observation information the UNet conditioning should use.
@@ -261,17 +334,33 @@ class JointWorldActionModel(nn.Module):
     def predict_world(self, noisy_future: torch.Tensor,
                       current_latent: torch.Tensor, actions: torch.Tensor,
                       state: torch.Tensor, timestep: torch.Tensor,
-                      observation_tokens: torch.Tensor | None = None) -> torch.Tensor:
+                      observation_tokens: torch.Tensor | None = None,
+                      action_semantic_tokens: torch.Tensor | None = None,
+                      ) -> torch.Tensor:
         if observation_tokens is None:
             observation_tokens = self.encode_current(current_latent)
-        condition = self.world.condition(actions, state)
+        if noisy_future.ndim != 4:
+            raise ValueError(
+                "single-horizon world prediction expects [B,4,27,5], got "
+                f"{tuple(noisy_future.shape)}")
+        if actions.ndim != 3 or tuple(actions.shape[1:]) != (10, 3):
+            raise ValueError(f"Expected ten actions [B,10,3], got {tuple(actions.shape)}")
+        padded_actions = F.pad(actions[:, None], (0, 0, 0, 0, 0, 2))
+        condition = self.world.condition(padded_actions, state, horizon=1)
+        if action_semantic_tokens is not None:
+            semantic = self.action_semantic_adapter(action_semantic_tokens)
+            if condition.shape[1] < semantic.shape[1]:
+                raise ValueError("world condition has fewer than ten action tokens")
+            condition = condition.clone()
+            condition[:, :semantic.shape[1]] += semantic
         residual = self.observation_to_world(observation_tokens.mean(dim=1))
         condition = condition.clone()
         condition[:, -1] = condition[:, -1] + residual
-        return self.world.unet(
+        result = self.world.unet(
             torch.cat([noisy_future, current_latent], dim=1), timestep,
             encoder_hidden_states=condition,
         ).sample
+        return result
 
     def predict_action_velocity(self, noisy_action: torch.Tensor,
                                 action_timestep: torch.Tensor,
@@ -301,7 +390,54 @@ class JointWorldActionModel(nn.Module):
         std = action_logit_std.to(
             device=clean_flow.device, dtype=clean_flow.dtype)
         action = (clean_flow * std + mean).sigmoid()
-        return action.reshape(len(action), 3, 10, 3)
+        return action
+
+    def _encode_action(self, noisy_action, action_timestep,
+                       observation_tokens, goal, proprio, past_actions,
+                       past_mask, action_logit_mean, action_logit_std):
+        action_tokens, action_context, action_time = (
+            self.action_expert.encode_semantics(
+                noisy_action, action_timestep, observation_tokens, goal,
+                proprio, past_actions, past_mask))
+        candidate_velocity = self.action_expert.semantic_velocity(action_tokens)
+        candidate_actions = self.estimate_normalized_action(
+            noisy_action, candidate_velocity, action_timestep,
+            action_logit_mean, action_logit_std)
+        return (action_tokens, action_context, action_time,
+                candidate_velocity, candidate_actions)
+
+    def rollout_feedback_future(
+            self, initial_noise: torch.Tensor, current_latent: torch.Tensor,
+            actions: torch.Tensor, state: torch.Tensor,
+            observation_tokens: torch.Tensor, action_tokens: torch.Tensor,
+            timesteps: torch.Tensor, alphas: torch.Tensor,
+            previous_alphas: torch.Tensor, gradient_steps: int = 1):
+        """Generate deployment-available future from pure noise.
+
+        Early DDIM steps are detached; only the requested final steps retain a
+        graph.  No dataset future latent is accepted by this path.
+        """
+        value = initial_noise
+        count = len(timesteps)
+        if not 1 <= int(gradient_steps) <= count:
+            raise ValueError("gradient_steps must be in [1, number of DDIM steps]")
+        for index in range(count):
+            keep_graph = index >= count-int(gradient_steps)
+            context = torch.enable_grad() if keep_graph else torch.no_grad()
+            with context:
+                epsilon = self.predict_world(
+                    value, current_latent, actions, state, timesteps[index],
+                    observation_tokens=observation_tokens,
+                    action_semantic_tokens=action_tokens)
+                alpha = alphas[index].to(value).reshape(1, 1, 1, 1)
+                previous_alpha = previous_alphas[index].to(value).reshape(
+                    1, 1, 1, 1)
+                clean = (value-(1-alpha).sqrt()*epsilon) / alpha.sqrt().clamp_min(1e-6)
+                value = (previous_alpha.sqrt()*clean
+                         + (1-previous_alpha).clamp_min(0).sqrt()*epsilon)
+            if not keep_graph:
+                value = value.detach()
+        return value
 
     def predict_joint_velocity(
             self, noisy_action: torch.Tensor, action_timestep: torch.Tensor,
@@ -310,6 +446,7 @@ class JointWorldActionModel(nn.Module):
             proprio: torch.Tensor, past_actions: torch.Tensor,
             past_mask: torch.Tensor, world_state: torch.Tensor,
             action_logit_mean: torch.Tensor, action_logit_std: torch.Tensor,
+            world_alpha_cumprod: torch.Tensor,
             observation_tokens: torch.Tensor | None = None,
             teacher_actions: torch.Tensor | None = None,
             teacher_forcing: float = 0.0,
@@ -322,12 +459,10 @@ class JointWorldActionModel(nn.Module):
         """
         if observation_tokens is None:
             observation_tokens = self.encode_current(current_latent)
-        provisional = self.predict_action_velocity(
-            noisy_action, action_timestep, current_latent, goal, proprio,
-            past_actions, past_mask, observation_tokens=observation_tokens)
-        actions = self.estimate_normalized_action(
-            noisy_action, provisional, action_timestep,
-            action_logit_mean, action_logit_std)
+        (action_tokens, action_context, action_time,
+         provisional, actions) = self._encode_action(
+             noisy_action, action_timestep, observation_tokens, goal, proprio,
+             past_actions, past_mask, action_logit_mean, action_logit_std)
         if teacher_actions is not None and teacher_forcing:
             mix = float(teacher_forcing)
             if not 0.0 <= mix <= 1.0:
@@ -335,12 +470,19 @@ class JointWorldActionModel(nn.Module):
             actions = mix * teacher_actions + (1.0-mix) * actions
         world_epsilon = self.predict_world(
             noisy_future, current_latent, actions, world_state,
-            world_timestep, observation_tokens=observation_tokens)
-        future_tokens = self.future_adapter(world_epsilon)
-        refined = self.predict_action_velocity(
-            noisy_action, action_timestep, current_latent, goal, proprio,
-            past_actions, past_mask, observation_tokens=observation_tokens,
-            future_tokens=future_tokens)
+            world_timestep, observation_tokens=observation_tokens,
+            action_semantic_tokens=action_tokens)
+        alpha = world_alpha_cumprod.to(
+            device=noisy_future.device, dtype=noisy_future.dtype)
+        alpha = alpha.reshape(len(noisy_future), *([1] * (noisy_future.ndim-1)))
+        predicted_future = (
+            noisy_future - (1-alpha).clamp_min(0).sqrt()*world_epsilon
+        ) / alpha.sqrt().clamp_min(1e-6)
+        future_tokens = self.future_adapter(predicted_future)
+        refined = self.action_expert.decode_semantics(
+            action_tokens, action_context, action_time, future_tokens)
+        self._last_action_semantic_tokens = action_tokens
+        self._last_predicted_future = predicted_future
         return refined, world_epsilon, provisional
 
     def forward(self, noisy_action: torch.Tensor, action_timestep: torch.Tensor,
@@ -352,6 +494,12 @@ class JointWorldActionModel(nn.Module):
                 world_timestep: torch.Tensor | None = None,
                 action_logit_mean: torch.Tensor | None = None,
                 action_logit_std: torch.Tensor | None = None,
+                world_alpha_cumprod: torch.Tensor | None = None,
+                feedback_noise: torch.Tensor | None = None,
+                feedback_timesteps: torch.Tensor | None = None,
+                feedback_alphas: torch.Tensor | None = None,
+                feedback_previous_alphas: torch.Tensor | None = None,
+                feedback_gradient_steps: int = 1,
                 teacher_forcing: float = 0.0):
         """Single DDP-visible forward for joint world/action optimization."""
         observation = self.encode_current(current_latent)
@@ -366,17 +514,36 @@ class JointWorldActionModel(nn.Module):
                 past_actions, past_mask, observation_tokens=observation)
         else:
             if (world_state is None or world_timestep is None
-                    or action_logit_mean is None or action_logit_std is None):
+                    or action_logit_mean is None or action_logit_std is None
+                    or world_alpha_cumprod is None):
                 raise ValueError(
-                    "joint forward requires world state/timestep and action stats")
-            action_velocity, world_epsilon, provisional = self.predict_joint_velocity(
-                    noisy_action, action_timestep, noisy_future,
-                    world_timestep, current_latent, goal, proprio,
-                    past_actions, past_mask, world_state,
-                    action_logit_mean, action_logit_std,
-                    observation_tokens=observation,
-                    teacher_actions=world_actions,
-                    teacher_forcing=teacher_forcing)
+                    "joint forward requires world state/timestep/alpha and action stats")
+            if any(value is None for value in (
+                    feedback_noise, feedback_timesteps, feedback_alphas,
+                    feedback_previous_alphas)):
+                raise ValueError("joint training requires pure-noise feedback rollout inputs")
+            (action_tokens, action_context, action_time,
+             provisional, candidate_actions) = self._encode_action(
+                 noisy_action, action_timestep, observation, goal, proprio,
+                 past_actions, past_mask, action_logit_mean, action_logit_std)
+            # Supervised world path: ground-truth action is paired with its
+            # matching noised future.  Its reconstruction is never fed back.
+            world_epsilon = self.predict_world(
+                noisy_future, current_latent, world_actions, world_state,
+                world_timestep, observation_tokens=observation)
+            # Action feedback path: starts from pure noise and is conditioned
+            # only on predicted candidate actions and causal observations.
+            predicted_future = self.rollout_feedback_future(
+                feedback_noise, current_latent, candidate_actions, world_state,
+                observation, action_tokens, feedback_timesteps,
+                feedback_alphas, feedback_previous_alphas,
+                feedback_gradient_steps)
+            future_tokens = self.future_adapter(predicted_future)
+            action_velocity = self.action_expert.decode_semantics(
+                action_tokens, action_context, action_time, future_tokens)
+            self._last_action_semantic_tokens = action_tokens
+            self._last_predicted_future = predicted_future
+            self._last_candidate_velocity = provisional
             self._last_provisional_velocity = provisional
         return action_velocity, world_epsilon
 
@@ -391,6 +558,8 @@ class ActionOnlyModel(nn.Module):
         self.action_expert = ActionFlowExpert(
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
             future_attention_layers=0)
+        self.action_expert.candidate_norm.requires_grad_(False)
+        self.action_expert.candidate_out.requires_grad_(False)
 
     def encode_current(self, current_latent: torch.Tensor) -> torch.Tensor:
         return self.observation(current_latent)

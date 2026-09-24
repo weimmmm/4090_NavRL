@@ -14,10 +14,12 @@ from lidar_wam.coordinates import (
     normalized_to_world_velocity,
     world_to_goal,
 )
+from lidar_wam.data_v2 import random_window_subset, validation_trajectory_keys
 from lidar_wam.runner.world_direct_horizon import (
     lagen_zero_pad_points,
     lagen_zero_pad_squared_chamfer_points,
     squared_chamfer_points,
+    summarize_rows,
     voxel_anchor_squared_chamfer_points,
 )
 from lidar_wam.runner.action_expert_joint import (
@@ -32,8 +34,9 @@ from lidar_wam.models.action_expert import (
 
 
 class _DummyCondition(torch.nn.Module):
-    def forward(self, actions, state):
-        value = actions.mean((1, 2, 3))[:, None, None].expand(-1, 1, 768)
+    def forward(self, actions, state, horizon=None):
+        value = actions.reshape(len(actions), 30, 3).mean(-1, keepdim=True)
+        value = value.expand(-1, -1, 768)
         padding = torch.zeros(
             len(state), 768-state.shape[-1], device=state.device,
             dtype=state.dtype)
@@ -81,6 +84,34 @@ class CoordinateSemanticsTest(unittest.TestCase):
             state.numpy(), target.numpy(), self.direction.numpy())
         self.assertTrue(np.array_equal(expected[0].numpy(), actual[0]))
         self.assertTrue(np.array_equal(expected[1].numpy(), actual[1]))
+
+
+class DatasetSplitProtocolTest(unittest.TestCase):
+    def test_validation_window_sampling_is_global_exact_and_deterministic(self):
+        candidates = np.arange(8000, dtype=np.int64)
+        first = random_window_subset(candidates, 1024, 42)
+        second = random_window_subset(candidates, 1024, 42)
+        future = random_window_subset(candidates, 256, 42)
+        self.assertEqual(len(first), 1024)
+        self.assertEqual(len(future), 256)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertEqual(len(np.unique(first)), len(first))
+
+    def test_validation_selection_is_exact_per_seed_and_deterministic(self):
+        inventory = {
+            0: [("a.h5", f"scene-{index:03d}") for index in range(100)],
+            1: [("b.h5", f"scene-{index:03d}") for index in range(41)],
+        }
+        first = validation_trajectory_keys(inventory, 0.05, 42)
+        second = validation_trajectory_keys(inventory, 0.05, 42)
+        self.assertEqual(first, second)
+        self.assertEqual(sum(key[0] == "a.h5" for key in first), 5)
+        self.assertEqual(sum(key[0] == "b.h5" for key in first), 2)
+        self.assertTrue(first.isdisjoint(set(inventory[0] + inventory[1]) - first))
+
+    def test_validation_selection_rejects_invalid_fraction(self):
+        with self.assertRaises(ValueError):
+            validation_trajectory_keys({0: [("a.h5", "scene")]}, 0.0, 42)
 
 
 class SquaredChamferTest(unittest.TestCase):
@@ -138,6 +169,28 @@ class SquaredChamferTest(unittest.TestCase):
             lagen_zero_pad_squared_chamfer_points(one_point, empty, count=5),
             0.4, places=7)
 
+    def test_nonempty_cd_summary_excludes_empty_cloud_penalties(self):
+        base = {
+            "voxel_anchor_cd_m2": 0.0,
+            "lagen_zero_pad_1500_cd_m2": 0.0,
+            "symmetric_nn_distance_m": 0.0,
+            "valid_range_abs_error_sum_m": 0.0,
+            "valid_range_count": 1,
+            "tp": 1, "fp": 0, "fn": 0,
+            "false_empty_frame": False, "false_hit_frame": False,
+            "gt_hit_count": 1, "pred_hit_count": 1,
+        }
+        valid = {**base, "cd_paper_m2": 0.4,
+                 "gt_empty": False, "pred_empty": False}
+        empty = {**base, "cd_paper_m2": 100.0,
+                 "gt_empty": False, "pred_empty": True,
+                 "false_empty_frame": True, "pred_hit_count": 0}
+        summary = summarize_rows([valid, empty])
+        self.assertEqual(summary["cd_paper_m2"], 50.2)
+        self.assertEqual(summary["nonempty_cd_paper_m2"], 0.4)
+        self.assertEqual(summary["nonempty_cd_samples"], 1)
+        self.assertEqual(summary["empty_cd_samples_excluded"], 1)
+
 
 class JointTrainingPolicyTest(unittest.TestCase):
     def test_cosine_lr_scale_starts_at_one_and_ends_at_minimum(self):
@@ -181,7 +234,7 @@ class JointTrainingPolicyTest(unittest.TestCase):
         torch.nn.init.normal_(expert.out.weight, std=0.02)
         batch = 2
         values = (
-            torch.randn(batch, 30, 3), torch.rand(batch) * 1000,
+            torch.randn(batch, 10, 3), torch.rand(batch) * 1000,
             torch.randn(batch, 135, 16), torch.randn(batch, 4),
             torch.randn(batch, 10), torch.randn(batch, 10, 3),
             torch.ones(batch, 10),
@@ -190,6 +243,23 @@ class JointTrainingPolicyTest(unittest.TestCase):
         with_future = expert(*values, future_tokens=torch.randn(batch, 135, 16))
         self.assertTrue(torch.equal(without_future, with_future))
 
+    @staticmethod
+    def _joint_inputs(batch):
+        return {
+            "noisy_future": torch.randn(batch, 4, 27, 5),
+            "world_actions": torch.rand(batch, 10, 3),
+            "world_state": torch.randn(batch, 5),
+            "world_timestep": torch.randint(0, 1000, (batch,)),
+            "action_logit_mean": torch.zeros(3),
+            "action_logit_std": torch.ones(3),
+            "world_alpha_cumprod": torch.full((batch,), 0.5),
+            "feedback_noise": torch.randn(batch, 4, 27, 5),
+            "feedback_timesteps": torch.tensor([999, 500, 0]),
+            "feedback_alphas": torch.tensor([0.01, 0.25, 0.99]),
+            "feedback_previous_alphas": torch.tensor([0.25, 0.99, 1.0]),
+            "feedback_gradient_steps": 1,
+        }
+
     def test_joint_forward_is_bidirectional_and_shape_safe(self):
         model = JointWorldActionModel(
             _DummyWorld(), width=16, depth=2, heads=4, ffn_width=32,
@@ -197,22 +267,50 @@ class JointTrainingPolicyTest(unittest.TestCase):
         torch.nn.init.normal_(model.action_expert.out.weight, std=0.02)
         batch = 2
         refined, future = model(
-            torch.randn(batch, 30, 3), torch.rand(batch) * 1000,
+            torch.randn(batch, 10, 3), torch.rand(batch) * 1000,
             torch.randn(batch, 4, 27, 5), torch.randn(batch, 4),
             torch.randn(batch, 10), torch.randn(batch, 10, 3),
             torch.ones(batch, 10),
-            noisy_future=torch.randn(batch, 4, 27, 5),
-            world_state=torch.randn(batch, 5),
-            world_timestep=torch.randint(0, 1000, (batch,)),
-            action_logit_mean=torch.zeros(3),
-            action_logit_std=torch.ones(3),
+            **self._joint_inputs(batch),
         )
         provisional = model._last_provisional_velocity
-        self.assertEqual(tuple(refined.shape), (batch, 30, 3))
-        self.assertEqual(tuple(provisional.shape), (batch, 30, 3))
+        self.assertEqual(tuple(refined.shape), (batch, 10, 3))
+        self.assertEqual(tuple(provisional.shape), (batch, 10, 3))
         self.assertEqual(tuple(future.shape), (batch, 4, 27, 5))
         self.assertEqual(
             tuple(model.future_adapter(future).shape), (batch, 135, 16))
+        self.assertEqual(
+            tuple(model._last_action_semantic_tokens.shape), (batch, 10, 16))
+        self.assertEqual(
+            tuple(model._last_predicted_future.shape), (batch, 4, 27, 5))
+
+    def test_action_semantic_condition_contains_only_executed_chunk(self):
+        model = JointWorldActionModel(
+            _DummyWorld(), width=16, depth=2, heads=4, ffn_width=32,
+            future_attention_layers=1)
+        model.action_semantic_adapter.gate.data.fill_(1.0)
+        tokens = torch.randn(3, 10, 16)
+        adapted = model.action_semantic_adapter(tokens)
+        self.assertEqual(tuple(adapted.shape), (3, 10, 768))
+        self.assertGreater(float(adapted.abs().sum()), 0.0)
+
+    def test_action_feedback_is_independent_of_supervised_future_target(self):
+        model = JointWorldActionModel(
+            _DummyWorld(), width=16, depth=2, heads=4, ffn_width=32,
+            future_attention_layers=1)
+        model.action_expert.blocks[-1].future_gate.data.fill_(0.5)
+        batch = 2
+        common = (
+            torch.randn(batch, 10, 3), torch.rand(batch) * 1000,
+            torch.randn(batch, 4, 27, 5), torch.randn(batch, 4),
+            torch.randn(batch, 10), torch.randn(batch, 10, 3),
+            torch.ones(batch, 10),
+        )
+        kwargs = self._joint_inputs(batch)
+        first = model(*common, **kwargs)[0]
+        kwargs["noisy_future"] = torch.randn_like(kwargs["noisy_future"]) * 100
+        second = model(*common, **kwargs)[0]
+        self.assertTrue(torch.equal(first, second))
 
 if __name__ == "__main__":
     unittest.main()
