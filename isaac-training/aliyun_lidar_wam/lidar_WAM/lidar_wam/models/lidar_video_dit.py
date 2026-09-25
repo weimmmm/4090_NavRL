@@ -131,8 +131,55 @@ class LiDARVideoDiT(nn.Module):
         mask[:history, history:] = True
         return mask
 
+    def encode_history(self, history: torch.Tensor) -> torch.Tensor:
+        """Tokenize the observed history for the joint World/Action DiT.
+
+        The returned tokens are exactly the history portion used by the
+        pretrained Video-DiT.  A parallel Action-DiT can consume this tensor,
+        so both losses update the same LiDAR observation representation.  No
+        noisy future token is present in this method.
+        """
+        expected_history = (3, 4, 27, 5)
+        if history.ndim != 5 or tuple(history.shape[1:]) != expected_history:
+            raise ValueError(
+                f"Expected history [B,3,4,27,5], got {tuple(history.shape)}")
+        tokens = history.permute(0, 1, 3, 4, 2).reshape(
+            len(history), 3, self.tokens_per_frame, self.latent_channels)
+        tokens = self.input_projection(tokens)
+        tokens = tokens + self.frame_position[:, :3] + self.spatial_position.to(
+            tokens.dtype)
+        return tokens.flatten(1, 2)
+
+    def encode_history_features(self, history: torch.Tensor,
+                                timestep: torch.Tensor,
+                                depth: int = 6) -> torch.Tensor:
+        """Run only observed history through the first World DiT blocks.
+
+        The history-only attention mask is the top-left block of the normal
+        Video-DiT mask.  Consequently these features are identical to the
+        history-token slice obtained when the full noisy-next sequence is
+        passed through the same number of blocks: history queries are already
+        forbidden from reading the future block.  This gives Action DiT a
+        causal deep World representation without exposing the target frame.
+        """
+        expected_history = (3, 4, 27, 5)
+        if history.ndim != 5 or tuple(history.shape[1:]) != expected_history:
+            raise ValueError(
+                f"Expected history [B,3,4,27,5], got {tuple(history.shape)}")
+        depth = int(depth)
+        if not 0 <= depth <= self.depth:
+            raise ValueError(f"depth must be in [0,{self.depth}], got {depth}")
+        tokens = self.encode_history(history)
+        condition = self.time_mlp(timestep_embedding(timestep, self.width))
+        history_count = 3 * self.tokens_per_frame
+        mask = self.block_causal_mask[:history_count, :history_count]
+        for block in self.blocks[:depth]:
+            tokens = block(tokens, condition, mask)
+        return tokens
+
     def forward(self, history: torch.Tensor, noisy_next: torch.Tensor,
-                timestep: torch.Tensor) -> torch.Tensor:
+                timestep: torch.Tensor,
+                history_tokens: torch.Tensor | None = None) -> torch.Tensor:
         expected_history = (3, 4, 27, 5)
         if history.ndim != 5 or tuple(history.shape[1:]) != expected_history:
             raise ValueError(
@@ -140,12 +187,29 @@ class LiDARVideoDiT(nn.Module):
         if noisy_next.ndim != 4 or tuple(noisy_next.shape[1:]) != (4, 27, 5):
             raise ValueError(
                 f"Expected noisy next [B,4,27,5], got {tuple(noisy_next.shape)}")
-        video = torch.cat((history, noisy_next[:, None]), dim=1)
-        tokens = video.permute(0, 1, 3, 4, 2).reshape(
-            len(video), 4, self.tokens_per_frame, 4)
-        tokens = self.input_projection(tokens)
-        tokens = tokens + self.frame_position + self.spatial_position.to(tokens.dtype)
-        tokens = tokens.flatten(1, 2)
+        if history_tokens is None:
+            video = torch.cat((history, noisy_next[:, None]), dim=1)
+            tokens = video.permute(0, 1, 3, 4, 2).reshape(
+                len(video), 4, self.tokens_per_frame, 4)
+            tokens = self.input_projection(tokens)
+            tokens = tokens + self.frame_position + self.spatial_position.to(tokens.dtype)
+            tokens = tokens.flatten(1, 2)
+        else:
+            expected_tokens = (3 * self.tokens_per_frame, self.width)
+            if history_tokens.ndim != 3 or tuple(history_tokens.shape[1:]) != expected_tokens:
+                raise ValueError(
+                    f"Expected history tokens [B,{expected_tokens[0]},{expected_tokens[1]}], "
+                    f"got {tuple(history_tokens.shape)}")
+            noisy_tokens = noisy_next.permute(0, 2, 3, 1).reshape(
+                len(noisy_next), self.tokens_per_frame, self.latent_channels)
+            noisy_tokens = self.input_projection(noisy_tokens)
+            # ``noisy_tokens`` is already flattened to [B,135,C].  Squeeze
+            # the singleton frame axis from the positional buffers; keeping
+            # the four-dimensional buffers here would broadcast to [1,B,135,C]
+            # and silently corrupt the batch dimension.
+            noisy_tokens = noisy_tokens + self.frame_position[:, 3] + self.spatial_position[:, 0].to(
+                noisy_tokens.dtype)
+            tokens = torch.cat((history_tokens, noisy_tokens), dim=1)
         condition = self.time_mlp(timestep_embedding(timestep, self.width))
         mask = self.block_causal_mask
         for block in self.blocks:
@@ -155,6 +219,5 @@ class LiDARVideoDiT(nn.Module):
         future = self.final_norm(future) * (1 + scale[:, None]) + shift[:, None]
         future = self.output_projection(future)
         return future.reshape(
-            len(video), self.latent_height, self.latent_width,
+            len(history), self.latent_height, self.latent_width,
             self.latent_channels).permute(0, 3, 1, 2).contiguous()
-

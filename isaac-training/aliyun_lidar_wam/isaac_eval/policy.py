@@ -25,6 +25,9 @@ if str(DIFFUSERS_ROOT) not in sys.path:
 from diffusers import AutoencoderKL, DDIMScheduler
 from lidar_wam.models.action_expert import (
     ActionFlowExpert, JointWorldActionModel, LiDARObservationEncoder)
+from lidar_wam.models.action_dit import (
+    JointHistoryWorldActionDiT, flow_sample_action)
+from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.models.world import DirectHorizonWorldModel
 from lidar_wam.coordinates import (
     ACTION_FRAME,
@@ -45,6 +48,7 @@ FLOW_EPS = 1e-4
 COMPACT_FORMAT = "navrl-action-expert-policy-v2"
 JOINT_POLICY_FORMAT = "navrl-joint-world-action-policy-v3"
 JOINT_TRAINING_FORMAT = "navrl-joint-world-action-training-v3"
+HISTORY_JOINT_FORMAT = "navrl-history-world-action-dit-v1"
 
 
 def load_circular_vae(device: torch.device):
@@ -102,6 +106,38 @@ def _policy_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
 def load_deployment_policy(checkpoint_path: Path, device: torch.device,
                            allow_legacy_body: bool = False):
     payload = torch_load(checkpoint_path, "cpu")
+    # History World/Action DiT training stores causal condition statistics
+    # under ``condition_stats`` and keeps the complete World+Action model in
+    # the checkpoint.  Its action horizon is ten (the executed chunk), and
+    # deployment must run the World-DiT history tokenizer before Action-DiT.
+    if (isinstance(payload, dict)
+            and payload.get("format") == HISTORY_JOINT_FORMAT):
+        architecture = dict(payload.get("architecture", {}))
+        width = int(architecture.get("width", 512))
+        depth = int(architecture.get("depth", 8))
+        heads = int(architecture.get("heads", 8))
+        mlp_ratio = float(architecture.get("mlp_ratio", 4.0))
+        world = LiDARVideoDiT(width=width, depth=depth, heads=heads,
+                               mlp_ratio=mlp_ratio)
+        model = JointHistoryWorldActionDiT(
+            world, width=width, depth=depth, heads=heads,
+            mlp_ratio=mlp_ratio,
+            past_horizon=int(architecture.get("past_horizon", 30)),
+            shared_world_depth=int(architecture.get("shared_world_depth", 6)))
+        model.load_state_dict(payload["model"], strict=True)
+        model.to(device=device, dtype=torch.float32).eval()
+        semantics = {
+            "condition_frame": CONDITION_FRAME,
+            "action_frame": ACTION_FRAME,
+            "lidar_frame": LIDAR_FRAME,
+            "action_limit_mps": 2.0,
+            "action_horizon": int(architecture.get("action_horizon", 10)),
+            "execution_horizon": 10,
+            "history_frames": int(architecture.get("history_frames", 3)),
+            "legacy": False,
+        }
+        return (model, payload.get("condition_stats", {}),
+                int(payload.get("step", -1)), semantics)
     if not isinstance(payload, dict) or "model" not in payload or "stats" not in payload:
         raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
     semantics = payload.get("semantics")
@@ -265,7 +301,8 @@ def lidar_range_image(env) -> torch.Tensor:
 
 
 def route_stable_action_noise(seeds: torch.Tensor, device: torch.device,
-                              dtype: torch.dtype) -> torch.Tensor:
+                              dtype: torch.dtype, horizon: int = ACTION_HORIZON
+                              ) -> torch.Tensor:
     """Generate one deterministic flow-noise tensor per route.
 
     A single CUDA generator for the whole batch is not route-stable: changing
@@ -278,7 +315,7 @@ def route_stable_action_noise(seeds: torch.Tensor, device: torch.device,
     for seed in seeds.detach().cpu().reshape(-1).tolist():
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
         rows.append(torch.randn(
-            (ACTION_HORIZON, ACTION_DIM), generator=generator,
+            (int(horizon), ACTION_DIM), generator=generator,
             device="cpu", dtype=torch.float32))
     return torch.stack(rows).to(device=device, dtype=dtype, non_blocking=True)
 
@@ -288,11 +325,30 @@ def sample_actions(model: nn.Module, latent: torch.Tensor,
                    goal: torch.Tensor, proprio: torch.Tensor,
                    past: torch.Tensor, past_mask: torch.Tensor,
                    stats: dict[str, Any], steps: int,
-                   seeds: torch.Tensor) -> torch.Tensor:
+                   seeds: torch.Tensor,
+                   history: torch.Tensor | None = None) -> torch.Tensor:
     if seeds.numel() != len(latent):
         raise ValueError(
             f"Expected one policy seed per route, got {seeds.numel()} for "
             f"batch {len(latent)}")
+    if isinstance(model, JointHistoryWorldActionDiT):
+        if history is None:
+            raise ValueError("history latents are required by History World/Action DiT")
+        goal = normalize_condition(goal, stats, "goal")
+        proprio = normalize_condition(proprio, stats, "proprio")
+        features = model.encode_history_features(history)
+        value = route_stable_action_noise(
+            seeds, latent.device, latent.dtype, model.action.action_horizon)
+        schedule = torch.linspace(1, 0, int(steps) + 1,
+                                  device=latent.device, dtype=latent.dtype)
+        for current, following in zip(schedule[:-1], schedule[1:]):
+            timestep = torch.full((len(latent),), current,
+                                  device=latent.device, dtype=latent.dtype)
+            velocity = model.action(
+                features, value, timestep, goal, proprio, past, past_mask)
+            value = value + (following - current) * velocity
+        return value.clamp(0.0, 1.0)
+
     value = route_stable_action_noise(seeds, latent.device, latent.dtype)
     raw_proprio = proprio
     goal = normalize_condition(goal, stats, "goal")
@@ -358,26 +414,40 @@ class RecedingHorizonPolicy:
         (self.model, self.stats, self.checkpoint_step,
          self.semantics) = load_deployment_policy(
             checkpoint, device, allow_legacy_body=allow_legacy_body)
+        self.history_joint = isinstance(self.model, JointHistoryWorldActionDiT)
+        self.execution_horizon = (
+            10 if self.history_joint else EXECUTION_HORIZON)
+        self.past_horizon = (
+            int(self.model.action.past_horizon)
+            if self.history_joint else EXECUTION_HORIZON)
         self.condition_frame = self.semantics["condition_frame"]
         self.executed_head = (
-            "joint_world_action_flow30"
-            if isinstance(self.model, JointWorldActionModel) else "flow30")
+            "history_world_action_dit_flow10"
+            if self.history_joint else
+            ("joint_world_action_flow30"
+             if isinstance(self.model, JointWorldActionModel) else "flow30"))
         expected_limit = float(self.semantics.get("action_limit_mps", action_limit))
         if abs(expected_limit-self.action_limit) > 1e-6:
             raise ValueError(
                 f"checkpoint action_limit_mps={expected_limit} but environment uses "
                 f"{self.action_limit}")
-        if int(self.semantics.get("action_horizon", ACTION_HORIZON)) != ACTION_HORIZON:
+        expected_horizon = 10 if self.history_joint else ACTION_HORIZON
+        if int(self.semantics.get("action_horizon", expected_horizon)) != expected_horizon:
             raise ValueError("checkpoint action horizon is incompatible with deployment")
         if int(self.semantics.get(
                 "execution_horizon", EXECUTION_HORIZON)) != EXECUTION_HORIZON:
             raise ValueError("checkpoint execution horizon is incompatible with deployment")
         self.vae = load_circular_vae(device)
         self.scale = float(self.vae.config.scaling_factor)
-        self.actions = torch.zeros(num_envs, EXECUTION_HORIZON, ACTION_DIM, device=device)
-        self.past = torch.zeros_like(self.actions)
-        self.past_mask = torch.zeros(num_envs, EXECUTION_HORIZON, device=device)
-        self.action_index = torch.full((num_envs,), EXECUTION_HORIZON,
+        self.actions = torch.zeros(num_envs, self.execution_horizon, ACTION_DIM,
+                                    device=device)
+        self.past = torch.zeros(num_envs, self.past_horizon, ACTION_DIM,
+                                device=device)
+        self.past_mask = torch.zeros(num_envs, self.past_horizon, device=device)
+        self.history_latents = torch.zeros(
+            num_envs, 3, 4, 27, 5, device=device, dtype=torch.float32)
+        self.history_valid = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        self.action_index = torch.full((num_envs,), self.execution_horizon,
                                        device=device, dtype=torch.long)
         self.route_id = (torch.arange(num_envs, device=device, dtype=torch.long)
                          if route_ids is None else
@@ -396,22 +466,49 @@ class RecedingHorizonPolicy:
         self.actions[mask] = 0
         self.past[mask] = 0
         self.past_mask[mask] = 0
-        self.action_index[mask] = EXECUTION_HORIZON
+        self.action_index[mask] = self.execution_horizon
+        self.history_latents[mask] = 0
+        self.history_valid[mask] = False
         self.route_replan_count[mask] = 0
     @torch.no_grad()
     def _replan(self, env, mask: torch.Tensor):
         indices = mask.nonzero().flatten()
         if not len(indices):
             return
-        continuing = self.past_mask[indices].any(dim=-1) | (self.actions[indices].abs().sum((1, 2)) > 0)
+        continuing = self.past_mask[indices].any(dim=-1) | (
+            self.actions[indices].abs().sum((1, 2)) > 0)
         if continuing.any():
             continued_indices = indices[continuing]
-            self.past[continued_indices] = self.actions[continued_indices]
-            self.past_mask[continued_indices] = 1.0
+            if self.history_joint:
+                self.past[continued_indices] = torch.cat((
+                    self.past[continued_indices, self.execution_horizon:],
+                    self.actions[continued_indices]), dim=1)
+                self.past_mask[continued_indices] = torch.cat((
+                    self.past_mask[continued_indices, self.execution_horizon:],
+                    torch.ones(len(continued_indices), self.execution_horizon,
+                               device=self.device)), dim=1)
+            else:
+                self.past[continued_indices] = self.actions[continued_indices]
+                self.past_mask[continued_indices] = 1.0
 
         started = time.perf_counter()
         image = lidar_range_image(env)[indices]
         latent = self.vae.encode(image).latent_dist.mode() * self.scale
+        if self.history_joint:
+            valid = self.history_valid[indices]
+            if valid.any():
+                valid_indices = indices[valid]
+                self.history_latents[valid_indices] = torch.cat((
+                    self.history_latents[valid_indices, 1:],
+                    latent[valid, None]), dim=1)
+            if (~valid).any():
+                invalid_indices = indices[~valid]
+                self.history_latents[invalid_indices] = latent[~valid, None].expand(
+                    -1, 3, -1, -1, -1)
+            history = self.history_latents[indices]
+            self.history_valid[indices] = True
+        else:
+            history = None
         state = env.drone.get_state(env_frame=False)[indices, 0, :13]
         target = env.target_pos[indices, 0]
         if self.condition_frame == CONDITION_FRAME:
@@ -432,7 +529,7 @@ class RecedingHorizonPolicy:
         chosen = sample_actions(
             self.model, latent, goal, proprio, self.past[indices],
             self.past_mask[indices], self.stats, self.flow_steps,
-            base_policy_seeds)
+            base_policy_seeds, history=history)
         self.actions[indices] = chosen[:, :EXECUTION_HORIZON]
         self.action_index[indices] = 0
         self.route_replan_count[indices] += 1

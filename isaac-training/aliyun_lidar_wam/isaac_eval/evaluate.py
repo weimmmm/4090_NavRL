@@ -130,6 +130,8 @@ def load_config(args):
 
 
 def summarize(episodes, latency, args, checkpoint_step, elapsed):
+    from isaac_eval.timeout_diagnostics import diagnostic_summary
+
     count = len(episodes)
     successes = sum(row["termination_reason"] == "reach_goal" for row in episodes)
     collisions = sum(row["termination_reason"] == "collision" for row in episodes)
@@ -140,7 +142,7 @@ def summarize(episodes, latency, args, checkpoint_step, elapsed):
         return sum(float(row[key]) for row in episodes) / max(count, 1)
 
     successful = [row for row in episodes if row["termination_reason"] == "reach_goal"]
-    return {
+    result = {
         "checkpoint": str(args.checkpoint),
         "checkpoint_step": checkpoint_step,
         "environment_file": str(args.environment) if args.environment else None,
@@ -153,7 +155,7 @@ def summarize(episodes, latency, args, checkpoint_step, elapsed):
         "dynamic_obstacles": 0,
         "max_steps": args.max_steps,
         "replan_interval_steps": 10,
-        "generated_horizon_steps": 30,
+        "generated_horizon_steps": getattr(args, "generated_horizon_steps", 30),
         "executed_head": getattr(args, "executed_head", "flow30"),
         "flow_steps": args.flow_steps,
         "condition_frame": args.condition_frame,
@@ -177,6 +179,8 @@ def summarize(episodes, latency, args, checkpoint_step, elapsed):
         "wall_time_s": elapsed,
         "inference_latency": latency,
     }
+    result["timeout_diagnostics"] = diagnostic_summary(episodes)
+    return result
 
 
 def main():
@@ -233,6 +237,7 @@ def main():
 
         from isaac_eval.navigation_env import NavigationEnv
         from isaac_eval.policy import RecedingHorizonPolicy, lidar_range_image, save_json
+        from isaac_eval.timeout_diagnostics import classify_timeout
         print("[isaac_eval] local evaluator imports ready", flush=True)
 
         np.random.seed(args.seed)
@@ -259,11 +264,32 @@ def main():
                        if environment is not None else None))
         args.condition_frame = policy.condition_frame
         args.executed_head = policy.executed_head
+        args.generated_horizon_steps = int(policy.actions.shape[1])
         args.checkpoint_semantics = policy.semantics
         path_length = torch.zeros(args.num_envs, device=device)
         episode_steps = torch.zeros(args.num_envs, device=device, dtype=torch.long)
         min_clearance = torch.full((args.num_envs,), float(env.lidar_range), device=device)
         previous_position = env.drone.pos[:, 0].clone()
+        target_position = env.target_pos[:, 0]
+        initial_goal_distance = (target_position-previous_position).norm(dim=-1)
+        min_goal_distance = initial_goal_distance.clone()
+        min_goal_distance_step = torch.zeros(
+            args.num_envs, device=device, dtype=torch.long)
+        closest_normalized_action = torch.zeros(
+            args.num_envs, 3, device=device)
+        goalward_velocity_sum = torch.zeros(args.num_envs, device=device)
+        goalward_velocity_count = torch.zeros(
+            args.num_envs, device=device, dtype=torch.long)
+        negative_goalward_velocity_count = torch.zeros_like(
+            goalward_velocity_count)
+        previous_plan_direction = torch.zeros(
+            args.num_envs, device=device, dtype=torch.int8)
+        plan_direction_reversals = torch.zeros(
+            args.num_envs, device=device, dtype=torch.long)
+        plan_count = torch.zeros_like(plan_direction_reversals)
+        chunk_start_distance = initial_goal_distance.clone()
+        chunk_progress = [[] for _ in range(args.num_envs)]
+        chunk_distances = [[float(value)] for value in initial_goal_distance.cpu()]
         episode_number = torch.zeros(args.num_envs, device=device, dtype=torch.long)
         # Split the requested episodes across environments.  Without a per-env
         # quota, environments that collide early can reset and be counted more
@@ -278,7 +304,27 @@ def main():
 
         with torch.no_grad():
             while len(rows) < args.episodes:
+                replan_mask = policy.action_index >= policy.execution_horizon
                 policy.act(td, env)
+                normalized_action = td[
+                    "agents", "action_normalized"].reshape(args.num_envs, 3)
+                world_command = td["agents", "action"].reshape(args.num_envs, 3)
+                if replan_mask.any():
+                    position_before = env.drone.pos[:, 0]
+                    to_goal_before = env.target_pos[:, 0]-position_before
+                    unit_before = to_goal_before / to_goal_before.norm(
+                        dim=-1, keepdim=True).clamp_min(1e-6)
+                    plan_goalward = (world_command*unit_before).sum(dim=-1)
+                    direction = torch.where(
+                        plan_goalward > 0.05, 1,
+                        torch.where(plan_goalward < -0.05, -1, 0)).to(torch.int8)
+                    reversal = (replan_mask & (direction != 0)
+                                & (previous_plan_direction != 0)
+                                & (direction != previous_plan_direction))
+                    plan_direction_reversals += reversal.long()
+                    update = replan_mask & (direction != 0)
+                    previous_plan_direction[update] = direction[update]
+                    plan_count += replan_mask.long()
                 transition = transformed_env.step(td)
                 td = transition["next"]
 
@@ -286,6 +332,27 @@ def main():
                 path_length += (position - previous_position).norm(dim=-1)
                 previous_position = position.clone()
                 episode_steps += 1
+                distance = (env.target_pos[:, 0]-position).norm(dim=-1)
+                newly_closest = distance < min_goal_distance
+                min_goal_distance = torch.minimum(min_goal_distance, distance)
+                min_goal_distance_step[newly_closest] = episode_steps[newly_closest]
+                closest_normalized_action[newly_closest] = normalized_action[
+                    newly_closest]
+                goal_direction = (env.target_pos[:, 0]-position)
+                goal_direction = goal_direction / goal_direction.norm(
+                    dim=-1, keepdim=True).clamp_min(1e-6)
+                actual_goalward_velocity = (
+                    env.drone.vel_w[:, 0, :3]*goal_direction).sum(dim=-1)
+                goalward_velocity_sum += actual_goalward_velocity
+                goalward_velocity_count += 1
+                negative_goalward_velocity_count += (
+                    actual_goalward_velocity < -0.05).long()
+                chunk_boundary = (episode_steps % policy.execution_horizon) == 0
+                for chunk_index in chunk_boundary.nonzero().flatten().tolist():
+                    progress = chunk_start_distance[chunk_index]-distance[chunk_index]
+                    chunk_progress[chunk_index].append(float(progress))
+                    chunk_distances[chunk_index].append(float(distance[chunk_index]))
+                    chunk_start_distance[chunk_index] = distance[chunk_index]
                 image = lidar_range_image(env)
                 live_range = (image[:, 0, :, :18] + 1.0) * (float(env.lidar_range) / 2.0)
                 valid = image[:, 1, :, :18] > 0
@@ -313,6 +380,10 @@ def main():
                         reason = "reach_goal"
                     else:
                         reason = "timeout"
+                    if int(episode_steps[index]) % policy.execution_horizon:
+                        progress = chunk_start_distance[index]-distance[index]
+                        chunk_progress[index].append(float(progress))
+                        chunk_distances[index].append(float(distance[index]))
                     row = {
                         "episode": len(rows),
                         "env_id": index,
@@ -325,6 +396,27 @@ def main():
                         "duration_s": float(episode_steps[index]) * float(cfg.sim.dt),
                         "path_length_m": float(path_length[index]),
                         "min_clearance_m": float(min_clearance[index]),
+                        "initial_goal_distance_m": float(initial_goal_distance[index]),
+                        "final_goal_distance_m": float(distance[index]),
+                        "min_goal_distance_m": float(min_goal_distance[index]),
+                        "min_goal_distance_step": int(min_goal_distance_step[index]),
+                        "net_goal_progress_m": float(
+                            initial_goal_distance[index]-distance[index]),
+                        "retreat_after_closest_m": float(
+                            distance[index]-min_goal_distance[index]),
+                        "mean_goalward_velocity_mps": float(
+                            goalward_velocity_sum[index]
+                            / goalward_velocity_count[index].clamp_min(1)),
+                        "negative_goalward_velocity_fraction": float(
+                            negative_goalward_velocity_count[index]
+                            / goalward_velocity_count[index].clamp_min(1)),
+                        "plan_count": int(plan_count[index]),
+                        "plan_goal_direction_reversals": int(
+                            plan_direction_reversals[index]),
+                        "closest_normalized_action": (
+                            closest_normalized_action[index].tolist()),
+                        "chunk_goal_progress_m": chunk_progress[index],
+                        "chunk_goal_distance_m": chunk_distances[index],
                     }
                     if environment is not None:
                         row["start_position"] = environment[
@@ -333,6 +425,7 @@ def main():
                             "target_positions"][index, 0].tolist()
                         row["start_side"] = int(environment["start_sides"][index])
                         row["target_side"] = int(environment["target_sides"][index])
+                    row["timeout_class"] = classify_timeout(row)
                     rows.append(row)
                     collected_per_env[index] += 1
                 if len(rows) >= args.episodes:
@@ -349,6 +442,22 @@ def main():
                     episode_steps[done] = 0
                     min_clearance[done] = float(env.lidar_range)
                     previous_position[done] = env.drone.pos[done, 0]
+                    reset_distance = (
+                        env.target_pos[:, 0]-env.drone.pos[:, 0]).norm(dim=-1)
+                    initial_goal_distance[done] = reset_distance[done]
+                    min_goal_distance[done] = reset_distance[done]
+                    min_goal_distance_step[done] = 0
+                    closest_normalized_action[done] = 0
+                    goalward_velocity_sum[done] = 0
+                    goalward_velocity_count[done] = 0
+                    negative_goalward_velocity_count[done] = 0
+                    previous_plan_direction[done] = 0
+                    plan_direction_reversals[done] = 0
+                    plan_count[done] = 0
+                    chunk_start_distance[done] = reset_distance[done]
+                    for reset_index in done.nonzero().flatten().tolist():
+                        chunk_progress[reset_index] = []
+                        chunk_distances[reset_index] = [float(reset_distance[reset_index])]
 
                 if len(rows) and len(rows) % max(args.num_envs, 10) == 0:
                     print(json.dumps({"completed_episodes": len(rows),
