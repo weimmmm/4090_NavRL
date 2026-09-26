@@ -49,6 +49,7 @@ COMPACT_FORMAT = "navrl-action-expert-policy-v2"
 JOINT_POLICY_FORMAT = "navrl-joint-world-action-policy-v3"
 JOINT_TRAINING_FORMAT = "navrl-joint-world-action-training-v3"
 HISTORY_JOINT_FORMAT = "navrl-history-world-action-dit-v1"
+HISTORY_JOINT_MASKED_FORMAT = "navrl-history-world-action-dit-v2-masked-terminal"
 
 
 def load_circular_vae(device: torch.device):
@@ -111,7 +112,8 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
     # the checkpoint.  Its action horizon is ten (the executed chunk), and
     # deployment must run the World-DiT history tokenizer before Action-DiT.
     if (isinstance(payload, dict)
-            and payload.get("format") == HISTORY_JOINT_FORMAT):
+            and payload.get("format") in (
+                HISTORY_JOINT_FORMAT, HISTORY_JOINT_MASKED_FORMAT)):
         architecture = dict(payload.get("architecture", {}))
         width = int(architecture.get("width", 512))
         depth = int(architecture.get("depth", 8))
@@ -401,7 +403,7 @@ def sample_actions(model: nn.Module, latent: torch.Tensor,
 
 
 class RecedingHorizonPolicy:
-    """Plan 30 normalized actions and execute the first ten before replanning."""
+    """Generate and execute one fixed ten-step action chunk."""
 
     def __init__(self, checkpoint: Path, num_envs: int, device: torch.device,
                  flow_steps: int = 10, seed: int = 42, action_limit: float = 2.0,
@@ -415,8 +417,7 @@ class RecedingHorizonPolicy:
          self.semantics) = load_deployment_policy(
             checkpoint, device, allow_legacy_body=allow_legacy_body)
         self.history_joint = isinstance(self.model, JointHistoryWorldActionDiT)
-        self.execution_horizon = (
-            10 if self.history_joint else EXECUTION_HORIZON)
+        self.execution_horizon = EXECUTION_HORIZON
         self.past_horizon = (
             int(self.model.action.past_horizon)
             if self.history_joint else EXECUTION_HORIZON)
@@ -479,7 +480,7 @@ class RecedingHorizonPolicy:
             self.actions[indices].abs().sum((1, 2)) > 0)
         if continuing.any():
             continued_indices = indices[continuing]
-            if self.history_joint:
+            if self.execution_horizon < self.past_horizon:
                 self.past[continued_indices] = torch.cat((
                     self.past[continued_indices, self.execution_horizon:],
                     self.actions[continued_indices]), dim=1)
@@ -488,7 +489,8 @@ class RecedingHorizonPolicy:
                     torch.ones(len(continued_indices), self.execution_horizon,
                                device=self.device)), dim=1)
             else:
-                self.past[continued_indices] = self.actions[continued_indices]
+                self.past[continued_indices] = self.actions[
+                    continued_indices, -self.past_horizon:]
                 self.past_mask[continued_indices] = 1.0
 
         started = time.perf_counter()
@@ -530,7 +532,7 @@ class RecedingHorizonPolicy:
             self.model, latent, goal, proprio, self.past[indices],
             self.past_mask[indices], self.stats, self.flow_steps,
             base_policy_seeds, history=history)
-        self.actions[indices] = chosen[:, :EXECUTION_HORIZON]
+        self.actions[indices] = chosen[:, :self.execution_horizon]
         self.action_index[indices] = 0
         self.route_replan_count[indices] += 1
         self.plan_counter += 1
@@ -540,7 +542,7 @@ class RecedingHorizonPolicy:
 
     @torch.no_grad()
     def act(self, tensordict, env):
-        self._replan(env, self.action_index >= EXECUTION_HORIZON)
+        self._replan(env, self.action_index >= self.execution_horizon)
         rows = torch.arange(len(self.action_index), device=self.device)
         normalized = self.actions[rows, self.action_index]
         self.action_index += 1

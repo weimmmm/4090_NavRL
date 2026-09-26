@@ -15,11 +15,11 @@ latents are the frozen-VAE cache produced by ``cache-latents``.
 Example::
 
   python -m lidar_wam.runner.history_action_dit smoke \
-      --dataset-root DATA --latent-root LATENTS --video-index-root VIDEO_INDEX \
+      --dataset-root DATA --latent-root LATENTS --action-index-root ACTION_INDEX \
       --world-checkpoint outputs/lidar_video_dit_history3_next1/best.pt
 
   torchrun --nproc_per_node=4 -m lidar_wam.runner.history_action_dit train \
-      --dataset-root DATA --latent-root LATENTS --video-index-root VIDEO_INDEX \
+      --dataset-root DATA --latent-root LATENTS --action-index-root ACTION_INDEX \
       --world-checkpoint outputs/lidar_video_dit_history3_next1/best.pt \
       --out outputs --run-name history_world_action_dit
 """
@@ -50,7 +50,8 @@ from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.runner.lidar_video_dit import HistoryLatentDataset, INDEX_FORMAT
 
 
-FORMAT = "navrl-history-world-action-dit-v1"
+FORMAT = "navrl-history-world-action-dit-v2-masked-terminal"
+ACTION_INDEX_FORMAT = "navrl-history3-action-next1-index-v2"
 
 
 def _atomic_save(value, path: Path):
@@ -93,36 +94,38 @@ class JointHistoryDataset(HistoryLatentDataset):
     """
 
     def __init__(self, dataset_root: Path, latent_root: Path,
-                 video_index_root: Path, split: str):
-        super().__init__(dataset_root, latent_root, video_index_root, split,
-                         return_target_image=False)
+                 action_index_root: Path, split: str):
+        # This index is a superset of the ordinary Video-DiT index: it retains
+        # successful terminal chunks with 1--9 valid actions.  Reconstruct the
+        # small amount of HistoryLatentDataset state here because that class
+        # intentionally rejects index formats other than its world-only one.
+        self.dataset_root = Path(dataset_root)
+        self.latent_root = Path(latent_root)
+        self.root = Path(action_index_root) / split
+        self.metadata = json.loads((self.root / "metadata.json").read_text())
+        if self.metadata.get("format") != ACTION_INDEX_FORMAT:
+            raise ValueError("incompatible terminal-aware action index")
+        self.entries = self.metadata["entries"]
+        self.counts = np.asarray(self.metadata["counts"], dtype=np.int64)
+        self.ends = np.cumsum(self.counts)
+        self._rows = {}
+        self._latents = {}
+        self._files = {}
+        self.return_target_image = False
         self._action_files = {}
-        # The history index only checks temporal continuity.  Remove windows
-        # whose successor action is masked before a DataLoader ever sees them.
-        # Historical chunks may be partially unavailable at a scene start;
-        # those are represented by zeros plus a mask, rather than being
-        # mistaken for real zero-velocity supervision.
-        valid = []
-        offset = 0
-        for shard, count in enumerate(self.counts.tolist()):
-            rows, _ = self._open(shard)
-            frames = self._action_frames(shard)
-            masks = np.asarray(frames["action_mask"][:], dtype=bool)
-            successor = np.asarray(rows[:, 3], dtype=np.int64)
-            keep = masks[successor].all(axis=1)
-            valid.append(offset + np.flatnonzero(keep))
-            offset += int(count)
-        self.selection = np.concatenate(valid).astype(np.int64, copy=False)
-        if not len(self.selection):
-            raise RuntimeError(f"No valid action windows in split {split!r}")
+        latent_metadata = json.loads(
+            (self.latent_root / "metadata.json").read_text())
+        self.vae_metadata = {
+            key: latent_metadata.get(key) for key in (
+                "scaling_factor", "vae_variant", "vae_step",
+                "vae_checkpoint", "vae_sha256")}
+        if not len(self):
+            raise RuntimeError(f"No action windows in split {split!r}")
 
     def __getstate__(self):
         value = super().__getstate__()
         value["_action_files"] = {}
         return value
-
-    def _base_index(self, index: int) -> int:
-        return int(self.selection[int(index)])
 
     def _action_frames(self, shard: int):
         if shard not in self._action_files:
@@ -140,14 +143,12 @@ class JointHistoryDataset(HistoryLatentDataset):
     def _raw_conditions(self, indices):
         """Vectorized goal/proprio read used for stats and diagnostics."""
         indices = np.asarray(indices, dtype=np.int64)
-        base_indices = np.asarray([self._base_index(i) for i in indices],
-                                  dtype=np.int64)
         result_goal = np.empty((len(indices), 4), np.float32)
         result_proprio = np.empty((len(indices), 10), np.float32)
-        shards = np.asarray([self._location(int(i))[0] for i in base_indices])
+        shards = np.asarray([self._location(int(i))[0] for i in indices])
         for shard in np.unique(shards):
             positions = np.flatnonzero(shards == shard)
-            rows = np.asarray([self._location(int(base_indices[p]))[1][2]
+            rows = np.asarray([self._location(int(indices[p]))[1][2]
                                for p in positions], dtype=np.int64)
             frames = self._action_frames(int(shard))
             state = _read_rows(frames["drone_state"], rows)
@@ -159,15 +160,21 @@ class JointHistoryDataset(HistoryLatentDataset):
         return result_goal, result_proprio
 
     def __getitem__(self, index):
-        base_index = self._base_index(index)
-        history, target = super().__getitem__(base_index)
-        shard, chain = self._location(base_index)
+        history, target = super().__getitem__(int(index))
+        shard, chain = self._location(int(index))
         frames = self._action_frames(shard)
         current, successor = int(chain[2]), int(chain[3])
         action = np.asarray(frames["normalized_action_sequence"][successor],
                             dtype=np.float32)
-        if not bool(np.isfinite(action).all()):
-            raise ValueError(f"non-finite successor action at row {successor}")
+        action_mask = np.asarray(frames["action_mask"][successor],
+                                 dtype=np.float32)
+        valid = action_mask.astype(bool)
+        if not valid.any() or not bool(np.isfinite(action[valid]).all()):
+            raise ValueError(f"invalid successor action at row {successor}")
+        # Invalid suffix values were padding in the collector, not executed
+        # zero velocity.  A neutral constant plus attention masking ensures
+        # they neither receive loss nor become keys for valid action queries.
+        action = np.where(valid[:, None] & np.isfinite(action), action, 0.5)
         # Three ten-step chunks (t-2, t-1, t) provide the requested 30-step
         # causal action history.  Each chunk carries its own validity mask.
         history_rows = np.asarray(chain[:3], dtype=np.int64)
@@ -183,7 +190,9 @@ class JointHistoryDataset(HistoryLatentDataset):
         goal, proprio = self._raw_conditions([int(index)])
         return (history, target, torch.from_numpy(action),
                 torch.from_numpy(goal[0]), torch.from_numpy(proprio[0]),
-                torch.from_numpy(history_action), torch.from_numpy(history_mask))
+                torch.from_numpy(history_action), torch.from_numpy(history_mask),
+                torch.from_numpy(action_mask),
+                torch.tensor(bool(valid.all()), dtype=torch.bool))
 
 
 def _condition_stats(dataset: JointHistoryDataset, samples: int, seed: int):
@@ -224,7 +233,8 @@ def _load_world(checkpoint: Path, device):
 
 def _flow_batch(model, batch, device, precision, stats, action_weight,
                 world_weight):
-    history, target, action_target, goal, proprio, past, past_mask = batch
+    (history, target, action_target, goal, proprio, past, past_mask,
+     action_mask, world_valid) = batch
     history = history.to(device, non_blocking=True)
     target = target.to(device, non_blocking=True)
     action_target = action_target.to(device, non_blocking=True)
@@ -232,6 +242,8 @@ def _flow_batch(model, batch, device, precision, stats, action_weight,
     proprio = _normalize(proprio.to(device, non_blocking=True), stats, "proprio", device)
     past = past.to(device, non_blocking=True)
     past_mask = past_mask.to(device, non_blocking=True)
+    action_mask = action_mask.to(device, non_blocking=True)
+    world_valid = world_valid.to(device, non_blocking=True)
     future_noise = torch.randn_like(target)
     future_sigma = torch.rand(len(target), device=device, dtype=target.dtype)
     noisy_future = ((1 - future_sigma[:, None, None, None]) * target
@@ -246,21 +258,33 @@ def _flow_batch(model, batch, device, precision, stats, action_weight,
     with amp:
         world_velocity, action_velocity = model(
             history, noisy_future, future_sigma, noisy_action, action_sigma,
-            goal, proprio, past, past_mask)
+            goal, proprio, past, past_mask, action_mask=action_mask)
         world_target = future_noise - target
         action_flow_target = action_noise - action_target
-        world_flow = (world_velocity - world_target).square().mean()
-        action_flow = (action_velocity - action_flow_target).square().mean()
-        world_x0 = (noisy_future - future_sigma[:, None, None, None]
-                    * world_velocity - target).abs().mean()
-        action_x0 = (noisy_action - action_sigma[:, None, None]
-                     * action_velocity - action_target).abs().mean()
+        world_weight_mask = world_valid.to(world_velocity.dtype)
+        world_denominator = world_weight_mask.sum().clamp_min(1.0)
+        world_flow_per_sample = (world_velocity - world_target).square().flatten(1).mean(1)
+        world_x0_per_sample = (
+            noisy_future - future_sigma[:, None, None, None]
+            * world_velocity - target).abs().flatten(1).mean(1)
+        world_flow = (world_flow_per_sample * world_weight_mask).sum() / world_denominator
+        world_x0 = (world_x0_per_sample * world_weight_mask).sum() / world_denominator
+        action_weight_mask = action_mask[:, :, None].to(action_velocity.dtype)
+        action_denominator = (
+            action_weight_mask.sum() * action_velocity.shape[-1]).clamp_min(1.0)
+        action_flow = ((action_velocity - action_flow_target).square()
+                       * action_weight_mask).sum() / action_denominator
+        action_x0 = ((noisy_action - action_sigma[:, None, None]
+                      * action_velocity - action_target).abs()
+                     * action_weight_mask).sum() / action_denominator
         loss = world_weight * (world_flow + 0.1 * world_x0) + action_weight * (
             action_flow + 0.1 * action_x0)
     metrics = {
         "loss": loss.detach(), "world_loss": world_flow.detach(),
         "action_loss": action_flow.detach(), "world_x0_l1": world_x0.detach(),
         "action_x0_l1": action_x0.detach(),
+        "terminal_partial_fraction": (~world_valid).float().mean().detach(),
+        "valid_action_steps": action_mask.sum(1).float().mean().detach(),
     }
     return loss, metrics
 
@@ -271,9 +295,11 @@ def _validate(model, loader, device, precision, stats, world_weight,
     model.eval()
     sums = {key: 0.0 for key in
             ("loss", "world_loss", "action_loss", "world_x0_l1",
-             "action_x0_l1", "action_sample_l1")}
+             "action_x0_l1", "terminal_partial_fraction",
+             "valid_action_steps", "action_sample_l1")}
     count = 0
-    sample_count = 0
+    sample_window_count = 0
+    sample_value_count = 0
     generator = torch.Generator(device=device).manual_seed(271828)
     raw = model.module if isinstance(model, DistributedDataParallel) else model
     for batch in loader:
@@ -283,8 +309,8 @@ def _validate(model, loader, device, precision, stats, world_weight,
         count += n
         for key, value in metrics.items():
             sums[key] += float(value) * n
-        if sample_count < int(sample_windows):
-            take = min(n, int(sample_windows) - sample_count)
+        if sample_window_count < int(sample_windows):
+            take = min(n, int(sample_windows) - sample_window_count)
             history = batch[0][:take].to(device, non_blocking=True)
             target_action = batch[2][:take].to(device, non_blocking=True)
             goal = _normalize(batch[3][:take].to(device, non_blocking=True),
@@ -293,6 +319,7 @@ def _validate(model, loader, device, precision, stats, world_weight,
                                  stats, "proprio", device)
             past = batch[5][:take].to(device, non_blocking=True)
             past_mask = batch[6][:take].to(device, non_blocking=True)
+            target_mask = batch[7][:take].to(device, non_blocking=True)
             features = raw.encode_history_features(history)
             amp = (torch.autocast("cuda", dtype=torch.bfloat16)
                    if precision == "bf16" else contextlib.nullcontext())
@@ -300,24 +327,30 @@ def _validate(model, loader, device, precision, stats, world_weight,
                 sampled = flow_sample_action(
                     raw.action, features, goal, proprio, past, past_mask,
                     steps=int(sample_steps), generator=generator)
-                sample_l1 = (sampled.float() - target_action.float()).abs().mean()
-            sums["action_sample_l1"] += float(sample_l1) * take
-            sample_count += take
+                absolute = (sampled.float() - target_action.float()).abs()
+                valid_values = target_mask.sum() * absolute.shape[-1]
+                sample_l1 = (absolute * target_mask[:, :, None]).sum()
+            sums["action_sample_l1"] += float(sample_l1)
+            sample_value_count += int(valid_values)
+            sample_window_count += take
     if dist.is_initialized():
-        value = torch.tensor([sums[k] for k in sums] + [count, sample_count], device=device,
+        value = torch.tensor(
+            [sums[k] for k in sums] +
+            [count, sample_window_count, sample_value_count], device=device,
                              dtype=torch.float64)
         dist.all_reduce(value)
         for i, key in enumerate(sums):
             sums[key] = float(value[i])
-        count = float(value[-2])
-        sample_count = float(value[-1])
+        count = float(value[-3])
+        sample_window_count = float(value[-2])
+        sample_value_count = float(value[-1])
     count = max(float(count), 1.0)
-    sample_count = max(float(sample_count), 1.0)
+    sample_value_count = max(float(sample_value_count), 1.0)
     model.train()
     output = {key: value / count for key, value in sums.items()
               if key != "action_sample_l1"}
-    output["action_sample_l1"] = sums["action_sample_l1"] / sample_count
-    output["action_sample_windows"] = int(sample_count)
+    output["action_sample_l1"] = sums["action_sample_l1"] / sample_value_count
+    output["action_sample_windows"] = int(sample_window_count)
     return output
 
 
@@ -345,6 +378,8 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
         "source_world_checkpoint": str(args.world_checkpoint),
         "source_world_sha256": _sha256(args.world_checkpoint),
         "source_world_step": int(world_payload.get("step", -1)),
+        "resume_checkpoint": (str(args.resume_checkpoint)
+                              if args.resume_checkpoint else None),
         "config": vars(args),
     }
 
@@ -368,9 +403,9 @@ def train(args):
         dist.init_process_group("nccl")
     device = torch.device("cuda", local_rank)
     train_data = JointHistoryDataset(
-        args.dataset_root, args.latent_root, args.video_index_root, "train")
+        args.dataset_root, args.latent_root, args.action_index_root, "train")
     val_full = JointHistoryDataset(
-        args.dataset_root, args.latent_root, args.video_index_root, "val")
+        args.dataset_root, args.latent_root, args.action_index_root, "val")
     rng = np.random.default_rng(args.seed)
     val_indices = np.sort(rng.choice(len(val_full),
                                      min(args.eval_samples, len(val_full)),
@@ -395,6 +430,18 @@ def train(args):
         world, width=args.width, depth=args.depth, heads=args.heads,
         mlp_ratio=args.mlp_ratio, past_horizon=args.past_horizon,
         shared_world_depth=args.shared_world_depth).to(device)
+    resume_payload = None
+    initial_step = 0
+    if args.resume_checkpoint is not None:
+        resume_payload = torch.load(
+            args.resume_checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(resume_payload.get("model", resume_payload), strict=True)
+        initial_step = int(resume_payload.get("step", 0))
+        if "condition_stats" in resume_payload:
+            # Preserve the exact deployment normalization learned by the
+            # checkpoint.  Optimizer state is deliberately not restored for
+            # this terminal-aware fine-tuning stage.
+            stats = resume_payload["condition_stats"]
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank],
                                         find_unused_parameters=False)
@@ -423,12 +470,16 @@ def train(args):
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
            if args.precision == "bf16" else contextlib.nullcontext())
     iterator, epoch = iter(train_loader), 0
+    # Validation data and masking semantics changed in this stage, so old
+    # checkpoint metrics are not comparable.  Establish all three best files
+    # from the first new validation instead of silently retaining stale bars.
     best_score = float("inf")
     best_world = float("inf")
     best_action = float("inf")
     started = time.time()
     model.train()
-    for step in range(1, args.steps + 1):
+    for local_step in range(1, args.steps + 1):
+        step = initial_step + local_step
         try:
             batch = next(iterator)
         except StopIteration:
@@ -479,13 +530,13 @@ def train(args):
                 if metrics_val["world_x0_l1"] < best_world:
                     best_world = metrics_val["world_x0_l1"]
                     _atomic_save(checkpoint, run_dir / "best_world.pt")
-                if metrics_val["action_x0_l1"] < best_action:
-                    best_action = metrics_val["action_x0_l1"]
+                if metrics_val["action_sample_l1"] < best_action:
+                    best_action = metrics_val["action_sample_l1"]
                     _atomic_save(checkpoint, run_dir / "best_action.pt")
                 (run_dir / "best_metrics.json").write_text(json.dumps({
                     "selection_score": best_score,
                     "best_world_x0_l1": best_world,
-                    "best_action_x0_l1": best_action,
+                    "best_action_sample_l1": best_action,
                     "last_validation": metrics_val,
                     "step": step}, indent=2) + "\n")
                 if writer:
@@ -514,8 +565,9 @@ def main():
     for command in (sub.add_parser("train"), sub.add_parser("smoke")):
         command.add_argument("--dataset-root", type=Path, required=True)
         command.add_argument("--latent-root", type=Path, required=True)
-        command.add_argument("--video-index-root", type=Path, required=True)
+        command.add_argument("--action-index-root", type=Path, required=True)
         command.add_argument("--world-checkpoint", type=Path, required=True)
+        command.add_argument("--resume-checkpoint", type=Path)
         command.add_argument("--out", type=Path, default=Path("outputs"))
         command.add_argument("--run-name", default="history_world_action_dit")
         command.add_argument("--steps", type=int, default=20000)

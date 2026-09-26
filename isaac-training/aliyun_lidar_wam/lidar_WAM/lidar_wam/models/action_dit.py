@@ -76,7 +76,8 @@ class ActionDiT(nn.Module):
     def forward(self, history_tokens: torch.Tensor, noisy_action: torch.Tensor,
                 timestep: torch.Tensor, goal: torch.Tensor,
                 proprio: torch.Tensor, past_actions: torch.Tensor,
-                past_mask: torch.Tensor) -> torch.Tensor:
+                past_mask: torch.Tensor,
+                action_mask: torch.Tensor | None = None) -> torch.Tensor:
         expected_history = (self.history_tokens, self.width)
         if history_tokens.ndim != 3 or tuple(history_tokens.shape[1:]) != expected_history:
             raise ValueError(
@@ -99,9 +100,21 @@ class ActionDiT(nn.Module):
         ), dim=1)
         action = self.action_in(noisy_action) + self.action_position
         tokens = torch.cat((context, action), dim=1)
+        key_padding_mask = None
+        if action_mask is not None:
+            if tuple(action_mask.shape[1:]) != (self.action_horizon,):
+                raise ValueError(
+                    f"Expected action mask [B,{self.action_horizon}], "
+                    f"got {tuple(action_mask.shape)}")
+            context_valid = torch.ones(
+                len(tokens), self.context_tokens, device=tokens.device,
+                dtype=torch.bool)
+            key_padding_mask = ~torch.cat(
+                (context_valid, action_mask.to(dtype=torch.bool)), dim=1)
         condition = self.time_mlp(timestep_embedding(timestep, self.width))
         for block in self.blocks:
-            tokens = block(tokens, condition, self.causal_mask)
+            tokens = block(tokens, condition, self.causal_mask,
+                           key_padding_mask=key_padding_mask)
         action = tokens[:, -self.action_horizon:]
         shift, scale = self.final_modulation(condition).chunk(2, dim=-1)
         action = self.final_norm(action) * (1 + scale[:, None]) + shift[:, None]
@@ -157,7 +170,8 @@ class JointHistoryWorldActionDiT(nn.Module):
                 future_timestep: torch.Tensor, noisy_action: torch.Tensor,
                 action_timestep: torch.Tensor, goal: torch.Tensor,
                 proprio: torch.Tensor, past_actions: torch.Tensor,
-                past_mask: torch.Tensor):
+                past_mask: torch.Tensor,
+                action_mask: torch.Tensor | None = None):
         # Keep the original H0 path for the World loss.  Action receives H6,
         # not just the raw tokenizer output, so the pretrained temporal
         # representation can influence action generation.
@@ -167,7 +181,7 @@ class JointHistoryWorldActionDiT(nn.Module):
             history, noisy_future, future_timestep, history_tokens=shared)
         action_velocity = self.action(
             action_features, noisy_action, action_timestep, goal, proprio,
-            past_actions, past_mask)
+            past_actions, past_mask, action_mask=action_mask)
         return world_velocity, action_velocity
 
 

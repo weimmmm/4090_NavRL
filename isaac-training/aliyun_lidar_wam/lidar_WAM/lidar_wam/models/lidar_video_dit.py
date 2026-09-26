@@ -64,13 +64,14 @@ class VideoDiTBlock(nn.Module):
         return value * (1 + scale[:, None]) + shift[:, None]
 
     def forward(self, tokens: torch.Tensor, condition: torch.Tensor,
-                attention_mask: torch.Tensor) -> torch.Tensor:
+                attention_mask: torch.Tensor,
+                key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = (
             self.modulation(condition).chunk(6, dim=-1))
         value = self._modulate(self.norm1(tokens), shift_a, scale_a)
         value = self.attention(
             value, value, value, attn_mask=attention_mask,
-            need_weights=False)[0]
+            key_padding_mask=key_padding_mask, need_weights=False)[0]
         tokens = tokens + gate_a[:, None] * value
         value = self._modulate(self.norm2(tokens), shift_m, scale_m)
         tokens = tokens + gate_m[:, None] * self.mlp(value)

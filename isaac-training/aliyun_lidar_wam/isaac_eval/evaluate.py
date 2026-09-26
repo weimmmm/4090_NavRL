@@ -264,7 +264,10 @@ def main():
                        if environment is not None else None))
         args.condition_frame = policy.condition_frame
         args.executed_head = policy.executed_head
-        args.generated_horizon_steps = int(policy.actions.shape[1])
+        args.generated_horizon_steps = int(
+            policy.model.action.action_horizon
+            if policy.history_joint else 30)
+        args.executed_horizon_steps = 10
         args.checkpoint_semantics = policy.semantics
         path_length = torch.zeros(args.num_envs, device=device)
         episode_steps = torch.zeros(args.num_envs, device=device, dtype=torch.long)
