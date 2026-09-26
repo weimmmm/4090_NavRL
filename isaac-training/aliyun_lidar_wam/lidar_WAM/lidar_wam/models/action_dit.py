@@ -48,6 +48,19 @@ class ActionDiT(nn.Module):
         self.special_position = nn.Parameter(torch.randn(1, 2, width) * 0.02)
         self.time_mlp = nn.Sequential(
             nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width))
+        # The only new path in this ablation is a goal query over causal H6
+        # World tokens.  The zero residual projection makes an old step-8200
+        # checkpoint numerically identical at initialization while allowing
+        # the new spatial readout to learn from the first update.
+        self.goal_history_norm = nn.LayerNorm(width, elementwise_affine=False)
+        self.goal_cross_attn = nn.MultiheadAttention(
+            width, heads, batch_first=True, dropout=0.0)
+        # Zero the residual projection, rather than the whole branch.  This
+        # preserves the exact step-8200 action at initialization while still
+        # giving the new cross-attention path a useful gradient immediately.
+        nn.init.zeros_(self.goal_cross_attn.out_proj.weight)
+        nn.init.zeros_(self.goal_cross_attn.out_proj.bias)
+        self.goal_gate = nn.Parameter(torch.ones(()))
         self.blocks = nn.ModuleList([
             VideoDiTBlock(width, heads, mlp_ratio) for _ in range(depth)])
         self.final_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
@@ -90,8 +103,14 @@ class ActionDiT(nn.Module):
         if tuple(past_actions.shape[1:]) != (self.past_horizon, self.action_dim):
             raise ValueError(f"Unexpected past action shape {tuple(past_actions.shape)}")
         past = torch.cat((past_actions, past_mask.unsqueeze(-1)), dim=-1)
+        goal_query = self.goal_in(goal).unsqueeze(1)
+        history_for_goal = self.goal_history_norm(history_tokens)
+        goal_spatial = self.goal_cross_attn(
+            goal_query, history_for_goal, history_for_goal,
+            need_weights=False)[0]
+        goal_token = goal_query + torch.tanh(self.goal_gate) * goal_spatial
         special = torch.cat((
-            self.goal_in(goal).unsqueeze(1),
+            goal_token,
             self.proprio_in(proprio).unsqueeze(1)), dim=1)
         context = torch.cat((
             history_tokens,

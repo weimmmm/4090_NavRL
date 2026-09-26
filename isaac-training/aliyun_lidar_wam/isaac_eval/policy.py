@@ -50,6 +50,7 @@ JOINT_POLICY_FORMAT = "navrl-joint-world-action-policy-v3"
 JOINT_TRAINING_FORMAT = "navrl-joint-world-action-training-v3"
 HISTORY_JOINT_FORMAT = "navrl-history-world-action-dit-v1"
 HISTORY_JOINT_MASKED_FORMAT = "navrl-history-world-action-dit-v2-masked-terminal"
+HISTORY_JOINT_GOAL_SPATIAL_FORMAT = "navrl-history-world-action-dit-v2-goal-spatial-attention"
 
 
 def load_circular_vae(device: torch.device):
@@ -113,7 +114,8 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
     # deployment must run the World-DiT history tokenizer before Action-DiT.
     if (isinstance(payload, dict)
             and payload.get("format") in (
-                HISTORY_JOINT_FORMAT, HISTORY_JOINT_MASKED_FORMAT)):
+                HISTORY_JOINT_FORMAT, HISTORY_JOINT_MASKED_FORMAT,
+                HISTORY_JOINT_GOAL_SPATIAL_FORMAT)):
         architecture = dict(payload.get("architecture", {}))
         width = int(architecture.get("width", 512))
         depth = int(architecture.get("depth", 8))

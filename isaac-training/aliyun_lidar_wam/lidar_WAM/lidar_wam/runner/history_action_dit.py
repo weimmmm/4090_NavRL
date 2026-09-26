@@ -50,7 +50,7 @@ from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.runner.lidar_video_dit import HistoryLatentDataset, INDEX_FORMAT
 
 
-FORMAT = "navrl-history-world-action-dit-v2-masked-terminal"
+FORMAT = "navrl-history-world-action-dit-v2-goal-spatial-attention"
 ACTION_INDEX_FORMAT = "navrl-history3-action-next1-index-v2"
 
 
@@ -373,6 +373,8 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
             "conditioning": "causal_history_goal_proprio_past_action",
             "world_backbone": "history_video_dit",
             "action_backbone": "action_dit_same_video_blocks",
+            "goal_attention": "goal_query_cross_attends_to_world_h6",
+            "goal_attention_gate": "tanh_scalar_zero_initialized",
         },
         "condition_stats": stats,
         "source_world_checkpoint": str(args.world_checkpoint),
@@ -435,7 +437,20 @@ def train(args):
     if args.resume_checkpoint is not None:
         resume_payload = torch.load(
             args.resume_checkpoint, map_location="cpu", weights_only=False)
-        model.load_state_dict(resume_payload.get("model", resume_payload), strict=True)
+        missing, unexpected = model.load_state_dict(
+            resume_payload.get("model", resume_payload), strict=False)
+        allowed_missing = {
+            "action.goal_history_norm.weight", "action.goal_history_norm.bias",
+            "action.goal_cross_attn.in_proj_weight",
+            "action.goal_cross_attn.in_proj_bias",
+            "action.goal_cross_attn.out_proj.weight",
+            "action.goal_cross_attn.out_proj.bias",
+            "action.goal_gate",
+        }
+        if set(unexpected) or not set(missing).issubset(allowed_missing):
+            raise RuntimeError(
+                f"Unexpected checkpoint mismatch; missing={missing}, "
+                f"unexpected={unexpected}")
         initial_step = int(resume_payload.get("step", 0))
         if "condition_stats" in resume_payload:
             # Preserve the exact deployment normalization learned by the
@@ -508,7 +523,8 @@ def train(args):
         if step % args.eval_every == 0:
             metrics_val = _validate(
                 model, val_loader, device, args.precision, stats,
-                args.world_weight, args.action_weight, args.action_sample_steps,
+                args.world_weight, args.action_weight,
+                args.action_sample_steps,
                 args.action_sample_windows)
             if rank == 0:
                 print(json.dumps({"step": step, "validation": metrics_val}),
