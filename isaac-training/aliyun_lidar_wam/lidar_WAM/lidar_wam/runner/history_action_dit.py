@@ -232,7 +232,7 @@ def _load_world(checkpoint: Path, device):
 
 
 def _flow_batch(model, batch, device, precision, stats, action_weight,
-                world_weight):
+                world_weight, future_cross=False):
     (history, target, action_target, goal, proprio, past, past_mask,
      action_mask, world_valid) = batch
     history = history.to(device, non_blocking=True)
@@ -251,6 +251,10 @@ def _flow_batch(model, batch, device, precision, stats, action_weight,
     action_noise = torch.randn_like(action_target)
     action_sigma = torch.rand(len(action_target), device=device,
                               dtype=action_target.dtype)
+    future_tokens = None
+    if future_cross:
+        raw = model.module if isinstance(model, DistributedDataParallel) else model
+        future_tokens = raw.future_features_from_noise(history, future_noise)
     noisy_action = ((1 - action_sigma[:, None, None]) * action_target
                     + action_sigma[:, None, None] * action_noise)
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
@@ -258,7 +262,8 @@ def _flow_batch(model, batch, device, precision, stats, action_weight,
     with amp:
         world_velocity, action_velocity = model(
             history, noisy_future, future_sigma, noisy_action, action_sigma,
-            goal, proprio, past, past_mask, action_mask=action_mask)
+            goal, proprio, past, past_mask, action_mask=action_mask,
+            future_tokens=future_tokens)
         world_target = future_noise - target
         action_flow_target = action_noise - action_target
         world_weight_mask = world_valid.to(world_velocity.dtype)
@@ -291,7 +296,8 @@ def _flow_batch(model, batch, device, precision, stats, action_weight,
 
 @torch.no_grad()
 def _validate(model, loader, device, precision, stats, world_weight,
-              action_weight, sample_steps=10, sample_windows=128):
+              action_weight, sample_steps=10, sample_windows=128,
+              future_cross=False):
     model.eval()
     sums = {key: 0.0 for key in
             ("loss", "world_loss", "action_loss", "world_x0_l1",
@@ -301,10 +307,12 @@ def _validate(model, loader, device, precision, stats, world_weight,
     sample_window_count = 0
     sample_value_count = 0
     generator = torch.Generator(device=device).manual_seed(271828)
+    future_generator = torch.Generator(device=device).manual_seed(314159)
     raw = model.module if isinstance(model, DistributedDataParallel) else model
     for batch in loader:
         loss, metrics = _flow_batch(model, batch, device, precision, stats,
-                                    action_weight, world_weight)
+                                    action_weight, world_weight,
+                                    future_cross=future_cross)
         n = len(batch[0])
         count += n
         for key, value in metrics.items():
@@ -321,12 +329,20 @@ def _validate(model, loader, device, precision, stats, world_weight,
             past_mask = batch[6][:take].to(device, non_blocking=True)
             target_mask = batch[7][:take].to(device, non_blocking=True)
             features = raw.encode_history_features(history)
+            future_tokens = None
+            if future_cross:
+                future_noise = torch.randn(
+                    tuple(batch[1][:take].shape), device=device,
+                    dtype=history.dtype, generator=future_generator)
+                future_tokens = raw.future_features_from_noise(
+                    history, future_noise)
             amp = (torch.autocast("cuda", dtype=torch.bfloat16)
                    if precision == "bf16" else contextlib.nullcontext())
             with amp:
                 sampled = flow_sample_action(
                     raw.action, features, goal, proprio, past, past_mask,
-                    steps=int(sample_steps), generator=generator)
+                    steps=int(sample_steps), generator=generator,
+                    future_tokens=future_tokens)
                 absolute = (sampled.float() - target_action.float()).abs()
                 valid_values = target_mask.sum() * absolute.shape[-1]
                 sample_l1 = (absolute * target_mask[:, :, None]).sum()
@@ -375,6 +391,9 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
             "action_backbone": "action_dit_same_video_blocks",
             "goal_attention": "goal_query_cross_attends_to_world_h6",
             "goal_attention_gate": "tanh_scalar_zero_initialized",
+            "future_action_cross_attention": (
+                "action_queries_predicted_future_tokens_after_each_action_block"),
+            "future_action_cross_attention_gate": "tanh_per_block_zero_initialized",
         },
         "condition_stats": stats,
         "source_world_checkpoint": str(args.world_checkpoint),
@@ -447,7 +466,17 @@ def train(args):
             "action.goal_cross_attn.out_proj.bias",
             "action.goal_gate",
         }
-        if set(unexpected) or not set(missing).issubset(allowed_missing):
+        future_prefixes = (
+            "action.future_cross_query_norm.",
+            "action.future_cross_context_norm.",
+            "action.future_cross_attn.",
+            "action.future_cross_gates",
+        )
+        invalid_missing = [
+            key for key in missing
+            if key not in allowed_missing and not any(
+                key.startswith(prefix) for prefix in future_prefixes)]
+        if set(unexpected) or invalid_missing:
             raise RuntimeError(
                 f"Unexpected checkpoint mismatch; missing={missing}, "
                 f"unexpected={unexpected}")
@@ -457,16 +486,33 @@ def train(args):
             # checkpoint.  Optimizer state is deliberately not restored for
             # this terminal-aware fine-tuning stage.
             stats = resume_payload["condition_stats"]
+    if args.future_cross_only:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = name.startswith("action.future_cross_")
+        trainable = [name for name, parameter in model.named_parameters()
+                     if parameter.requires_grad]
+        if not trainable:
+            raise RuntimeError("future_cross_only selected no trainable parameters")
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank],
                                         find_unused_parameters=False)
     raw = model.module if isinstance(model, DistributedDataParallel) else model
-    optimizer = torch.optim.AdamW([
-        {"params": raw.world.parameters(), "lr": args.world_lr,
-         "name": "world"},
-        {"params": raw.action.parameters(), "lr": args.action_lr,
-         "name": "action"},
-    ], weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    if args.future_cross_only:
+        optimizer_groups = [{
+            "params": [parameter for name, parameter in raw.named_parameters()
+                       if name.startswith("action.future_cross_")],
+            "lr": args.action_lr,
+            "name": "future_prediction_cross_attention",
+        }]
+    else:
+        optimizer_groups = [
+            {"params": raw.world.parameters(), "lr": args.world_lr,
+             "name": "world"},
+            {"params": raw.action.parameters(), "lr": args.action_lr,
+             "name": "action"},
+        ]
+    optimizer = torch.optim.AdamW(
+        optimizer_groups, weight_decay=args.weight_decay, betas=(0.9, 0.95))
     run_dir = args.out / args.run_name
     writer = None
     if rank == 0:
@@ -479,7 +525,10 @@ def train(args):
                        "train_windows": len(train_data),
                        "val_windows": len(val_full),
                        "val_subset": len(val_data), "condition_stats": stats,
-                       "world_architecture": world_arch})
+                       "world_architecture": world_arch,
+                       "future_cross_only": args.future_cross_only,
+                       "trainable_parameter_names": (
+                           trainable if args.future_cross_only else None)})
         (run_dir / "config.json").write_text(json.dumps(
             config, indent=2, default=str) + "\n")
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
@@ -506,7 +555,8 @@ def train(args):
         optimizer.zero_grad(set_to_none=True)
         loss, metrics = _flow_batch(model, batch, device, args.precision,
                                     stats, args.action_weight,
-                                    args.world_weight)
+                                    args.world_weight,
+                                    future_cross=args.future_cross_only)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
@@ -525,7 +575,8 @@ def train(args):
                 model, val_loader, device, args.precision, stats,
                 args.world_weight, args.action_weight,
                 args.action_sample_steps,
-                args.action_sample_windows)
+                args.action_sample_windows,
+                future_cross=args.future_cross_only)
             if rank == 0:
                 print(json.dumps({"step": step, "validation": metrics_val}),
                       flush=True)
@@ -596,6 +647,9 @@ def main():
         command.add_argument("--mlp-ratio", type=float, default=4.0)
         command.add_argument("--past-horizon", type=int, default=30)
         command.add_argument("--shared-world-depth", type=int, default=6)
+        command.add_argument(
+            "--future-cross-only", action="store_true",
+            help="train only the predicted Future-DiT -> Action-DiT cross-attention")
         command.add_argument("--world-lr", type=float, default=1e-5)
         command.add_argument("--action-lr", type=float, default=1e-4)
         command.add_argument("--weight-decay", type=float, default=1e-2)

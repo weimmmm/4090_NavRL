@@ -178,6 +178,35 @@ class LiDARVideoDiT(nn.Module):
             tokens = block(tokens, condition, mask)
         return tokens
 
+    def encode_future_features(self, history: torch.Tensor,
+                               future: torch.Tensor,
+                               timestep: torch.Tensor,
+                               depth: int | None = None) -> torch.Tensor:
+        """Encode history plus a predicted future frame and return future tokens."""
+        expected_history = (3, 4, 27, 5)
+        expected_future = (4, 27, 5)
+        if history.ndim != 5 or tuple(history.shape[1:]) != expected_history:
+            raise ValueError(
+                f"Expected history [B,3,4,27,5], got {tuple(history.shape)}")
+        if future.ndim != 4 or tuple(future.shape[1:]) != expected_future:
+            raise ValueError(
+                f"Expected future [B,4,27,5], got {tuple(future.shape)}")
+        depth = self.depth if depth is None else int(depth)
+        if not 0 <= depth <= self.depth:
+            raise ValueError(f"depth must be in [0,{self.depth}], got {depth}")
+        history_tokens = self.encode_history(history)
+        future_tokens = future.permute(0, 2, 3, 1).reshape(
+            len(future), self.tokens_per_frame, self.latent_channels)
+        future_tokens = self.input_projection(future_tokens)
+        future_tokens = future_tokens + self.frame_position[:, 3]
+        future_tokens = future_tokens + self.spatial_position[:, 0].to(
+            future_tokens.dtype)
+        tokens = torch.cat((history_tokens, future_tokens), dim=1)
+        condition = self.time_mlp(timestep_embedding(timestep, self.width))
+        for block in self.blocks[:depth]:
+            tokens = block(tokens, condition, self.block_causal_mask)
+        return tokens[:, 3 * self.tokens_per_frame:]
+
     def forward(self, history: torch.Tensor, noisy_next: torch.Tensor,
                 timestep: torch.Tensor,
                 history_tokens: torch.Tensor | None = None) -> torch.Tensor:
