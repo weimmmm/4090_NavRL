@@ -53,3 +53,21 @@ def test_action_dit_context_cannot_read_noisy_action():
     context = model.context_tokens
     assert model.causal_mask[:context, context:].all()
     assert not model.causal_mask[context:, :].any()
+
+
+def test_three_step_future_rollout_feeds_action_cross_attention():
+    world = LiDARVideoDiT(width=32, depth=1, heads=4, mlp_ratio=2)
+    joint = JointHistoryWorldActionDiT(
+        world, width=32, depth=1, heads=4, mlp_ratio=2,
+        shared_world_depth=1)
+    history = torch.randn(2, 3, 4, 27, 5)
+    future_noise = torch.randn(2, 3, 4, 27, 5)
+    future_tokens = joint.future_features_autoregressive(history, future_noise)
+    assert future_tokens.shape == (2, 3 * 27 * 5, 32)
+
+    output = joint.action(
+        joint.encode_history_features(history), torch.randn(2, 10, 3),
+        torch.rand(2), torch.randn(2, 4), torch.randn(2, 10),
+        torch.randn(2, 30, 3), torch.ones(2, 30),
+        future_tokens=future_tokens)
+    assert output.shape == (2, 10, 3)

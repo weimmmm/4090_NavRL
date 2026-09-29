@@ -254,7 +254,12 @@ def _flow_batch(model, batch, device, precision, stats, action_weight,
     future_tokens = None
     if future_cross:
         raw = model.module if isinstance(model, DistributedDataParallel) else model
-        future_tokens = raw.future_features_from_noise(history, future_noise)
+        rollout_noise = torch.cat((
+            future_noise[:, None],
+            torch.randn(len(target), 2, *target.shape[1:],
+                        device=target.device, dtype=target.dtype)), dim=1)
+        future_tokens = raw.future_features_autoregressive(
+            history, rollout_noise)
     noisy_action = ((1 - action_sigma[:, None, None]) * action_target
                     + action_sigma[:, None, None] * action_noise)
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
@@ -332,9 +337,9 @@ def _validate(model, loader, device, precision, stats, world_weight,
             future_tokens = None
             if future_cross:
                 future_noise = torch.randn(
-                    tuple(batch[1][:take].shape), device=device,
+                    (take, 3, *batch[1].shape[1:]), device=device,
                     dtype=history.dtype, generator=future_generator)
-                future_tokens = raw.future_features_from_noise(
+                future_tokens = raw.future_features_autoregressive(
                     history, future_noise)
             amp = (torch.autocast("cuda", dtype=torch.bfloat16)
                    if precision == "bf16" else contextlib.nullcontext())
@@ -380,6 +385,7 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
         "metrics": {key: float(value) for key, value in metrics.items()},
         "architecture": {
             "history_frames": 3, "prediction_frames": 1,
+            "future_action_rollout_steps": 3,
             "latent_shape": [4, 27, 5], "width": args.width,
             "depth": args.depth, "heads": args.heads,
             "mlp_ratio": args.mlp_ratio, "action_horizon": 10,
@@ -392,7 +398,7 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
             "goal_attention": "goal_query_cross_attends_to_world_h6",
             "goal_attention_gate": "tanh_scalar_zero_initialized",
             "future_action_cross_attention": (
-                "action_queries_predicted_future_tokens_after_each_action_block"),
+                "action_queries_autoregressive_t+1:t+3_future_tokens_after_each_action_block"),
             "future_action_cross_attention_gate": "tanh_per_block_zero_initialized",
         },
         "condition_stats": stats,
@@ -471,12 +477,19 @@ def train(args):
             "action.future_cross_context_norm.",
             "action.future_cross_attn.",
             "action.future_cross_gates",
+            "action.future_cross_horizon_position",
         )
         invalid_missing = [
             key for key in missing
             if key not in allowed_missing and not any(
                 key.startswith(prefix) for prefix in future_prefixes)]
-        if set(unexpected) or invalid_missing:
+        # The 76.56% checkpoint was serialized while an unused reverse
+        # Action->Future experiment was present in the class.  Those tensors
+        # never participated in its forward pass and are intentionally dropped.
+        invalid_unexpected = [
+            key for key in unexpected
+            if not key.startswith("action_to_future_")]
+        if invalid_unexpected or invalid_missing:
             raise RuntimeError(
                 f"Unexpected checkpoint mismatch; missing={missing}, "
                 f"unexpected={unexpected}")
@@ -527,6 +540,7 @@ def train(args):
                        "val_subset": len(val_data), "condition_stats": stats,
                        "world_architecture": world_arch,
                        "future_cross_only": args.future_cross_only,
+                       "future_rollout_steps": 3,
                        "trainable_parameter_names": (
                            trainable if args.future_cross_only else None)})
         (run_dir / "config.json").write_text(json.dumps(

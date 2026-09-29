@@ -90,6 +90,10 @@ class ActionDiT(nn.Module):
             nn.MultiheadAttention(width, heads, batch_first=True, dropout=0.0)
             for _ in range(depth)])
         self.future_cross_gates = nn.Parameter(torch.zeros(depth))
+        # Identify the t+1, t+2 and t+3 token groups produced by the frozen
+        # one-step Future-DiT rollout.
+        self.future_cross_horizon_position = nn.Parameter(
+            torch.zeros(1, 3, 1, width))
         self.final_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
         self.final_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(width, 2 * width))
@@ -137,6 +141,20 @@ class ActionDiT(nn.Module):
                     f"{tuple(future_tokens.shape)}")
             if future_tokens.shape[-1] != self.width or future_tokens.shape[1] <= 0:
                 raise ValueError("future_tokens has an invalid token shape")
+            tokens_per_frame = 27 * 5
+            if future_tokens.shape[1] % tokens_per_frame:
+                raise ValueError("future token count must be a multiple of 135")
+            future_horizons = future_tokens.shape[1] // tokens_per_frame
+            if future_horizons > self.future_cross_horizon_position.shape[1]:
+                raise ValueError(
+                    f"At most {self.future_cross_horizon_position.shape[1]} "
+                    f"future horizons are supported, got {future_horizons}")
+            future_tokens = future_tokens.reshape(
+                len(future_tokens), future_horizons, tokens_per_frame,
+                self.width)
+            future_tokens = future_tokens + self.future_cross_horizon_position[
+                :, :future_horizons]
+            future_tokens = future_tokens.flatten(1, 2)
         past = torch.cat((past_actions, past_mask.unsqueeze(-1)), dim=-1)
         goal_query = self.goal_in(goal).unsqueeze(1)
         history_for_goal = self.goal_history_norm(history_tokens)
@@ -184,8 +202,8 @@ class ActionDiT(nn.Module):
                     query, context, context, need_weights=False)[0]
                 action_tokens = action_tokens + torch.tanh(
                     self.future_cross_gates[layer_index]) * cross
-                tokens = torch.cat((tokens[:, :self.context_tokens], action_tokens),
-                                   dim=1)
+            tokens = torch.cat((tokens[:, :self.context_tokens], action_tokens),
+                               dim=1)
         action = tokens[:, -self.action_horizon:]
         shift, scale = self.final_modulation(condition).chunk(2, dim=-1)
         action = self.final_norm(action) * (1 + scale[:, None]) + shift[:, None]
@@ -238,19 +256,33 @@ class JointHistoryWorldActionDiT(nn.Module):
             history, timestep, depth=self.shared_world_depth)
 
     @torch.no_grad()
-    def future_features_from_noise(self, history: torch.Tensor,
-                                   future_noise: torch.Tensor) -> torch.Tensor:
-        """Build deployment-available future tokens from history and noise."""
-        sigma = torch.ones(
-            len(history), device=history.device, dtype=future_noise.dtype)
-        shared = self.encode_history(history)
-        velocity = self.world(
-            history, future_noise, sigma, history_tokens=shared)
-        predicted_future = future_noise - velocity
-        zero = torch.zeros(
-            len(history), device=history.device, dtype=future_noise.dtype)
-        return self.world.encode_future_features(
-            history, predicted_future, zero, depth=self.world.depth)
+    def future_features_autoregressive(
+            self, history: torch.Tensor,
+            future_noise: torch.Tensor) -> torch.Tensor:
+        """Predict t+1:t+3 autoregressively and concatenate their tokens."""
+        if future_noise.ndim != 5 or tuple(future_noise.shape[2:]) != (4, 27, 5):
+            raise ValueError(
+                "Expected future noise [B,H,4,27,5], got "
+                f"{tuple(future_noise.shape)}")
+        if future_noise.shape[1] != 3:
+            raise ValueError("Future-to-Action uses exactly three future frames")
+        rolling_history = history
+        outputs = []
+        for horizon in range(3):
+            noise = future_noise[:, horizon]
+            sigma = torch.ones(
+                len(history), device=history.device, dtype=noise.dtype)
+            shared = self.encode_history(rolling_history)
+            velocity = self.world(
+                rolling_history, noise, sigma, history_tokens=shared)
+            predicted = noise - velocity
+            zero = torch.zeros(
+                len(history), device=history.device, dtype=noise.dtype)
+            outputs.append(self.world.encode_future_features(
+                rolling_history, predicted, zero, depth=self.world.depth))
+            rolling_history = torch.cat(
+                (rolling_history[:, 1:], predicted[:, None]), dim=1)
+        return torch.cat(outputs, dim=1)
 
     def forward(self, history: torch.Tensor, noisy_future: torch.Tensor,
                 future_timestep: torch.Tensor, noisy_action: torch.Tensor,
