@@ -670,8 +670,54 @@ def _sha_or_none(path):
     return file_sha256(path) if path is not None and Path(path).is_file() else None
 
 
+class History3V2WindowDataset(V2WindowDataset):
+    """Expose causal ``[t-2,t-1,t]`` latents to an Action-only policy.
+
+    Windows at a scene boundary without three real observations are excluded;
+    no zero latent is presented as a real LiDAR scan.
+    """
+
+    _NUMPY_ROWS = (
+        "shard", "rows", "past_rows", "past_valid", "clearance",
+        "turn_score", "scene_id", "seeds", "source_indices")
+    _TORCH_ROWS = ("goal", "proprio", "world_state")
+
+    def __init__(self, *args, limit=None, random_seed=42, **kwargs):
+        super().__init__(
+            *args, limit=None, random_seed=random_seed, **kwargs)
+        if self.past_rows is None:
+            raise ValueError(
+                "history-three Action training requires an index with past_rows")
+        if not np.array_equal(self.past_rows[:, -1], self.rows[:, 0]):
+            raise RuntimeError("history/current latent alignment mismatch")
+        selection = np.flatnonzero((self.past_rows >= 0).all(axis=1))
+        if limit is not None and len(selection) > int(limit):
+            rng = np.random.default_rng(int(random_seed))
+            selection = np.sort(rng.choice(selection, int(limit), replace=False))
+        if not len(selection):
+            raise RuntimeError(f"No complete history-three windows in {self.split}")
+        tensor_selection = torch.from_numpy(selection)
+        for name in self._NUMPY_ROWS:
+            setattr(self, name, getattr(self, name)[selection])
+        for name in self._TORCH_ROWS:
+            setattr(self, name, getattr(self, name)[tensor_selection])
+
+    def __getitem__(self, index):
+        values = list(super().__getitem__(index))
+        shard_id = int(self.shard[index])
+        history_rows = np.asarray(self.past_rows[index], dtype=np.int64)
+        _, latent = self._handles(shard_id)
+        history = np.asarray(latent[history_rows], dtype=np.float32).copy()
+        values[0] = torch.from_numpy(history)
+        return tuple(values)
+
+
 def _v2_dataset(split, args, overfit=False, samples=None, limit=None):
-    return V2WindowDataset(
+    dataset_type = (
+        History3V2WindowDataset
+        if int(getattr(args, "observation_history_frames", 1)) == 3
+        else V2WindowDataset)
+    return dataset_type(
         split, args.dataset_root, args.latent_root, args.index_root,
         overfit=overfit, samples_per_seed=samples, random_seed=args.seed,
         limit=limit, all_future_targets=args.command == "train-joint",
@@ -872,7 +918,8 @@ def _make_v2_model(args):
     if args.command == "train-action":
         return ActionOnlyModel(
             args.action_width, args.action_depth, args.action_heads,
-            args.action_ffn_width, past_horizon=args.past_horizon), -1
+            args.action_ffn_width, past_horizon=args.past_horizon,
+            observation_history_frames=args.observation_history_frames), -1
     world_payload = torch.load(
         args.world_checkpoint, map_location="cpu", weights_only=False)
     world_gate = world_payload.get("validation", {}).get("gate", {})
@@ -1114,6 +1161,8 @@ def _checkpoint_v2(path, model, optimizer, step, stats, args, world_step,
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
             "past_horizon": args.past_horizon,
+            "observation_history_frames": int(
+                getattr(args, "observation_history_frames", 1)),
             "future_attention_layers": (
                 args.future_attention_layers if is_joint else 0),
             "world_horizon": 1 if is_joint else 0,
@@ -1165,6 +1214,8 @@ def _candidate_policy_v2(path, model, step, stats, args, validation):
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
             "past_horizon": args.past_horizon,
+            "observation_history_frames": int(
+                getattr(args, "observation_history_frames", 1)),
         },
         "provenance": {
             "dataset_manifest_sha256": file_sha256(args.dataset_root/"manifest.json"),
@@ -1354,6 +1405,7 @@ def train_v2(args):
             "reset_stats": bool(args.reset_stats),
             "world_size": world_size,
             "global_batch_size": args.micro_batch_size*args.grad_accumulation*world_size,
+            "observation_history_frames": args.observation_history_frames,
             "precision": args.precision, "semantics": coordinate_semantics(),
             "action_validation_samples": len(val_data),
             "world_validation_samples": len(world_val_data),
@@ -1862,7 +1914,9 @@ def evaluate_v2(args):
         model = ActionOnlyModel(
             architecture["width"], architecture["depth"], architecture["heads"],
             architecture["ffn_width"],
-            architecture.get("past_horizon", 10))
+            architecture.get("past_horizon", 10),
+            observation_history_frames=int(
+                architecture.get("observation_history_frames", 1)))
         selected = {key: value for key, value in payload["model"].items()
                     if key.startswith(("observation.", "action_expert."))}
         position_key = "action_expert.action_position"
@@ -1875,6 +1929,8 @@ def evaluate_v2(args):
             raise ValueError(f"action checkpoint mismatch: {incompatible}")
     # The dataset must expose the same history length as the checkpoint.
     args.past_horizon = int(architecture.get("past_horizon", 10))
+    args.observation_history_frames = int(
+        architecture.get("observation_history_frames", 1))
     model.to(device).eval()
     dataset = _v2_dataset(args.split, args, limit=args.eval_samples)
     summary = evaluate_actions_v2(model, dataset, payload["stats"], args, device)
@@ -1899,6 +1955,10 @@ def _v2_common(parser, past_horizon: int = 30):
         "--past-horizon", type=int, default=int(past_horizon),
         help=("Number of previously executed low-level actions exposed to the "
               "Action Expert; must be a multiple of the 10-step chunk."))
+    parser.add_argument(
+        "--observation-history-frames", type=int, choices=(1, 3), default=1,
+        help=("Observed VAE latents exposed to the Action Expert. One keeps "
+              "the original policy; three uses causal [t-2,t-1,t] latents."))
     parser.add_argument("--future-attention-layers", type=int, default=2)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     parser.add_argument("--eval-batch-size", type=int, default=64)

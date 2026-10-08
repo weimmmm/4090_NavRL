@@ -64,26 +64,60 @@ def polar_position_encoding(height: int, width: int, channels: int) -> torch.Ten
 
 
 class LiDARObservationEncoder(nn.Module):
-    """Encode the clean current ``[4,27,5]`` latent into 135 causal tokens."""
+    """Encode one or more clean LiDAR latents into causal spatial tokens.
 
-    def __init__(self, width: int = 512):
+    The original Action Expert consumes one current latent and therefore keeps
+    its exact checkpoint layout when ``history_frames=1``.  The history-three
+    ablation applies the same circular CNN to each observed frame, adds a
+    learned temporal position, and concatenates the three 135-token grids.  It
+    never receives a future or target latent.
+    """
+
+    def __init__(self, width: int = 512, history_frames: int = 1):
         super().__init__()
+        self.history_frames = int(history_frames)
+        if self.history_frames < 1:
+            raise ValueError("history_frames must be positive")
         self.net = nn.Sequential(
             CircularConv2d(4, 128, 3), nn.SiLU(),
             CircularConv2d(128, 256, 3), nn.SiLU(),
             CircularConv2d(256, width, 3),
         )
         self.norm = nn.LayerNorm(width)
+        if self.history_frames > 1:
+            self.frame_position = nn.Parameter(
+                torch.zeros(1, self.history_frames, 1, width))
+            nn.init.normal_(self.frame_position, std=0.02)
+        else:
+            self.register_parameter("frame_position", None)
         self.register_buffer(
             "polar_position", polar_position_encoding(27, 5, width),
             persistent=False)
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        if latent.ndim != 4 or tuple(latent.shape[1:]) != (4, 27, 5):
-            raise ValueError(f"Expected current latent [B,4,27,5], got {tuple(latent.shape)}")
-        feature = self.net(latent)
+        expected = (4, 27, 5)
+        if self.history_frames == 1:
+            if latent.ndim != 4 or tuple(latent.shape[1:]) != expected:
+                raise ValueError(
+                    f"Expected current latent [B,4,27,5], got {tuple(latent.shape)}")
+            feature = self.net(latent)
+            tokens = self.norm(feature.flatten(2).transpose(1, 2))
+            return tokens + 0.10 * self.polar_position.to(
+                device=tokens.device, dtype=tokens.dtype)
+
+        expected_history = (self.history_frames,) + expected
+        if latent.ndim != 5 or tuple(latent.shape[1:]) != expected_history:
+            raise ValueError(
+                f"Expected history latent [B,{self.history_frames},4,27,5], "
+                f"got {tuple(latent.shape)}")
+        batch = len(latent)
+        feature = self.net(latent.flatten(0, 1))
         tokens = self.norm(feature.flatten(2).transpose(1, 2))
-        return tokens + 0.10 * self.polar_position.to(dtype=tokens.dtype)
+        tokens = tokens.reshape(batch, self.history_frames, 27 * 5, -1)
+        spatial = self.polar_position.to(
+            device=tokens.device, dtype=tokens.dtype)[:, None]
+        temporal = self.frame_position.to(dtype=tokens.dtype)
+        return (tokens + 0.10 * spatial + temporal).flatten(1, 2)
 
 
 class FutureTokenAdapter(nn.Module):
@@ -600,9 +634,11 @@ class ActionOnlyModel(nn.Module):
     """
 
     def __init__(self, width: int = 512, depth: int = 8, heads: int = 8,
-                 ffn_width: int = 2048, past_horizon: int = 30):
+                 ffn_width: int = 2048, past_horizon: int = 30,
+                 observation_history_frames: int = 1):
         super().__init__()
-        self.observation = LiDARObservationEncoder(width)
+        self.observation = LiDARObservationEncoder(
+            width, history_frames=observation_history_frames)
         self.action_expert = ActionFlowExpert(
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
             past_horizon=past_horizon, future_attention_layers=0)

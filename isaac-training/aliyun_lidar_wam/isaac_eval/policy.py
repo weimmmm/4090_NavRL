@@ -84,9 +84,11 @@ class DeploymentActionModel(nn.Module):
 
     def __init__(self, width: int = 512, depth: int = 8, heads: int = 8,
                  ffn_width: int = 2048, past_horizon: int = EXECUTION_HORIZON,
-                 horizon: int = EXECUTION_HORIZON):
+                 horizon: int = EXECUTION_HORIZON,
+                 observation_history_frames: int = 1):
         super().__init__()
-        self.observation = LiDARObservationEncoder(width)
+        self.observation = LiDARObservationEncoder(
+            width, history_frames=observation_history_frames)
         self.action_expert = ActionFlowExpert(
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
             future_attention_layers=0, past_horizon=int(past_horizon),
@@ -212,7 +214,9 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
         model = DeploymentActionModel(
             width, depth, heads, ffn_width,
             past_horizon=int(architecture.get("past_horizon", 30)),
-            horizon=horizon)
+            horizon=horizon,
+            observation_history_frames=int(
+                architecture.get("observation_history_frames", 1)))
         model.load_state_dict(payload["model"], strict=True)
         model.to(device=device, dtype=torch.float32).eval()
         semantics = dict(payload.get("semantics") or coordinate_semantics())
@@ -221,6 +225,8 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
         semantics.update({
             "action_horizon": horizon,
             "execution_horizon": EXECUTION_HORIZON,
+            "history_frames": int(
+                architecture.get("observation_history_frames", 1)),
             "action_limit_mps": float(semantics.get("action_limit_mps", 2.0)),
         })
         return model, payload.get("stats", {}), int(payload.get("step", -1)), semantics
@@ -256,7 +262,9 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
     else:
         model = DeploymentActionModel(
             width, depth, heads, ffn_width, past_horizon=past_horizon,
-            horizon=int(architecture.get("action_horizon", ACTION_HORIZON)))
+            horizon=int(architecture.get("action_horizon", ACTION_HORIZON)),
+            observation_history_frames=int(
+                architecture.get("observation_history_frames", 1)))
         if payload.get("format") != COMPACT_FORMAT:
             state = _policy_state_dict(state)
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -479,9 +487,17 @@ def sample_actions(model: nn.Module, latent: torch.Tensor,
     goal = normalize_condition(goal, stats, "goal")
     proprio = normalize_condition(proprio, stats, "proprio")
     past = action_to_flow(past, stats) * past_mask.unsqueeze(-1)
-    observation = (model.encode_current(latent)
-                   if isinstance(model, JointWorldActionModel)
-                   else model.observation(latent))
+    if isinstance(model, JointWorldActionModel):
+        observation = model.encode_current(latent)
+    else:
+        history_frames = int(getattr(model.observation, "history_frames", 1))
+        if history_frames > 1:
+            if history is None:
+                raise ValueError(
+                    "history latents are required by history-three Action Expert")
+            observation = model.observation(history)
+        else:
+            observation = model.observation(latent)
     sigmas = torch.linspace(1, 0, steps + 1, device=latent.device, dtype=latent.dtype)
     joint = isinstance(model, JointWorldActionModel)
     if joint:
@@ -540,8 +556,12 @@ class RecedingHorizonPolicy:
          self.semantics) = load_deployment_policy(
             checkpoint, device, allow_legacy_body=allow_legacy_body)
         self.history_joint = isinstance(self.model, JointHistoryWorldActionDiT)
-        self.history_required = self.history_joint or isinstance(
-            self.model, FutureConditionedActionModel)
+        self.history_required = (
+            self.history_joint
+            or isinstance(self.model, FutureConditionedActionModel)
+            or int(getattr(
+                getattr(self.model, "observation", None),
+                "history_frames", 1)) > 1)
         self.execution_horizon = EXECUTION_HORIZON
         self.past_horizon = int(
             self.model.action.past_horizon
@@ -627,6 +647,7 @@ class RecedingHorizonPolicy:
         started = time.perf_counter()
         image = lidar_range_image(env)[indices]
         latent = self.vae.encode(image).latent_dist.mode() * self.scale
+        state = env.drone.get_state(env_frame=False)[indices, 0, :13]
         if self.history_required:
             valid = self.history_valid[indices]
             if valid.any():
@@ -636,13 +657,12 @@ class RecedingHorizonPolicy:
                     latent[valid, None]), dim=1)
             if (~valid).any():
                 invalid_indices = indices[~valid]
-                self.history_latents[invalid_indices] = latent[~valid, None].expand(
-                    -1, 3, -1, -1, -1)
+                self.history_latents[invalid_indices] = latent[
+                    ~valid, None].expand(-1, 3, -1, -1, -1)
             history = self.history_latents[indices]
             self.history_valid[indices] = True
         else:
             history = None
-        state = env.drone.get_state(env_frame=False)[indices, 0, :13]
         target = env.target_pos[indices, 0]
         if self.condition_frame == CONDITION_FRAME:
             direction = env.target_dir[indices, 0]

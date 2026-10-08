@@ -144,6 +144,9 @@ def main():
     parser.add_argument("--gpus", type=int, nargs="+", default=(1, 2))
     parser.add_argument("--routes", type=int, default=128)
     parser.add_argument("--flow-steps", type=int, default=10)
+    parser.add_argument(
+        "--min-step", type=int, default=0,
+        help="Ignore queued checkpoints earlier than this optimizer step.")
     parser.add_argument("--final-step", type=int, required=True)
     parser.add_argument("--poll-seconds", type=float, default=20.0)
     parser.add_argument("--max-used-mib", type=int, default=2000)
@@ -158,6 +161,8 @@ def main():
         pending = []
         for checkpoint in snapshots:
             step = int(checkpoint.stem.split("_")[-1])
+            if step < args.min_step:
+                continue
             summary = args.output / f"step_{step:06d}" / "summary_128.json"
             if not summary.exists():
                 pending.append((step, checkpoint))

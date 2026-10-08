@@ -1,7 +1,8 @@
 import torch
 
 from lidar_wam.models.action_expert import (
-    ActionOnlyModel, FutureChangeAdapter, FutureConditionedActionModel)
+    ActionOnlyModel, FutureChangeAdapter, FutureConditionedActionModel,
+    LiDARObservationEncoder)
 from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 
 
@@ -21,6 +22,29 @@ def test_future_change_adapter_shape():
     adapter = FutureChangeAdapter(width=32)
     tokens = adapter(torch.randn(2, 4, 27, 5), torch.randn(2, 4, 27, 5))
     assert tokens.shape == (2, 135, 32)
+
+
+def test_history_three_observation_encoder_shape_and_order():
+    torch.manual_seed(3)
+    encoder = LiDARObservationEncoder(width=32, history_frames=3)
+    history = torch.randn(2, 3, 4, 27, 5)
+    tokens = encoder(history)
+    swapped = encoder(history[:, [1, 0, 2]])
+    assert tokens.shape == (2, 405, 32)
+    assert not torch.equal(tokens, swapped)
+
+
+def test_history_three_action_only_model_keeps_other_inputs_unchanged():
+    model = ActionOnlyModel(
+        width=32, depth=2, heads=4, ffn_width=64, past_horizon=30,
+        observation_history_frames=3)
+    inputs = _inputs()
+    velocity, world = model(
+        inputs["noisy_action"], inputs["action_timestep"],
+        torch.randn(2, 3, 4, 27, 5), inputs["goal"], inputs["proprio"],
+        inputs["past_actions"], inputs["past_mask"])
+    assert velocity.shape == (2, 10, 3)
+    assert world is None
 
 
 def test_zero_gate_exactly_preserves_action_checkpoint():
