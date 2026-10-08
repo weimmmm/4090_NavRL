@@ -75,21 +75,59 @@ def _sample_boundary_points(num_envs: int, generator: torch.Generator):
     return (points * masks[sides].unsqueeze(1) + shifts[sides].unsqueeze(1)), sides
 
 
+def _sample_points_on_sides(sides: torch.Tensor, generator: torch.Generator):
+    """Sample boundary positions for an explicitly selected side per route."""
+    masks = torch.tensor([[1., 0., 1.], [1., 0., 1.],
+                          [0., 1., 1.], [0., 1., 1.]])
+    shifts = torch.tensor([[0., 24., 0.], [0., -24., 0.],
+                           [24., 0., 0.], [-24., 0., 0.]])
+    points = 48. * torch.rand((len(sides), 1, 3), generator=generator) - 24.
+    points[:, 0, 2] = .5 + 2. * torch.rand(len(sides), generator=generator)
+    return points * masks[sides].unsqueeze(1) + shifts[sides].unsqueeze(1)
+
+
 def generate_environment(num_envs: int = 256, terrain_seed: int = 18,
                          route_seed: int = 18, static_obstacles: int = 350,
-                         max_steps: int = 2200) -> dict[str, Any]:
+                         max_steps: int = 2200,
+                         opposite_fraction: float | None = None) -> dict[str, Any]:
     """Create a legacy v1 route/recipe environment."""
     if num_envs <= 0 or static_obstacles < 0 or max_steps <= 0:
         raise ValueError("invalid evaluation environment dimensions")
     generator = torch.Generator(device="cpu").manual_seed(route_seed)
-    targets, target_sides = _sample_boundary_points(num_envs, generator)
     starts, start_sides = _sample_boundary_points(num_envs, generator)
+    if opposite_fraction is None:
+        targets, target_sides = _sample_boundary_points(num_envs, generator)
+        route_sampling = "independent_uniform_four_edges"
+    else:
+        if not 0.0 <= float(opposite_fraction) <= 1.0:
+            raise ValueError("opposite_fraction must be in [0,1]")
+        opposite_count = int(round(num_envs * float(opposite_fraction)))
+        remaining = num_envs - opposite_count
+        same_count = remaining // 2
+        relation = torch.empty(num_envs, dtype=torch.int64)
+        relation[:opposite_count] = 0
+        relation[opposite_count:opposite_count + same_count] = 1
+        relation[opposite_count + same_count:] = 2
+        relation = relation[torch.randperm(num_envs, generator=generator)]
+        target_sides = torch.empty_like(start_sides)
+        target_sides[relation == 0] = start_sides[relation == 0] ^ 1
+        target_sides[relation == 1] = start_sides[relation == 1]
+        adjacent = relation == 2
+        # Each side has two adjacent choices: the pair on the other axis.
+        adjacent_choice = torch.randint(
+            0, 2, (int(adjacent.sum()),), generator=generator)
+        target_sides[adjacent] = (
+            2 * (1 - (start_sides[adjacent] // 2)) + adjacent_choice)
+        targets = _sample_points_on_sides(target_sides, generator)
+        route_sampling = (
+            f"balanced_edges_opposite_{opposite_count}_same_{same_count}_"
+            f"adjacent_{remaining - same_count}")
     return {
         "format": ENVIRONMENT_FORMAT_V1, "num_envs": int(num_envs),
         "terrain_seed": int(terrain_seed), "route_seed": int(route_seed),
         "static_obstacles": int(static_obstacles), "dynamic_obstacles": 0,
         "max_steps": int(max_steps), "terrain": dict(DEFAULT_TERRAIN_CONFIG),
-        "route_sampling": "independent_uniform_four_edges",
+        "route_sampling": route_sampling,
         "start_positions": starts.float(), "target_positions": targets.float(),
         "start_sides": start_sides, "target_sides": target_sides,
     }

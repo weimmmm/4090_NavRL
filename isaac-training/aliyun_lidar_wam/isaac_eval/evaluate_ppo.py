@@ -35,6 +35,18 @@ def parse_args():
                         help="Defaults to one episode per fixed environment.")
     parser.add_argument("--route-start", type=int, default=0)
     parser.add_argument("--route-limit", type=int)
+    parser.add_argument(
+        "--max-steps", type=int, default=2500,
+        help="Evaluation horizon. Overrides the value stored in the environment file.")
+    parser.add_argument(
+        "--goal-radius", type=float, default=0.5,
+        help="Entering this radius starts zero-velocity braking.")
+    parser.add_argument(
+        "--settle-speed", type=float, default=0.1,
+        help="Speed in m/s below which the drone is considered nearly stopped.")
+    parser.add_argument(
+        "--settle-steps", type=int, default=10,
+        help="Consecutive low-speed simulation steps required for reach_goal.")
     parser.add_argument("--render", action="store_true")
     args = parser.parse_args()
     for name in ("checkpoint", "environment"):
@@ -47,6 +59,14 @@ def parse_args():
         parser.error("--episodes must be positive")
     if args.route_start < 0 or (args.route_limit is not None and args.route_limit <= 0):
         parser.error("route start/limit is invalid")
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be positive")
+    if args.goal_radius <= 0:
+        parser.error("--goal-radius must be positive")
+    if args.settle_speed <= 0:
+        parser.error("--settle-speed must be positive")
+    if args.settle_steps <= 0:
+        parser.error("--settle-steps must be positive")
     return args
 
 
@@ -64,6 +84,7 @@ def main():
     from isaac_eval.environment_file import load_environment, slice_environment
 
     fixed = load_environment(args.environment)
+    source_max_steps = int(fixed["max_steps"])
     source_count = int(fixed["num_envs"])
     if args.route_start or args.route_limit is not None:
         route_limit = (source_count-args.route_start
@@ -72,6 +93,10 @@ def main():
             raise ValueError("requested route slice exceeds environment route count")
         fixed = slice_environment(
             fixed, range(args.route_start, args.route_start+route_limit))
+    # Keep the fixed geometry/routes, but allow evaluation to use a longer
+    # horizon than the value embedded when the environment was created.
+    fixed = dict(fixed)
+    fixed["max_steps"] = int(args.max_steps)
     num_envs = int(fixed["num_envs"])
     episodes = args.episodes or num_envs
     terrain_seed = int(fixed["terrain_seed"])
@@ -143,6 +168,14 @@ def main():
         quota = torch.full((num_envs,), per_env, device=device, dtype=torch.long)
         quota[:remainder] += 1
         collected = torch.zeros_like(quota)
+        braking = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        settle_streak = torch.zeros(num_envs, device=device, dtype=torch.long)
+        brake_attempts = torch.zeros(num_envs, device=device, dtype=torch.long)
+        brake_steps = torch.zeros(num_envs, device=device, dtype=torch.long)
+        brake_entry_position = torch.zeros(
+            num_envs, 3, device=device, dtype=previous_position.dtype)
+        brake_max_drift = torch.zeros(
+            num_envs, device=device, dtype=previous_position.dtype)
         inference_seconds = []
         rows = []
 
@@ -150,6 +183,22 @@ def main():
             while len(rows) < episodes:
                 tick = time.perf_counter()
                 policy(td)
+                # Enter a latched braking state inside the goal sphere.  PPO
+                # remains disabled until the drone has actually settled.  If
+                # it settles outside the sphere, release the latch and let PPO
+                # approach again; merely passing through the goal is not a
+                # successful episode.
+                distance_before_step = (
+                    env.target_pos[:, 0] - env.drone.pos[:, 0]).norm(dim=-1)
+                start_braking = (~braking) & (
+                    distance_before_step < args.goal_radius)
+                if start_braking.any():
+                    braking[start_braking] = True
+                    brake_attempts[start_braking] += 1
+                    brake_entry_position[start_braking] = env.drone.pos[
+                        start_braking, 0]
+                if braking.any():
+                    td["agents", "action"][braking] = 0.0
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 inference_seconds.append(time.perf_counter() - tick)
@@ -163,9 +212,25 @@ def main():
                     "agents", "observation", "lidar"].reshape(num_envs, -1).amin(-1)
                 min_clearance = torch.minimum(min_clearance, clearance)
                 collision = td["stats", "collision"].reshape(-1).bool()
-                reach_goal = td["stats", "reach_goal"].reshape(-1).bool()
                 truncated = td["truncated"].reshape(-1).bool()
                 out_of_bounds = (position[:, 2] < 0.2) | (position[:, 2] > 4.0)
+                speed = env.drone.vel_w[:, 0, :3].norm(dim=-1)
+                goal_distance = (env.target_pos[:, 0] - position).norm(dim=-1)
+                if braking.any():
+                    brake_steps[braking] += 1
+                    drift = (position - brake_entry_position).norm(dim=-1)
+                    brake_max_drift[braking] = torch.maximum(
+                        brake_max_drift[braking], drift[braking])
+                low_speed = braking & (speed < args.settle_speed)
+                settle_streak = torch.where(
+                    low_speed, settle_streak + 1,
+                    torch.zeros_like(settle_streak))
+                settled = braking & (settle_streak >= args.settle_steps)
+                reach_goal = settled & (goal_distance < args.goal_radius)
+                settled_outside = settled & ~reach_goal
+                if settled_outside.any():
+                    braking[settled_outside] = False
+                    settle_streak[settled_outside] = 0
                 done = collision | reach_goal | truncated | out_of_bounds
 
                 for index in done.nonzero().flatten().tolist():
@@ -190,6 +255,11 @@ def main():
                         "duration_s": float(episode_steps[index]) * float(cfg.sim.dt),
                         "path_length_m": float(path_length[index]),
                         "min_clearance_m": float(min_clearance[index]),
+                        "final_goal_distance_m": float(goal_distance[index]),
+                        "final_speed_mps": float(speed[index]),
+                        "goal_stop_attempts": int(brake_attempts[index]),
+                        "goal_stop_steps": int(brake_steps[index]),
+                        "goal_stop_max_drift_m": float(brake_max_drift[index]),
                         "start_position": fixed["start_positions"][index, 0].tolist(),
                         "target_position": fixed["target_positions"][index, 0].tolist(),
                         "start_side": int(fixed["start_sides"][index]),
@@ -208,6 +278,12 @@ def main():
                     episode_steps[done] = 0
                     min_clearance[done] = float(env.lidar_range)
                     previous_position[done] = env.drone.pos[done, 0]
+                    braking[done] = False
+                    settle_streak[done] = 0
+                    brake_attempts[done] = 0
+                    brake_steps[done] = 0
+                    brake_entry_position[done] = 0
+                    brake_max_drift[done] = 0
 
         successful = [row for row in rows if row["termination_reason"] == "reach_goal"]
         latency = torch.tensor(inference_seconds)
@@ -228,6 +304,11 @@ def main():
             "static_obstacles": int(fixed["static_obstacles"]),
             "dynamic_obstacles": 0,
             "max_steps": int(fixed["max_steps"]),
+            "source_environment_max_steps": source_max_steps,
+            "goal_radius_m": float(args.goal_radius),
+            "goal_terminal_control": "zero_velocity_until_settled_inside_goal",
+            "settle_speed_mps": float(args.settle_speed),
+            "settle_consecutive_steps": int(args.settle_steps),
             "success_rate": len(successful) / max(len(rows), 1),
             "collision_rate": sum(r["termination_reason"] == "collision" for r in rows) / max(len(rows), 1),
             "out_of_bounds_rate": sum(r["termination_reason"] == "out_of_bounds" for r in rows) / max(len(rows), 1),
@@ -235,6 +316,15 @@ def main():
             "mean_episode_steps": mean(rows, "steps"),
             "mean_path_length_m": mean(rows, "path_length_m"),
             "mean_min_clearance_m": mean(rows, "min_clearance_m"),
+            "successful_mean_stop_drift_m": mean(
+                successful, "goal_stop_max_drift_m"),
+            "successful_max_stop_drift_m": max(
+                (float(row["goal_stop_max_drift_m"]) for row in successful),
+                default=0.0),
+            "successful_mean_final_speed_mps": mean(
+                successful, "final_speed_mps"),
+            "successful_mean_final_goal_distance_m": mean(
+                successful, "final_goal_distance_m"),
             "wall_time_s": time.perf_counter() - started,
             "inference_latency": {
                 "calls": len(inference_seconds),

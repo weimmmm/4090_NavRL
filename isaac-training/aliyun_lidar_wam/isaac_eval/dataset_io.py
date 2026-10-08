@@ -110,6 +110,82 @@ class TrajectoryWriter:
             self.frames[name][begin:end] = np.asarray(values, dtype=self.frames[name].dtype)
         self.count = end
 
+    def retain_scenes(self, scene_ids, *, token_prefix: str,
+                      metadata_updates: dict[str, Any] | None = None) -> dict[int, int]:
+        """Compact the open file to complete accepted scenes only.
+
+        Collection is streamed because buffering 512 full trajectories in RAM
+        is prohibitively expensive.  Consequently a collision can only be
+        discarded after its episode terminates.  This method performs that
+        discard in-place, renumbers the retained scenes contiguously, and
+        rebuilds all token links before the file is validated/published.
+        """
+        if self.file is None:
+            raise RuntimeError("cannot compact a closed trajectory writer")
+        keep = np.asarray(sorted({int(x) for x in scene_ids}), dtype=np.int64)
+        if not len(keep):
+            raise ValueError("cannot publish a shard with zero accepted scenes")
+        old_scene_ids = self.frames["scene_id"][:].astype(np.int64)
+        maximum = int(old_scene_ids.max(initial=-1))
+        if keep.min() < 0 or keep.max() > maximum:
+            raise ValueError("retained scene id is outside the collected range")
+        remap = np.full(maximum + 1, -1, dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        row_indices = np.flatnonzero(remap[old_scene_ids] >= 0)
+        new_count = int(len(row_indices))
+
+        # Only operate on canonical datasets. Root entries and action_sequence
+        # are HDF5 hard links to these same objects and follow automatically.
+        canonical = tuple(ARRAY_FIELDS) + tuple(SCALAR_FIELDS) + tuple(STRING_FIELDS)
+        block = 4096
+        for name in canonical:
+            dataset = self.frames[name]
+            write = 0
+            for begin in range(0, new_count, block):
+                selected = row_indices[begin:begin + block]
+                values = dataset[selected]
+                dataset[write:write + len(values)] = values
+                write += len(values)
+            dataset.resize(new_count, axis=0)
+
+        compact_scene_ids = remap[old_scene_ids[row_indices]].astype(np.int32)
+        self.frames["scene_id"][:] = compact_scene_ids
+        self.frames["env_id"][:] = compact_scene_ids
+        # Rebuild tokens and links after renumbering. Frames remain ordered
+        # within each scene because row_indices is increasing.
+        tokens = np.empty(new_count, dtype=self.frames["token"].dtype)
+        scene_tokens = np.empty(new_count, dtype=self.frames["scene_token"].dtype)
+        previous = np.empty(new_count, dtype=self.frames["prev_token"].dtype)
+        following = np.empty(new_count, dtype=self.frames["next_token"].dtype)
+        for scene_id in range(len(keep)):
+            rows = np.flatnonzero(compact_scene_ids == scene_id)
+            frame_indices = self.frames["frame_index"][rows].astype(np.int64)
+            values = [f"{token_prefix}-e{scene_id:04d}-f{frame:06d}"
+                      for frame in frame_indices]
+            encoded = np.asarray(values, dtype=tokens.dtype)
+            tokens[rows] = encoded
+            scene_tokens[rows] = np.asarray(
+                [f"{token_prefix}-e{scene_id:04d}"] * len(rows),
+                dtype=scene_tokens.dtype)
+            previous[rows] = np.asarray([""] + values[:-1], dtype=previous.dtype)
+            following[rows] = np.asarray(values[1:] + [""], dtype=following.dtype)
+        self.frames["token"][:] = tokens
+        self.frames["scene_token"][:] = scene_tokens
+        self.frames["prev_token"][:] = previous
+        self.frames["next_token"][:] = following
+
+        metadata = json.loads(self.file.attrs["metadata_json"])
+        metadata.update(metadata_updates or {})
+        metadata["source_num_envs"] = int(maximum + 1)
+        metadata["num_envs"] = int(len(keep))
+        metadata["retained_source_env_ids"] = keep.tolist()
+        self.file.attrs["metadata_json"] = json.dumps(metadata, sort_keys=True)
+        self.count = new_count
+        self.last_row.clear()
+        self.last_token.clear()
+        self.file.flush()
+        return {int(source): int(new) for new, source in enumerate(keep)}
+
     def close(self, summary: dict[str, Any] | None = None) -> None:
         if self.file is None:
             return

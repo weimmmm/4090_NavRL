@@ -52,6 +52,12 @@ def parse_args():
     parser.add_argument("--static-obstacles", type=int,
                         help="Must match --environment when one is used.")
     parser.add_argument("--flow-steps", type=int, default=10)
+    parser.add_argument("--goal-radius", type=float, default=0.5,
+                        help="Enter braking when within this distance (m).")
+    parser.add_argument("--settle-speed", type=float, default=0.1,
+                        help="Maximum speed for a settled goal stop (m/s).")
+    parser.add_argument("--settle-steps", type=int, default=10,
+                        help="Consecutive low-speed steps required for success.")
     parser.add_argument(
         "--allow-legacy-body", action="store_true",
         help="Allow a legacy checkpoint with implicit body-frame conditions.")
@@ -68,6 +74,8 @@ def parse_args():
         args.environment = None
     if args.flow_steps <= 0:
         parser.error("--flow-steps must be positive")
+    if args.goal_radius <= 0 or args.settle_speed <= 0 or args.settle_steps <= 0:
+        parser.error("goal-radius, settle-speed, and settle-steps must be positive")
     if args.route_limit is not None and args.route_limit <= 0:
         parser.error("--route-limit must be positive")
     if args.route_start < 0:
@@ -158,6 +166,10 @@ def summarize(episodes, latency, args, checkpoint_step, elapsed):
         "generated_horizon_steps": getattr(args, "generated_horizon_steps", 30),
         "executed_head": getattr(args, "executed_head", "flow30"),
         "flow_steps": args.flow_steps,
+        "goal_radius_m": float(args.goal_radius),
+        "goal_terminal_control": "zero_velocity_until_settled_inside_goal",
+        "settle_speed_mps": float(args.settle_speed),
+        "settle_consecutive_steps": int(args.settle_steps),
         "condition_frame": args.condition_frame,
         "checkpoint_semantics": args.checkpoint_semantics,
         "route_limit": args.route_limit,
@@ -303,12 +315,35 @@ def main():
             (args.num_envs,), episodes_per_env, device=device, dtype=torch.long)
         episode_quota[:remainder] += 1
         collected_per_env = torch.zeros_like(episode_quota)
+        braking = torch.zeros(args.num_envs, device=device, dtype=torch.bool)
+        settle_streak = torch.zeros(args.num_envs, device=device, dtype=torch.long)
+        goal_stop_attempts = torch.zeros(args.num_envs, device=device, dtype=torch.long)
+        goal_stop_entry = torch.zeros(
+            args.num_envs, 3, device=device, dtype=previous_position.dtype)
+        goal_stop_max_drift = torch.zeros(args.num_envs, device=device)
         rows = []
 
         with torch.no_grad():
             while len(rows) < args.episodes:
                 replan_mask = policy.action_index >= policy.execution_horizon
+                distance_before_step = (
+                    env.target_pos[:, 0] - env.drone.pos[:, 0]).norm(dim=-1)
+                start_braking = (~braking) & (
+                    distance_before_step < args.goal_radius)
+                if start_braking.any():
+                    braking[start_braking] = True
+                    settle_streak[start_braking] = 0
+                    goal_stop_attempts[start_braking] += 1
+                    goal_stop_entry[start_braking] = env.drone.pos[start_braking, 0]
                 policy.act(td, env)
+                # The deployment policy still generates its normal chunk so
+                # its internal history remains well-defined, but once inside
+                # the goal sphere the executed command is hard-zeroed.  A
+                # route is successful only after the vehicle settles inside
+                # the sphere; simply crossing it at speed is not success.
+                if braking.any():
+                    td["agents", "action"][braking] = 0.0
+                    td["agents", "action_normalized"][braking] = 0.0
                 normalized_action = td[
                     "agents", "action_normalized"].reshape(args.num_envs, 3)
                 world_command = td["agents", "action"].reshape(args.num_envs, 3)
@@ -365,9 +400,24 @@ def main():
                 min_clearance = torch.minimum(min_clearance, clearance)
 
                 collision = td["stats", "collision"].reshape(-1).bool()
-                reach_goal = td["stats", "reach_goal"].reshape(-1).bool()
                 truncated = td["truncated"].reshape(-1).bool()
                 out_of_bounds = (position[:, 2] < 0.2) | (position[:, 2] > 4.0)
+                speed = env.drone.vel_w[:, 0, :3].norm(dim=-1)
+                goal_distance = (env.target_pos[:, 0] - position).norm(dim=-1)
+                if braking.any():
+                    drift = (position - goal_stop_entry).norm(dim=-1)
+                    goal_stop_max_drift[braking] = torch.maximum(
+                        goal_stop_max_drift[braking], drift[braking])
+                low_speed = braking & (speed < args.settle_speed)
+                settle_streak = torch.where(
+                    low_speed, settle_streak + 1,
+                    torch.zeros_like(settle_streak))
+                settled = braking & (settle_streak >= args.settle_steps)
+                reach_goal = settled & (goal_distance < args.goal_radius)
+                settled_outside = settled & ~reach_goal
+                if settled_outside.any():
+                    braking[settled_outside] = False
+                    settle_streak[settled_outside] = 0
                 done = collision | reach_goal | truncated | out_of_bounds
                 done_indices = done.nonzero().flatten().tolist()
                 for index in done_indices:
@@ -399,6 +449,11 @@ def main():
                         "duration_s": float(episode_steps[index]) * float(cfg.sim.dt),
                         "path_length_m": float(path_length[index]),
                         "min_clearance_m": float(min_clearance[index]),
+                        "final_goal_distance_m": float(goal_distance[index]),
+                        "final_speed_mps": float(speed[index]),
+                        "goal_stop_attempts": int(goal_stop_attempts[index]),
+                        "goal_stop_steps": int(settle_streak[index]),
+                        "goal_stop_max_drift_m": float(goal_stop_max_drift[index]),
                         "initial_goal_distance_m": float(initial_goal_distance[index]),
                         "final_goal_distance_m": float(distance[index]),
                         "min_goal_distance_m": float(min_goal_distance[index]),
@@ -457,6 +512,11 @@ def main():
                     previous_plan_direction[done] = 0
                     plan_direction_reversals[done] = 0
                     plan_count[done] = 0
+                    braking[done] = False
+                    settle_streak[done] = 0
+                    goal_stop_attempts[done] = 0
+                    goal_stop_entry[done] = 0
+                    goal_stop_max_drift[done] = 0
                     chunk_start_distance[done] = reset_distance[done]
                     for reset_index in done.nonzero().flatten().tolist():
                         chunk_progress[reset_index] = []

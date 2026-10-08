@@ -126,6 +126,45 @@ class FutureTokenAdapter(nn.Module):
         return tokens
 
 
+class FutureChangeAdapter(nn.Module):
+    """Encode a predicted next latent and its change from the current scan.
+
+    The current latent is intentionally included next to the prediction.  This
+    lets the adapter distinguish static geometry from predicted motion without
+    changing the pretrained current-observation encoder used by the Action
+    Expert.
+    """
+
+    def __init__(self, width: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            CircularConv2d(12, 128, 3), nn.SiLU(),
+            CircularConv2d(128, width, 3),
+        )
+        self.norm = nn.LayerNorm(width)
+        self.type_embedding = nn.Parameter(torch.zeros(1, 1, width))
+        self.register_buffer(
+            "polar_position", polar_position_encoding(27, 5, width),
+            persistent=False)
+
+    def forward(self, current: torch.Tensor,
+                predicted_next: torch.Tensor) -> torch.Tensor:
+        expected = (4, 27, 5)
+        if (current.ndim != 4 or predicted_next.ndim != 4
+                or tuple(current.shape[1:]) != expected
+                or tuple(predicted_next.shape[1:]) != expected
+                or len(current) != len(predicted_next)):
+            raise ValueError(
+                "Expected matching current/predicted latents [B,4,27,5], got "
+                f"{tuple(current.shape)} and {tuple(predicted_next.shape)}")
+        value = torch.cat(
+            (current, predicted_next, predicted_next-current), dim=1)
+        feature = self.net(value)
+        tokens = self.norm(feature.flatten(2).transpose(1, 2))
+        return (tokens + 0.10*self.polar_position.to(tokens.dtype)
+                + self.type_embedding.to(tokens.dtype))
+
+
 class ActionSemanticAdapter(nn.Module):
     """Project the executed ten-action chunk into UNet conditioning."""
 
@@ -253,6 +292,8 @@ class ActionFlowExpert(nn.Module):
                 f"got {tuple(noisy_action.shape)}")
         if tuple(past_actions.shape[1:]) != (self.past_horizon, self.action_dim):
             raise ValueError(f"Unexpected past action shape {tuple(past_actions.shape)}")
+        if tuple(past_mask.shape[1:]) != (self.past_horizon,):
+            raise ValueError(f"Unexpected past action mask shape {tuple(past_mask.shape)}")
         past = torch.cat([past_actions, past_mask.unsqueeze(-1)], dim=-1)
         context = torch.cat([
             observation_tokens,
@@ -313,13 +354,15 @@ class JointWorldActionModel(nn.Module):
 
     def __init__(self, world_model: nn.Module, width: int = 512,
                  depth: int = 8, heads: int = 8, ffn_width: int = 2048,
-                 future_attention_layers: int = 2):
+                 future_attention_layers: int = 2,
+                 past_horizon: int = 10):
         super().__init__()
         self.world = world_model
         self.observation = LiDARObservationEncoder(width)
         self.action_expert = ActionFlowExpert(
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
-            future_attention_layers=future_attention_layers)
+            future_attention_layers=future_attention_layers,
+            past_horizon=past_horizon)
         self.future_adapter = FutureTokenAdapter(width)
         self.action_semantic_adapter = ActionSemanticAdapter(width)
         # Zero initialization makes the first world forward exactly the loaded
@@ -549,15 +592,20 @@ class JointWorldActionModel(nn.Module):
 
 
 class ActionOnlyModel(nn.Module):
-    """Deployment-shaped Action Expert used before optional world coupling."""
+    """Deployment-shaped Action Expert used before optional world coupling.
+
+    The standalone path defaults to three previously executed ten-action
+    chunks (30 low-level actions).  The joint v2 path keeps its historical
+    ten-action context unless it explicitly requests another horizon.
+    """
 
     def __init__(self, width: int = 512, depth: int = 8, heads: int = 8,
-                 ffn_width: int = 2048):
+                 ffn_width: int = 2048, past_horizon: int = 30):
         super().__init__()
         self.observation = LiDARObservationEncoder(width)
         self.action_expert = ActionFlowExpert(
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
-            future_attention_layers=0)
+            past_horizon=past_horizon, future_attention_layers=0)
         self.action_expert.candidate_norm.requires_grad_(False)
         self.action_expert.candidate_out.requires_grad_(False)
 
@@ -585,3 +633,106 @@ class ActionOnlyModel(nn.Module):
         return (self.predict_action_velocity(
             noisy_action, action_timestep, current_latent, goal, proprio,
             past_actions, past_mask), None)
+
+
+class FutureConditionedActionModel(nn.Module):
+    """Frozen history Future-DiT plus a checkpoint-safe Action Expert.
+
+    This is deliberately a one-way fusion model: the Future-DiT predicts one
+    next LiDAR latent from three observed latents, and only the final Action
+    blocks may read that prediction.  Actions never condition the Future-DiT,
+    and no ground-truth future latent is accepted by this interface.
+    """
+
+    def __init__(self, future_model: nn.Module, width: int = 512,
+                 depth: int = 8, heads: int = 8, ffn_width: int = 2048,
+                 past_horizon: int = 30,
+                 future_attention_layers: int = 2):
+        super().__init__()
+        self.future_model = future_model
+        self.observation = LiDARObservationEncoder(width)
+        self.action_expert = ActionFlowExpert(
+            width=width, depth=depth, heads=heads, ffn_width=ffn_width,
+            past_horizon=past_horizon,
+            future_attention_layers=future_attention_layers)
+        self.future_adapter = FutureChangeAdapter(width)
+        self.future_model.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # The pretrained Future-DiT is an immutable feature producer even
+        # while the newly added fusion layers are being optimized.
+        self.future_model.eval()
+        return self
+
+    def encode_current(self, current_latent: torch.Tensor) -> torch.Tensor:
+        return self.observation(current_latent)
+
+    @torch.no_grad()
+    def predict_next(self, history: torch.Tensor, initial_noise: torch.Tensor,
+                     steps: int = 4) -> torch.Tensor:
+        if history.ndim != 5 or tuple(history.shape[1:]) != (3, 4, 27, 5):
+            raise ValueError(
+                f"Expected history [B,3,4,27,5], got {tuple(history.shape)}")
+        if initial_noise.shape != history[:, 0].shape:
+            raise ValueError(
+                "Future noise must have shape [B,4,27,5], got "
+                f"{tuple(initial_noise.shape)}")
+        value = initial_noise
+        schedule = torch.linspace(
+            1, 0, int(steps)+1, device=history.device, dtype=history.dtype)
+        for current, following in zip(schedule[:-1], schedule[1:]):
+            timestep = torch.full(
+                (len(history),), current, device=history.device,
+                dtype=history.dtype)
+            velocity = self.future_model(history, value, timestep)
+            value = value + (following-current)*velocity
+        return value
+
+    def encode_predicted_future(
+            self, history: torch.Tensor, future_noise: torch.Tensor,
+            steps: int = 4, mode: str = "correct") -> torch.Tensor | None:
+        """Return causal Future tokens for controlled ablation experiments."""
+        if mode == "disabled":
+            return None
+        predicted = self.predict_next(history, future_noise, steps)
+        tokens = self.future_adapter(history[:, -1], predicted)
+        if mode == "zero":
+            return torch.zeros_like(tokens)
+        if mode == "shuffled":
+            if len(tokens) > 1:
+                return tokens.roll(1, dims=0)
+            return tokens
+        if mode != "correct":
+            raise ValueError(
+                "future mode must be correct, zero, shuffled, or disabled")
+        return tokens
+
+    def predict_action_velocity(
+            self, noisy_action: torch.Tensor, action_timestep: torch.Tensor,
+            current_latent: torch.Tensor, goal: torch.Tensor,
+            proprio: torch.Tensor, past_actions: torch.Tensor,
+            past_mask: torch.Tensor, history: torch.Tensor,
+            future_noise: torch.Tensor, future_steps: int = 4,
+            future_mode: str = "correct",
+            observation_tokens: torch.Tensor | None = None,
+            future_tokens: torch.Tensor | None = None) -> torch.Tensor:
+        if observation_tokens is None:
+            observation_tokens = self.encode_current(current_latent)
+        if future_tokens is None and future_mode != "disabled":
+            future_tokens = self.encode_predicted_future(
+                history, future_noise, future_steps, future_mode)
+        return self.action_expert(
+            noisy_action, action_timestep, observation_tokens, goal, proprio,
+            past_actions, past_mask, future_tokens=future_tokens)
+
+    def forward(self, noisy_action: torch.Tensor,
+                action_timestep: torch.Tensor, current_latent: torch.Tensor,
+                goal: torch.Tensor, proprio: torch.Tensor,
+                past_actions: torch.Tensor, past_mask: torch.Tensor,
+                history: torch.Tensor, future_noise: torch.Tensor,
+                future_steps: int = 4, future_mode: str = "correct"):
+        return (self.predict_action_velocity(
+            noisy_action, action_timestep, current_latent, goal, proprio,
+            past_actions, past_mask, history, future_noise, future_steps,
+            future_mode), None)

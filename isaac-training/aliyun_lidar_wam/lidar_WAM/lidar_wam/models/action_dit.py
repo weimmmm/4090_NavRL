@@ -4,9 +4,10 @@ The action branch intentionally follows the same token/AdaLN/flow-matching
 recipe as :mod:`lidar_video_dit`: noisy action tokens are appended after causal
 history, goal/proprioception and past-action tokens.  Context tokens cannot
 read the noisy action block, while action tokens can read the complete causal
-context.  The history tokens are supplied by the first pretrained World-DiT
-blocks (H6), so the action branch uses temporal World features rather than
-only the raw input projection.
+  context.  The history tokens are supplied by the first pretrained World-DiT
+  blocks (H6), so the action branch uses temporal World features rather than
+  only the raw input projection.  The optional Future-DiT path is a single
+  one-way cross-attention from predicted future tokens into action tokens.
 """
 
 from __future__ import annotations
@@ -63,6 +64,36 @@ class ActionDiT(nn.Module):
         self.goal_gate = nn.Parameter(torch.ones(()))
         self.blocks = nn.ModuleList([
             VideoDiTBlock(width, heads, mlp_ratio) for _ in range(depth)])
+        # Existing 73% base path: action tokens read the causal H6 World
+        # features.  Keep this structure for checkpoint compatibility; the
+        # new ablation below is the predicted-Future -> Action path.
+        self.world_cross_query_norm = nn.ModuleList([
+            nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+            for _ in range(depth)])
+        self.world_cross_context_norm = nn.ModuleList([
+            nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+            for _ in range(depth)])
+        self.world_cross_attn = nn.ModuleList([
+            nn.MultiheadAttention(width, heads, batch_first=True, dropout=0.0)
+            for _ in range(depth)])
+        self.world_cross_gates = nn.Parameter(torch.zeros(depth))
+        # The only added path in the Future-DiT ablation.  Action tokens query
+        # predicted future tokens; the future branch never queries actions.
+        # Zero gates preserve the base model until this branch is fine-tuned.
+        self.future_cross_query_norm = nn.ModuleList([
+            nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+            for _ in range(depth)])
+        self.future_cross_context_norm = nn.ModuleList([
+            nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+            for _ in range(depth)])
+        self.future_cross_attn = nn.ModuleList([
+            nn.MultiheadAttention(width, heads, batch_first=True, dropout=0.0)
+            for _ in range(depth)])
+        self.future_cross_gates = nn.Parameter(torch.zeros(depth))
+        # Identify the t+1, t+2 and t+3 token groups produced by the frozen
+        # one-step Future-DiT rollout.
+        self.future_cross_horizon_position = nn.Parameter(
+            torch.zeros(1, 3, 1, width))
         self.final_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
         self.final_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(width, 2 * width))
@@ -90,7 +121,8 @@ class ActionDiT(nn.Module):
                 timestep: torch.Tensor, goal: torch.Tensor,
                 proprio: torch.Tensor, past_actions: torch.Tensor,
                 past_mask: torch.Tensor,
-                action_mask: torch.Tensor | None = None) -> torch.Tensor:
+                action_mask: torch.Tensor | None = None,
+                future_tokens: torch.Tensor | None = None) -> torch.Tensor:
         expected_history = (self.history_tokens, self.width)
         if history_tokens.ndim != 3 or tuple(history_tokens.shape[1:]) != expected_history:
             raise ValueError(
@@ -102,6 +134,27 @@ class ActionDiT(nn.Module):
                 f"got {tuple(noisy_action.shape)}")
         if tuple(past_actions.shape[1:]) != (self.past_horizon, self.action_dim):
             raise ValueError(f"Unexpected past action shape {tuple(past_actions.shape)}")
+        if future_tokens is not None:
+            if future_tokens.ndim != 3 or future_tokens.shape[0] != len(history_tokens):
+                raise ValueError(
+                    "future_tokens must have shape [B,N,width], got "
+                    f"{tuple(future_tokens.shape)}")
+            if future_tokens.shape[-1] != self.width or future_tokens.shape[1] <= 0:
+                raise ValueError("future_tokens has an invalid token shape")
+            tokens_per_frame = 27 * 5
+            if future_tokens.shape[1] % tokens_per_frame:
+                raise ValueError("future token count must be a multiple of 135")
+            future_horizons = future_tokens.shape[1] // tokens_per_frame
+            if future_horizons > self.future_cross_horizon_position.shape[1]:
+                raise ValueError(
+                    f"At most {self.future_cross_horizon_position.shape[1]} "
+                    f"future horizons are supported, got {future_horizons}")
+            future_tokens = future_tokens.reshape(
+                len(future_tokens), future_horizons, tokens_per_frame,
+                self.width)
+            future_tokens = future_tokens + self.future_cross_horizon_position[
+                :, :future_horizons]
+            future_tokens = future_tokens.flatten(1, 2)
         past = torch.cat((past_actions, past_mask.unsqueeze(-1)), dim=-1)
         goal_query = self.goal_in(goal).unsqueeze(1)
         history_for_goal = self.goal_history_norm(history_tokens)
@@ -131,9 +184,26 @@ class ActionDiT(nn.Module):
             key_padding_mask = ~torch.cat(
                 (context_valid, action_mask.to(dtype=torch.bool)), dim=1)
         condition = self.time_mlp(timestep_embedding(timestep, self.width))
-        for block in self.blocks:
+        for layer_index, block in enumerate(self.blocks):
             tokens = block(tokens, condition, self.causal_mask,
                            key_padding_mask=key_padding_mask)
+            action_tokens = tokens[:, self.context_tokens:]
+            world_query = self.world_cross_query_norm[layer_index](action_tokens)
+            world_context = self.world_cross_context_norm[layer_index](history_tokens)
+            world_cross = self.world_cross_attn[layer_index](
+                world_query, world_context, world_context,
+                need_weights=False)[0]
+            action_tokens = action_tokens + torch.tanh(
+                self.world_cross_gates[layer_index]) * world_cross
+            if future_tokens is not None:
+                query = self.future_cross_query_norm[layer_index](action_tokens)
+                context = self.future_cross_context_norm[layer_index](future_tokens)
+                cross = self.future_cross_attn[layer_index](
+                    query, context, context, need_weights=False)[0]
+                action_tokens = action_tokens + torch.tanh(
+                    self.future_cross_gates[layer_index]) * cross
+            tokens = torch.cat((tokens[:, :self.context_tokens], action_tokens),
+                               dim=1)
         action = tokens[:, -self.action_horizon:]
         shift, scale = self.final_modulation(condition).chunk(2, dim=-1)
         action = self.final_norm(action) * (1 + scale[:, None]) + shift[:, None]
@@ -152,7 +222,7 @@ class JointHistoryWorldActionDiT(nn.Module):
     checkpoint is not silently changed at initialization.
     """
 
-    format = "navrl-history-world-action-dit-v1"
+    format = "navrl-history-world-action-dit-v2"
 
     def __init__(self, world: nn.Module, width: int = 512, depth: int = 8,
                  heads: int = 8, mlp_ratio: float = 4.0,
@@ -185,12 +255,42 @@ class JointHistoryWorldActionDiT(nn.Module):
         return self.world.encode_history_features(
             history, timestep, depth=self.shared_world_depth)
 
+    @torch.no_grad()
+    def future_features_autoregressive(
+            self, history: torch.Tensor,
+            future_noise: torch.Tensor) -> torch.Tensor:
+        """Predict t+1:t+3 autoregressively and concatenate their tokens."""
+        if future_noise.ndim != 5 or tuple(future_noise.shape[2:]) != (4, 27, 5):
+            raise ValueError(
+                "Expected future noise [B,H,4,27,5], got "
+                f"{tuple(future_noise.shape)}")
+        if future_noise.shape[1] != 3:
+            raise ValueError("Future-to-Action uses exactly three future frames")
+        rolling_history = history
+        outputs = []
+        for horizon in range(3):
+            noise = future_noise[:, horizon]
+            sigma = torch.ones(
+                len(history), device=history.device, dtype=noise.dtype)
+            shared = self.encode_history(rolling_history)
+            velocity = self.world(
+                rolling_history, noise, sigma, history_tokens=shared)
+            predicted = noise - velocity
+            zero = torch.zeros(
+                len(history), device=history.device, dtype=noise.dtype)
+            outputs.append(self.world.encode_future_features(
+                rolling_history, predicted, zero, depth=self.world.depth))
+            rolling_history = torch.cat(
+                (rolling_history[:, 1:], predicted[:, None]), dim=1)
+        return torch.cat(outputs, dim=1)
+
     def forward(self, history: torch.Tensor, noisy_future: torch.Tensor,
                 future_timestep: torch.Tensor, noisy_action: torch.Tensor,
                 action_timestep: torch.Tensor, goal: torch.Tensor,
                 proprio: torch.Tensor, past_actions: torch.Tensor,
                 past_mask: torch.Tensor,
-                action_mask: torch.Tensor | None = None):
+                action_mask: torch.Tensor | None = None,
+                future_tokens: torch.Tensor | None = None):
         # Keep the original H0 path for the World loss.  Action receives H6,
         # not just the raw tokenizer output, so the pretrained temporal
         # representation can influence action generation.
@@ -200,12 +300,14 @@ class JointHistoryWorldActionDiT(nn.Module):
             history, noisy_future, future_timestep, history_tokens=shared)
         action_velocity = self.action(
             action_features, noisy_action, action_timestep, goal, proprio,
-            past_actions, past_mask, action_mask=action_mask)
+            past_actions, past_mask, action_mask=action_mask,
+            future_tokens=future_tokens)
         return world_velocity, action_velocity
 
 
 def flow_sample_action(model, history_tokens, goal, proprio, past_actions,
-                       past_mask, steps=20, generator=None):
+                       past_mask, steps=20, generator=None,
+                       future_tokens=None):
     """Euler flow sampling in normalized action coordinates [0, 1]."""
     batch = len(history_tokens)
     value = torch.randn(
@@ -218,7 +320,7 @@ def flow_sample_action(model, history_tokens, goal, proprio, past_actions,
         timestep = torch.full((batch,), current, device=value.device,
                               dtype=value.dtype)
         velocity = model(history_tokens, value, timestep, goal, proprio,
-                         past_actions, past_mask)
+                         past_actions, past_mask, future_tokens=future_tokens)
         value = value + (following - current) * velocity
     # Rectified-flow integration already targets the normalized action
     # interval.  A sigmoid here would distort the learned endpoint and make

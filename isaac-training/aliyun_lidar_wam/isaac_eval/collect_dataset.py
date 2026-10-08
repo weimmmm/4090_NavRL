@@ -1,4 +1,9 @@
-"""Collect one complete PPO episode per drone into a compressed HDF5 file."""
+"""Collect full-horizon PPO episodes into an accepted-only HDF5 shard.
+
+Entering the goal radius starts a zero-command braking phase.  Reach-goal is
+recorded only after the vehicle settles inside the radius. Collision and
+out-of-bounds episodes are removed in their entirety before publication.
+"""
 
 from __future__ import annotations
 
@@ -35,14 +40,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--route-seed", type=int)
+    parser.add_argument("--shard-id", type=int)
     parser.add_argument("--num-envs", type=int, default=512)
     parser.add_argument("--sample-interval", type=int, default=10)
-    parser.add_argument("--max-steps", type=int, default=2200)
+    parser.add_argument("--max-steps", type=int, default=2500)
     parser.add_argument("--static-obstacles", type=int, default=350)
+    parser.add_argument("--opposite-fraction", type=float, default=0.5)
+    parser.add_argument("--goal-radius", type=float, default=0.5)
+    parser.add_argument("--settle-speed", type=float, default=0.1)
+    parser.add_argument("--settle-steps", type=int, default=10)
+    parser.add_argument("--keep-environment", action="store_true",
+                        help="Keep the accepted .pt snapshot (normally only shard 0 per condition).")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--split", choices=("auto", "train", "val", "test", "smoke"), default="auto")
     parser.add_argument("--output-root", type=Path,
-                        default=ROOT / "datasets" / "wam_static_seed00_09")
+                        default=ROOT / "datasets" / "wam_40x40_obs200_350_settled_4m")
     parser.add_argument("--checkpoint", type=Path,
                         default=ROOT / "isaac_eval" / "checkpoints" / "ppo_dataset_collector.pt")
     parser.add_argument("--render", action="store_true")
@@ -56,8 +68,14 @@ def parse_args():
         parser.error(f"checkpoint does not exist: {args.checkpoint}")
     if args.num_envs <= 0 or args.sample_interval <= 0 or args.sample_interval != 10:
         parser.error("--num-envs must be positive and --sample-interval must be 10")
-    if args.max_steps <= 0 or args.static_obstacles != 350:
-        parser.error("this protocol requires positive max steps and exactly 350 obstacles")
+    if args.max_steps <= 0 or args.static_obstacles not in (200, 350):
+        parser.error("this protocol requires positive max steps and 200 or 350 obstacles")
+    if args.goal_radius <= 0 or args.settle_speed <= 0 or args.settle_steps <= 0:
+        parser.error("goal/braking thresholds must be positive")
+    if not 0.0 <= args.opposite_fraction <= 1.0:
+        parser.error("--opposite-fraction must be in [0,1]")
+    if args.shard_id is not None and args.shard_id < 0:
+        parser.error("--shard-id must be non-negative")
     return args
 
 
@@ -174,18 +192,37 @@ def main():
         from isaac_eval.dataset_io import TrajectoryWriter, validate_dataset
         from isaac_eval.environment_file import (
             file_sha256, generate_environment, load_environment,
-            make_environment_v2, mesh_sha256, save_environment)
+            make_environment_v2, mesh_sha256, save_environment,
+            slice_environment)
         from isaac_eval.navigation_env import NavigationEnv
         from isaac_eval.policy import lidar_range_image
         from isaac_eval.ppo_policy import load_ppo_expert
 
-        seed_dir = args.output_root / args.split / f"seed_{args.seed:04d}"
-        environment_path = (args.output_root / "environments" /
-                            f"static350_seed{args.seed:02d}_n{args.num_envs}.pt")
+        shard_id = args.seed if args.shard_id is None else args.shard_id
+        legacy_layout = args.shard_id is None
+        keep_environment = args.keep_environment or legacy_layout
+        if legacy_layout:
+            # Preserve compatibility with the original seed00-09 collector.
+            seed_dir = args.output_root / args.split / f"seed_{args.seed:04d}"
+            environment_path = (args.output_root / "environments" /
+                                f"static{args.static_obstacles}_seed{args.seed:02d}_"
+                                f"n{args.num_envs}.pt")
+            retained_environment_path = environment_path
+        else:
+            seed_dir = (args.output_root / args.split /
+                        f"obs_{args.static_obstacles:04d}" / f"shard_{shard_id:05d}")
+            # A temporary exact snapshot is required for simulation and
+            # validation. Production keeps only shard 0 per condition.
+            environment_path = seed_dir / "environment.partial.pt"
+            retained_environment_path = (args.output_root / "environments" /
+                                         f"map40_obs{args.static_obstacles:04d}.pt")
         partial_path = seed_dir / "trajectories.partial.h5"
         dataset_path = seed_dir / "trajectories.h5"
         summary_path = seed_dir / "summary.json"
-        conflicts = [path for path in (environment_path, partial_path, dataset_path, summary_path)
+        checked_paths = [environment_path, partial_path, dataset_path, summary_path]
+        if keep_environment:
+            checked_paths.append(retained_environment_path)
+        conflicts = [path for path in checked_paths
                      if path.exists()]
         if conflicts:
             raise FileExistsError("refusing to overwrite: " + ", ".join(map(str, conflicts)))
@@ -210,7 +247,8 @@ def main():
         routes = generate_environment(
             num_envs=args.num_envs, terrain_seed=args.seed,
             route_seed=args.route_seed, static_obstacles=args.static_obstacles,
-            max_steps=args.max_steps)
+            max_steps=args.max_steps,
+            opposite_fraction=args.opposite_fraction)
         terrain_generator = TerrainGenerator(TerrainGeneratorCfg(
             seed=args.seed, size=(40.0, 40.0), border_width=5.0,
             num_rows=1, num_cols=1, horizontal_scale=0.1,
@@ -287,12 +325,22 @@ def main():
         min_clearance = torch.full((num_envs,), float(env.lidar_range), device=device)
         previous_position = initial_state[:, 0, :3].to(device)
         terminal_reasons: dict[int, str] = {}
+        braking = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        settle_streak = torch.zeros(num_envs, dtype=torch.long, device=device)
+        brake_attempts = torch.zeros(num_envs, dtype=torch.long, device=device)
 
         metadata = {
             "format": "navrl-isaac-trajectory-hdf5-v2", "terrain_seed": args.seed,
             "route_seed": args.route_seed, "num_envs": num_envs,
             "sample_interval": horizon, "max_steps": args.max_steps,
             "sim_dt": float(cfg.sim.dt), "static_obstacles": args.static_obstacles,
+            "map_size_m": [40.0, 40.0], "shard_id": shard_id,
+            "goal_radius_m": args.goal_radius,
+            "settle_speed_mps": args.settle_speed,
+            "settle_steps": args.settle_steps,
+            "opposite_fraction": args.opposite_fraction,
+            "route_sampling": routes["route_sampling"],
+            "discarded_terminations": ["collision", "out_of_bounds"],
             "dynamic_obstacles": 0, "policy": "ppo_dataset_collector",
             "exploration_type": "mean", "checkpoint_sha256": file_sha256(args.checkpoint),
             "environment_file": str(environment_path.relative_to(args.output_root)),
@@ -318,6 +366,18 @@ def main():
                 policy(td)
                 normalized = td["agents", "action_normalized"].reshape(num_envs, 3)
                 world = td["agents", "action"].reshape(num_envs, 3)
+                position_before = env.drone.pos[:, 0]
+                distance_before = (env.target_pos[:, 0] - position_before).norm(dim=-1)
+                start_braking = active & (~braking) & (distance_before < args.goal_radius)
+                braking[start_braking] = True
+                brake_attempts[start_braking] += 1
+                # Zero world velocity is the actual command sent to the
+                # controller. In normalized PPO coordinates zero is 0.5.
+                if braking.any():
+                    normalized[braking] = 0.5
+                    world[braking] = 0.0
+                    td["agents", "action_normalized"].reshape(num_envs, 3)[braking] = 0.5
+                    td["agents", "action"].reshape(num_envs, 3)[braking] = 0.0
                 slots = since_frame.clamp_max(horizon - 1)
                 active_ids = active.nonzero().flatten()
                 norm_buffer[active_ids, slots[active_ids]] = normalized[active_ids]
@@ -337,8 +397,19 @@ def main():
                 clearance = td["agents", "observation", "lidar"].reshape(num_envs, -1).amin(-1)
                 min_clearance[active] = torch.minimum(min_clearance[active], clearance[active])
                 collision = td["stats", "collision"].reshape(-1).bool() & active
-                reach = td["stats", "reach_goal"].reshape(-1).bool() & active
                 out = (((position[:, 2] < .2) | (position[:, 2] > 4.0)) & active)
+                goal_distance = (env.target_pos[:, 0] - position).norm(dim=-1)
+                speed = env.drone.vel_w[:, 0, :3].norm(dim=-1)
+                low_speed = braking & active & (speed < args.settle_speed)
+                settle_streak = torch.where(
+                    low_speed, settle_streak + 1, torch.zeros_like(settle_streak))
+                settled = braking & active & (settle_streak >= args.settle_steps)
+                reach = settled & (goal_distance < args.goal_radius)
+                # A vehicle can drift outside the radius while braking. It is
+                # not declared successful; release it so PPO can reacquire.
+                settled_outside = settled & (~reach)
+                braking[settled_outside] = False
+                settle_streak[settled_outside] = 0
                 timeout = ((td["truncated"].reshape(-1).bool() |
                             (sim_steps >= args.max_steps)) & active)
                 done = collision | reach | out | timeout
@@ -373,12 +444,12 @@ def main():
                     print(f"[collect] seed={args.seed} step={int(sim_steps.max())} "
                           f"active={int(active.sum())} frames={writer.count}", flush=True)
 
-        reason_counts = Counter(terminal_reasons.values())
+        raw_reason_counts = Counter(terminal_reasons.values())
         if len(terminal_reasons) != num_envs:
             raise RuntimeError(f"only {len(terminal_reasons)}/{num_envs} scenes terminated")
-        episodes = []
+        all_episodes = []
         for env_id in range(num_envs):
-            episodes.append({
+            all_episodes.append({
                 "scene_id": env_id, "env_id": env_id,
                 "termination_reason": terminal_reasons[env_id],
                 "steps": int(sim_steps[env_id]), "frames": int(frame_index[env_id]),
@@ -388,25 +459,73 @@ def main():
                 "target_position": snapshot["target_positions"][env_id, 0].tolist(),
                 "start_side": int(snapshot["start_sides"][env_id]),
                 "target_side": int(snapshot["target_sides"][env_id]),
+                "brake_attempts": int(brake_attempts[env_id]),
             })
+        # A collision (or leaving the valid flight volume) invalidates the
+        # complete trajectory, including all frames written before failure.
+        accepted_source_ids = [env_id for env_id in range(num_envs)
+                               if terminal_reasons[env_id] not in
+                               ("collision", "out_of_bounds")]
+        accepted_snapshot = slice_environment(snapshot, accepted_source_ids)
+        save_environment(environment_path, accepted_snapshot)
+        kept_environment = (str(retained_environment_path.relative_to(args.output_root))
+                            if keep_environment else None)
+        mapping = writer.retain_scenes(
+            accepted_source_ids,
+            token_prefix=(f"o{args.static_obstacles:04d}-h{shard_id:05d}"
+                          f"-s{args.seed:08d}"),
+            metadata_updates={
+                "environment_file": kept_environment,
+                "environment_sha256": file_sha256(environment_path),
+                "accepted_scenes": len(accepted_source_ids),
+                "discarded_scenes": num_envs - len(accepted_source_ids),
+            })
+        episodes = []
+        for episode in all_episodes:
+            source_id = int(episode["scene_id"])
+            if source_id not in mapping:
+                continue
+            item = dict(episode)
+            item["source_env_id"] = source_id
+            item["scene_id"] = mapping[source_id]
+            item["env_id"] = mapping[source_id]
+            episodes.append(item)
+        accepted_reason_counts = Counter(x["termination_reason"] for x in episodes)
         summary = {
-            **metadata, "frames": writer.count, "scenes": num_envs,
-            "termination_counts": dict(reason_counts),
-            "mean_episode_steps": float(sim_steps.float().mean()),
-            "mean_frames_per_scene": float(frame_index.float().mean()),
+            **metadata, "frames": writer.count, "scenes": len(episodes),
+            "num_envs": len(episodes),
+            "source_scenes": num_envs,
+            "discarded_scenes": num_envs - len(episodes),
+            "raw_termination_counts": dict(raw_reason_counts),
+            "termination_counts": dict(accepted_reason_counts),
+            "mean_episode_steps": float(np.mean([x["steps"] for x in episodes])),
+            "mean_frames_per_scene": float(np.mean([x["frames"] for x in episodes])),
             "wall_time_s": time.perf_counter() - started,
-            "environment_path": str(environment_path),
+            "environment_path": (str(retained_environment_path)
+                                 if keep_environment else None),
+            "environment_sha256": file_sha256(environment_path),
             "dataset_path": str(dataset_path),
         }
         writer.close(summary)
         writer = None
-        validation = validate_dataset(partial_path, snapshot, num_envs, horizon)
+        validation = validate_dataset(
+            partial_path, accepted_snapshot, len(accepted_source_ids), horizon)
         partial_path.replace(dataset_path)
+        if keep_environment and environment_path != retained_environment_path:
+            retained_environment_path.parent.mkdir(parents=True, exist_ok=True)
+            environment_path.replace(retained_environment_path)
+        elif not keep_environment:
+            environment_path.unlink()
         validation["dataset"] = str(dataset_path)
         summary["dataset_sha256"] = file_sha256(dataset_path)
         summary["dataset_size_bytes"] = dataset_path.stat().st_size
         summary["validation"] = validation
-        _save_json(summary_path, {"summary": summary, "episodes": episodes})
+        _save_json(summary_path, {
+            "summary": summary, "episodes": episodes,
+            "discarded_episodes": [x for x in all_episodes
+                                   if x["termination_reason"] in
+                                   ("collision", "out_of_bounds")],
+        })
         print(json.dumps(summary, indent=2), flush=True)
         completed = True
     except BaseException:

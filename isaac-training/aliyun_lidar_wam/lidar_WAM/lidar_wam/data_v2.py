@@ -1,8 +1,9 @@
 """Shard-native loader for ``navrl-isaac-trajectory-hdf5-v2`` datasets.
 
 Rows store the actions that arrived at that row.  Consequently a policy
-observation at row ``i`` uses row ``i`` as its past action and the three token
-successors as its 30-step supervision.  This module makes that convention
+observation at row ``i`` uses the current row and (when available) the two
+preceding rows as its 30-step action history; the three token successors are
+the action/world supervision window.  This module makes that convention
 explicit and rejects ambiguous or cross-scene chains.
 """
 
@@ -187,6 +188,7 @@ def build_split_index(dataset_root: Path, split: str, index_root: Path,
             raise ValueError(f"dangling prev_token in {path}")
 
         rows, goals, proprios, world_states = [], [], [], []
+        past_rows = []
         past_valid, clearances, turns, scene_ids = [], [], [], []
         for current in range(len(tokens)):
             trajectory_key = (_entry_identity(entry), scenes[current])
@@ -246,6 +248,14 @@ def build_split_index(dataset_root: Path, split: str, index_root: Path,
             world_states.append([
                 goal_velocity[0], goal_velocity[1], 0.0, 0.0,
                 angular_velocity[2]])
+            history = [current]
+            for _ in range(2):
+                token = previous[history[-1]]
+                if not token or token not in token_to_row:
+                    break
+                history.append(token_to_row[token])
+            history.reverse()
+            past_rows.append([-1] * (3 - len(history)) + history)
             past_valid.append(previous_is_valid)
             clearances.append(float(clearance[current]))
             turns.append(_turn_score(future_action, previous_action))
@@ -254,6 +264,8 @@ def build_split_index(dataset_root: Path, split: str, index_root: Path,
         count = len(rows)
         arrays["shard"].append(np.full(count, shard_id, np.int16))
         arrays["rows"].append(np.asarray(rows, np.int64))
+        arrays["past_rows"].append(
+            np.asarray(past_rows, np.int64).reshape(-1, 3))
         arrays["goal"].append(np.asarray(goals, np.float32))
         arrays["proprio"].append(np.asarray(proprios, np.float32))
         arrays["world_state"].append(np.asarray(world_states, np.float32))
@@ -295,6 +307,7 @@ def build_split_index(dataset_root: Path, split: str, index_root: Path,
         "time_alignment": {
             "observation": "rows[:,0]", "past_actions": "rows[:,0]",
             "future_actions": "rows[:,1:4]", "world_target": "rows[:,3]",
+            "past_action_history": "past_rows[:,0:3] oldest_to_current",
         },
         # Logical protocols can reuse one physical shard in train and val.  The
         # loader must therefore use the exact entry table embedded in the index
@@ -383,12 +396,18 @@ class V2WindowDataset(Dataset):
                  samples_per_seed: int | None = None, random_seed: int = 42,
                  limit: int | None = None, scene_min: int | None = None,
                  scene_max: int | None = None,
-                 all_future_targets: bool = False):
+                 all_future_targets: bool = False,
+                 past_horizon: int = 10):
         self.split = split
         self.dataset_root = Path(dataset_root)
         self.latent_root = Path(latent_root)
         self.index_root = Path(index_root)
         self.all_future_targets = bool(all_future_targets)
+        self.past_horizon = int(past_horizon)
+        if self.past_horizon < 10 or self.past_horizon % 10:
+            raise ValueError(
+                "past_horizon must be a positive multiple of the 10-step "
+                f"action chunk, got {self.past_horizon}")
         archive = np.load(index_path(self.index_root, split), allow_pickle=False)
         self.metadata = json.loads(str(archive["metadata_json"]))
         if self.metadata.get("format") != FORMAT:
@@ -403,9 +422,12 @@ class V2WindowDataset(Dataset):
         if not self.entries:
             raise ValueError(f"index {split!r} has no embedded or manifest entries")
         all_shards = np.asarray(archive["shard"])
+        # Collection protocols may use large deterministic seed bases (for
+        # example 9,000,000/11,000,000).  int16 silently wraps those values
+        # and can merge otherwise distinct per-seed sampling strata.
         all_seeds = np.asarray([
             int(self.entries[int(shard_id)]["seed"]) for shard_id in all_shards
-        ], dtype=np.int16)
+        ], dtype=np.int64)
         selection = np.arange(len(archive["rows"]), dtype=np.int64)
         if overfit:
             shard = np.asarray(archive["shard"])
@@ -428,6 +450,8 @@ class V2WindowDataset(Dataset):
         selection = random_window_subset(selection, limit, random_seed)
         self.shard = np.asarray(archive["shard"])[selection]
         self.rows = np.asarray(archive["rows"])[selection]
+        self.past_rows = (np.asarray(archive["past_rows"])[selection]
+                          if "past_rows" in archive.files else None)
         self.goal = torch.from_numpy(np.asarray(archive["goal"])[selection].copy())
         self.proprio = torch.from_numpy(np.asarray(archive["proprio"])[selection].copy())
         self.world_state = torch.from_numpy(
@@ -441,6 +465,7 @@ class V2WindowDataset(Dataset):
             (self.shard[:, None].astype(np.int64), self.rows), axis=1)
         self._h5: dict[int, Any] = {}
         self._latents: dict[int, np.ndarray] = {}
+        self._token_rows: dict[int, dict[str, int]] = {}
         latent_meta = json.loads((self.latent_root / "metadata.json").read_text())
         if latent_meta.get("dataset_manifest_sha256") != self.metadata[
                 "dataset_manifest_sha256"]:
@@ -454,6 +479,7 @@ class V2WindowDataset(Dataset):
         value = dict(self.__dict__)
         value["_h5"] = {}
         value["_latents"] = {}
+        value["_token_rows"] = {}
         return value
 
     def _handles(self, shard_id: int):
@@ -465,6 +491,14 @@ class V2WindowDataset(Dataset):
             latent_path = self.latent_root / entry_latent_filename(
                 self.entries[shard_id])
             self._latents[shard_id] = np.load(latent_path, mmap_mode="r")
+            # New indices store the three history row ids directly.  Only
+            # legacy indices (or a requested horizon beyond those three
+            # chunks) need the more expensive token lookup fallback.
+            if self.past_rows is None or self.past_horizon > 30:
+                tokens = _decode(self._h5[shard_id]["token"][:])
+                self._token_rows[shard_id] = {
+                    token: row for row, token in enumerate(tokens)
+                }
         return self._h5[shard_id], self._latents[shard_id]
 
     def __len__(self):
@@ -478,6 +512,51 @@ class V2WindowDataset(Dataset):
         return torch.from_numpy(np.asarray(
             h5["range_values"][current], dtype=np.float32))
 
+    def _past_action_sequence(self, shard_id: int, current: int,
+                              indexed_rows=None):
+        """Assemble action chunks ending at ``current``, oldest first.
+
+        A row stores one 10-step action chunk.  The original v2 loader
+        returned only the current chunk; the standalone Action Expert now
+        consumes the current chunk plus the two preceding chunks (30 actions
+        by default).  Missing history at a scene boundary is left padded with
+        zeros and an invalid mask.
+        """
+        h5, _ = self._handles(shard_id)
+        chunk_count = self.past_horizon // 10
+        if indexed_rows is not None and chunk_count <= len(indexed_rows):
+            rows = [int(row) for row in indexed_rows[-chunk_count:]
+                    if int(row) >= 0]
+        else:
+            rows = [int(current)]
+            seen = {int(current)}
+            token_rows = self._token_rows[shard_id]
+            for _ in range(chunk_count - 1):
+                previous_token = _decode(h5["prev_token"][rows[-1]])
+                if not previous_token:
+                    break
+                previous = token_rows.get(previous_token)
+                if previous is None or previous in seen:
+                    break
+                rows.append(int(previous))
+                seen.add(int(previous))
+            rows.reverse()
+
+        past = np.zeros((self.past_horizon, 3), dtype=np.float32)
+        past_mask = np.zeros((self.past_horizon,), dtype=np.float32)
+        start = self.past_horizon - len(rows) * 10
+        for offset, row in enumerate(rows):
+            actions = np.asarray(
+                h5["normalized_action_sequence"][row], dtype=np.float32)
+            mask = np.asarray(h5["action_mask"][row], dtype=np.float32)
+            finite = np.isfinite(actions).all(axis=-1)
+            valid = mask * finite.astype(np.float32)
+            destination = start + offset * 10
+            past[destination:destination + 10] = np.where(
+                finite[:, None], actions, 0.0)
+            past_mask[destination:destination + 10] = valid
+        return past, past_mask
+
     def __getitem__(self, index):
         shard_id = int(self.shard[index])
         chain = [int(v) for v in self.rows[index]]
@@ -485,12 +564,10 @@ class V2WindowDataset(Dataset):
         h5, latent = self._handles(shard_id)
         future = np.asarray(h5["normalized_action_sequence"][future_rows],
                             dtype=np.float32)
-        if self.past_valid[index]:
-            past = np.asarray(h5["normalized_action_sequence"][current], np.float32)
-            past_mask = np.ones(10, np.float32)
-        else:
-            past = np.zeros((10, 3), np.float32)
-            past_mask = np.zeros(10, np.float32)
+        indexed_past_rows = (None if self.past_rows is None
+                             else self.past_rows[index])
+        past, past_mask = self._past_action_sequence(
+            shard_id, current, indexed_past_rows)
         target_rows = future_rows if self.all_future_targets else future_rows[-1:]
         target_latent = np.asarray(latent[target_rows], np.float32)
         target_image = np.asarray(h5["range_values"][target_rows], np.float32)
@@ -512,6 +589,7 @@ class V2WindowDataset(Dataset):
             frames.file.close()
         self._h5.clear()
         self._latents.clear()
+        self._token_rows.clear()
 
 
 class StratifiedSampler(Sampler[int]):

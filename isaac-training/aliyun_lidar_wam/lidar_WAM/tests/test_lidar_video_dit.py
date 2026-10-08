@@ -2,6 +2,7 @@ import torch
 
 from lidar_wam.models.action_dit import ActionDiT, JointHistoryWorldActionDiT
 from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
+from lidar_wam.runner.history_action_dit import _load_action_initialization
 
 
 def test_video_dit_shape_and_block_causal_mask():
@@ -53,3 +54,27 @@ def test_action_dit_context_cannot_read_noisy_action():
     context = model.context_tokens
     assert model.causal_mask[:context, context:].all()
     assert not model.causal_mask[context:, :].any()
+
+
+def test_action_initialization_preserves_selected_world(tmp_path):
+    source = JointHistoryWorldActionDiT(
+        LiDARVideoDiT(width=64, depth=1, heads=4, mlp_ratio=2),
+        width=64, depth=1, heads=4, mlp_ratio=2,
+        shared_world_depth=1)
+    checkpoint = tmp_path / "joint.pt"
+    torch.save({"model": source.state_dict(), "step": 9000}, checkpoint)
+
+    target = JointHistoryWorldActionDiT(
+        LiDARVideoDiT(width=64, depth=2, heads=4, mlp_ratio=2),
+        width=64, depth=1, heads=4, mlp_ratio=2,
+        shared_world_depth=1)
+    world_before = {
+        key: value.detach().clone()
+        for key, value in target.world.state_dict().items()
+    }
+    _load_action_initialization(target, checkpoint)
+
+    for key, value in source.action.state_dict().items():
+        assert torch.equal(target.action.state_dict()[key], value)
+    for key, value in world_before.items():
+        assert torch.equal(target.world.state_dict()[key], value)

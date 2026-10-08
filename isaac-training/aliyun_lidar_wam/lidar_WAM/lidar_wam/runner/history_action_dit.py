@@ -103,8 +103,10 @@ class JointHistoryDataset(HistoryLatentDataset):
         self.latent_root = Path(latent_root)
         self.root = Path(action_index_root) / split
         self.metadata = json.loads((self.root / "metadata.json").read_text())
-        if self.metadata.get("format") != ACTION_INDEX_FORMAT:
-            raise ValueError("incompatible terminal-aware action index")
+        index_format = self.metadata.get("format")
+        if index_format not in (ACTION_INDEX_FORMAT, INDEX_FORMAT):
+            raise ValueError(
+                f"incompatible history/action index format {index_format!r}")
         self.entries = self.metadata["entries"]
         self.counts = np.asarray(self.metadata["counts"], dtype=np.int64)
         self.ends = np.cumsum(self.counts)
@@ -229,6 +231,44 @@ def _load_world(checkpoint: Path, device):
     state = payload.get("model", payload)
     model.load_state_dict(state, strict=True)
     return model.to(device), payload, architecture
+
+
+def _load_action_initialization(model: JointHistoryWorldActionDiT,
+                                checkpoint: Path):
+    """Initialize only Action DiT while preserving the selected World DiT.
+
+    Joint checkpoints contain both ``world.*`` and ``action.*`` parameters.
+    Loading the complete state after ``--world-checkpoint`` would silently
+    replace the newly selected Future Model with the checkpoint's old World
+    branch.  This loader deliberately strips and loads only ``action.*``.
+
+    The standalone ``ActionOnlyModel`` used by ``action_expert_joint.py`` is a
+    different architecture and is rejected with an explicit error instead of
+    being partially or silently loaded.
+    """
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state = payload.get("model", payload)
+    prefix = "action."
+    action_state = {
+        key[len(prefix):]: value for key, value in state.items()
+        if key.startswith(prefix)
+    }
+    if not action_state:
+        raise ValueError(
+            f"{checkpoint} does not contain an ActionDiT 'action.*' branch. "
+            "A navrl-action-expert-training-v2 checkpoint (for example "
+            "action_expert_settled_4m/best.pt) is architecturally "
+            "incompatible; use a history-world-action DiT checkpoint.")
+    expected = set(model.action.state_dict())
+    received = set(action_state)
+    missing = sorted(expected - received)
+    unexpected = sorted(received - expected)
+    if missing or unexpected:
+        raise RuntimeError(
+            "ActionDiT checkpoint mismatch; "
+            f"missing={missing}, unexpected={unexpected}")
+    model.action.load_state_dict(action_state, strict=True)
+    return payload
 
 
 def _flow_batch(model, batch, device, precision, stats, action_weight,
@@ -365,7 +405,13 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
         "architecture": {
             "history_frames": 3, "prediction_frames": 1,
             "latent_shape": [4, 27, 5], "width": args.width,
-            "depth": args.depth, "heads": args.heads,
+            # ``depth`` is retained for backward compatibility and denotes
+            # Action DiT depth.  New checkpoints record both branches because
+            # a newly pretrained Future DiT may be deeper than Action DiT.
+            "depth": args.depth,
+            "action_depth": args.depth,
+            "world_depth": int(source.world.depth),
+            "heads": args.heads,
             "mlp_ratio": args.mlp_ratio, "action_horizon": 10,
             "action_dim": 3, "past_horizon": args.past_horizon,
             "shared_world_depth": args.shared_world_depth,
@@ -380,6 +426,10 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
         "source_world_checkpoint": str(args.world_checkpoint),
         "source_world_sha256": _sha256(args.world_checkpoint),
         "source_world_step": int(world_payload.get("step", -1)),
+        "source_action_checkpoint": (str(args.action_checkpoint)
+                                     if args.action_checkpoint else None),
+        "source_action_sha256": (_sha256(args.action_checkpoint)
+                                 if args.action_checkpoint else None),
         "resume_checkpoint": (str(args.resume_checkpoint)
                               if args.resume_checkpoint else None),
         "config": vars(args),
@@ -433,7 +483,16 @@ def train(args):
         mlp_ratio=args.mlp_ratio, past_horizon=args.past_horizon,
         shared_world_depth=args.shared_world_depth).to(device)
     resume_payload = None
+    action_payload = None
     initial_step = 0
+    if args.action_checkpoint is not None:
+        action_payload = _load_action_initialization(
+            model, args.action_checkpoint)
+        if (not args.reset_condition_stats
+                and "condition_stats" in action_payload):
+            # Preserve the normalization expected by the initialized Action
+            # DiT.  The flag allows an intentional new-dataset recalibration.
+            stats = action_payload["condition_stats"]
     if args.resume_checkpoint is not None:
         resume_payload = torch.load(
             args.resume_checkpoint, map_location="cpu", weights_only=False)
@@ -540,6 +599,18 @@ def train(args):
                 checkpoint = _payload(model, optimizer, step, args, stats,
                                       world_payload, metrics_val)
                 _atomic_save(checkpoint, run_dir / "latest.pt")
+                if (args.closed_loop_snapshot_every > 0
+                        and step % args.closed_loop_snapshot_every == 0):
+                    # Model-only immutable snapshots let asynchronous Isaac
+                    # evaluators process every requested checkpoint without
+                    # racing the continually refreshed latest.pt.  Optimizer
+                    # state is intentionally omitted to keep the queue small.
+                    deployment = dict(checkpoint)
+                    deployment.pop("optimizer", None)
+                    _atomic_save(
+                        deployment,
+                        run_dir / "closed_loop_queue" /
+                        f"step_{step:06d}.pt")
                 if score < best_score:
                     best_score = score
                     _atomic_save(checkpoint, run_dir / "best.pt")
@@ -583,7 +654,17 @@ def main():
         command.add_argument("--latent-root", type=Path, required=True)
         command.add_argument("--action-index-root", type=Path, required=True)
         command.add_argument("--world-checkpoint", type=Path, required=True)
+        command.add_argument(
+            "--action-checkpoint", type=Path,
+            help=("Initialize only Action DiT from a joint checkpoint while "
+                  "preserving --world-checkpoint. Starts a fresh optimizer "
+                  "and a new step counter."))
         command.add_argument("--resume-checkpoint", type=Path)
+        command.add_argument(
+            "--reset-condition-stats", action="store_true",
+            help=("With --action-checkpoint, recompute goal/proprio statistics "
+                  "from the new training set instead of preserving the "
+                  "checkpoint's deployment normalization."))
         command.add_argument("--out", type=Path, default=Path("outputs"))
         command.add_argument("--run-name", default="history_world_action_dit")
         command.add_argument("--steps", type=int, default=20000)
@@ -608,9 +689,26 @@ def main():
         command.add_argument("--action-sample-steps", type=int, default=10)
         command.add_argument("--action-sample-windows", type=int, default=128)
         command.add_argument("--eval-every", type=int, default=200)
+        command.add_argument(
+            "--closed-loop-snapshot-every", type=int, default=0,
+            help=("Save an immutable model-only checkpoint for asynchronous "
+                  "Isaac evaluation at this interval; zero disables it. The "
+                  "interval must be a multiple of --eval-every."))
         command.add_argument("--log-every", type=int, default=20)
         command.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if (args.action_checkpoint is not None
+            and args.resume_checkpoint is not None):
+        parser.error(
+            "--action-checkpoint and --resume-checkpoint are mutually "
+            "exclusive: the former preserves the selected Future Model; "
+            "the latter restores the complete joint model.")
+    if (args.closed_loop_snapshot_every < 0
+            or (args.closed_loop_snapshot_every > 0
+                and args.closed_loop_snapshot_every % args.eval_every != 0)):
+        parser.error(
+            "--closed-loop-snapshot-every must be zero or a positive "
+            "multiple of --eval-every")
     if args.command == "smoke":
         smoke(args)
     else:

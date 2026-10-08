@@ -10,6 +10,7 @@ import argparse
 import bisect
 import contextlib
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -208,7 +209,10 @@ def validate(model, loader, vae, scale, device, precision, flow_steps):
     are still penalised, so this metric cannot be gamed by predicting nothing.
     """
     model.eval()
-    totals = torch.zeros(7, device=device, dtype=torch.float64)
+    # [flow, x0, sampled latent, all-sample CD, nonempty CD,
+    #  valid-depth absolute error, valid-depth count, sample count,
+    #  nonempty-GT sample count, decoded range-image absolute error]
+    totals = torch.zeros(10, device=device, dtype=torch.float64)
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
            if precision == "bf16" else contextlib.nullcontext())
     generator = torch.Generator(device=device).manual_seed(12345)
@@ -222,11 +226,33 @@ def validate(model, loader, vae, scale, device, precision, flow_steps):
         # sensitive for an evaluation metric in bf16.
         prediction_image = vae.decode(predicted.float() / scale).sample.cpu().numpy()
         target_image = target_image.numpy()
-        cd_sum = nonempty_cd_sum = 0.0
+        cd_sum = nonempty_cd_sum = range_image_l1_sum = 0.0
+        depth_error_sum = depth_count = 0.0
         nonempty_count = 0
         for prediction, truth in zip(prediction_image, target_image):
+            # The physical LiDAR image occupies the first 18 elevation bins.
+            # Decoder mask values are unbounded logits-like activations, so a
+            # raw two-channel L1 is not meaningful.  Evaluate the range image
+            # in physical/binary form instead: normalized range MAE on GT hits
+            # plus binary hit-map error, with equal weight.  The result is a
+            # stable, dimensionless image-domain generation score.
+            pred_hit = prediction[1, :, :18] > 1.5
+            gt_hit = truth[1, :, :18] > 0.0
+            pred_range = np.clip(
+                (prediction[0, :, :18] + 1.0) * 5.0, 0.0, 10.0)
+            gt_range = np.clip(
+                (truth[0, :, :18] + 1.0) * 5.0, 0.0, 10.0)
+            hit_map_l1 = np.abs(
+                pred_hit.astype(np.float32) - gt_hit.astype(np.float32)).mean()
+            range_l1_normalized = (
+                float(np.abs(pred_range - gt_range)[gt_hit].mean()) / 10.0
+                if bool(gt_hit.any()) else 0.0)
+            range_image_l1_sum += 0.5 * (
+                float(hit_map_l1) + range_l1_normalized)
             row = frame_metrics(prediction, truth)
             cd_sum += float(row["cd_paper_m2"])
+            depth_error_sum += float(row["valid_range_abs_error_sum_m"])
+            depth_count += float(row["valid_range_count"])
             if not row["gt_empty"]:
                 nonempty_cd_sum += float(row["cd_paper_m2"])
                 nonempty_count += 1
@@ -234,20 +260,43 @@ def validate(model, loader, vae, scale, device, precision, flow_steps):
         totals += torch.tensor(
             (float(flow_mse) * count, float(x0_l1) * count,
              float((predicted-target).abs().mean()) * count, cd_sum,
-             nonempty_cd_sum, float(count), float(nonempty_count)),
+             nonempty_cd_sum, depth_error_sum, depth_count,
+             float(count), float(nonempty_count), range_image_l1_sum),
             device=device, dtype=torch.float64)
     if dist.is_initialized():
         dist.all_reduce(totals)
-    count = max(float(totals[5]), 1.0)
-    nonempty_count = max(float(totals[6]), 1.0)
+    count = max(float(totals[7]), 1.0)
+    depth_count = max(float(totals[6]), 1.0)
+    nonempty_count = max(float(totals[8]), 1.0)
     model.train()
+    latent_generation_l1 = float(totals[2] / count)
+    generation_loss = float(totals[9] / count)
+    depth_estimate_loss = float(totals[5] / depth_count)
     return {"flow_mse": float(totals[0] / count),
             "x0_l1": float(totals[1] / count),
-            "sample_l1": float(totals[2] / count),
-            "selection_score": float(totals[2] / count),
+            "sample_l1": latent_generation_l1,
+            "latent_generation_l1": latent_generation_l1,
+            "range_image_l1": generation_loss,
+            "generation_loss": generation_loss,
+            "selection_score": generation_loss,
             "cd_paper_m2": float(totals[3] / count),
             "nonempty_gt_cd_paper_m2": float(totals[4] / nonempty_count),
-            "samples": int(count), "nonempty_gt_samples": int(totals[6])}
+            "depth_estimate_loss": depth_estimate_loss,
+            "depth_valid_samples": int(totals[6]),
+            "samples": int(count),
+            "nonempty_gt_samples": int(totals[8])}
+
+
+def _load_initial_checkpoint(model, checkpoint: Path):
+    """Load model weights only; optimizer state is intentionally reset."""
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state = payload.get("model", payload)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Initial Future Model checkpoint is incompatible: "
+            f"missing={missing}, unexpected={unexpected}")
+    return payload
 
 
 def checkpoint_payload(model, optimizer, step, bests, args, dataset):
@@ -308,6 +357,14 @@ def train(args):
         num_workers=max(0, args.workers // 2), pin_memory=True)
     model = LiDARVideoDiT(
         args.width, args.depth, args.heads, args.mlp_ratio).to(device)
+    initial_payload = None
+    if args.init_checkpoint is not None:
+        initial_payload = _load_initial_checkpoint(model, args.init_checkpoint)
+        if rank == 0:
+            print(json.dumps({
+                "init_checkpoint": str(args.init_checkpoint),
+                "init_step": int(initial_payload.get("step", -1)),
+            }), flush=True)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank])
     optimizer = torch.optim.AdamW(
@@ -338,6 +395,7 @@ def train(args):
     iterator, epoch = iter(train_loader), 0
     bests = {"selection_score": float("inf"), "cd_paper_m2": float("inf"),
              "nonempty_gt_cd_paper_m2": float("inf")}
+    no_improve_evals = 0
     started = time.time()
     model.train()
     torch.cuda.reset_peak_memory_stats(device)
@@ -352,6 +410,15 @@ def train(args):
             history, target = next(iterator)
         history = history.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        if args.warmup_steps > 0 and step <= args.warmup_steps:
+            lr = args.lr * step / args.warmup_steps
+        else:
+            decay_steps = max(args.steps - args.warmup_steps, 1)
+            progress = min(max(step - args.warmup_steps, 0) / decay_steps, 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lr = args.min_lr + (args.lr - args.min_lr) * cosine
+        for group in optimizer.param_groups:
+            group["lr"] = lr
         optimizer.zero_grad(set_to_none=True)
         with amp:
             loss, flow_mse, x0_l1 = flow_batch(model, history, target)
@@ -362,6 +429,7 @@ def train(args):
             row = {"step": step, "loss": float(loss),
                    "flow_mse": float(flow_mse), "x0_l1": float(x0_l1),
                    "grad_norm": float(grad_norm),
+                   "lr": float(lr),
                    "peak_allocated_gib": (
                        torch.cuda.max_memory_allocated(device) / 2**30),
                    "elapsed_min": (time.time()-started)/60}
@@ -374,6 +442,7 @@ def train(args):
         evaluate = step % args.eval_every == 0
         save_latest = step % args.checkpoint_every == 0
         metrics = None
+        stop_after_eval = False
         if evaluate:
             metrics = validate(model, val_loader, vae, scale, device,
                                args.precision, args.flow_steps)
@@ -392,6 +461,7 @@ def train(args):
                         "best_nonempty_chamfer_m2.pt",
                         "best_nonempty_chamfer_m2_metrics.json"),
                 }
+                previous_selection = bests["selection_score"]
                 for metric, (weight_name, json_name) in updates.items():
                     if metrics[metric] < bests[metric]:
                         bests[metric] = metrics[metric]
@@ -402,11 +472,33 @@ def train(args):
                             json.dumps({"step": step, "optimized_metric": metric,
                                         "best_value": metrics[metric], **metrics},
                                        indent=2) + "\n")
+                if metrics["selection_score"] < previous_selection - args.early_stop_min_delta:
+                    no_improve_evals = 0
+                else:
+                    no_improve_evals += 1
+                if (args.early_stop_patience > 0
+                        and no_improve_evals >= args.early_stop_patience):
+                    print(json.dumps({
+                        "early_stop": True,
+                        "step": step,
+                        "patience_evals": no_improve_evals,
+                        "best_selection_score": bests["selection_score"],
+                    }), flush=True)
+                    stop_after_eval = True
+                else:
+                    stop_after_eval = False
+        if dist.is_initialized():
+            stop_flag = torch.tensor(
+                [int(stop_after_eval)], device=device, dtype=torch.int32)
+            dist.broadcast(stop_flag, src=0)
+            stop_after_eval = bool(stop_flag.item())
         if rank == 0 and (save_latest or evaluate):
             _atomic_torch_save(
                 checkpoint_payload(model, optimizer, step, bests, args, training),
                 run_dir / "latest.pt")
             writer.flush()
+            if stop_after_eval:
+                break
     if writer is not None:
         writer.close()
     if dist.is_initialized():
@@ -435,6 +527,11 @@ def main():
     training.add_argument("--heads", type=int, default=8)
     training.add_argument("--mlp-ratio", type=float, default=4.0)
     training.add_argument("--lr", type=float, default=1e-4)
+    training.add_argument("--min-lr", type=float, default=2e-7)
+    training.add_argument("--warmup-steps", type=int, default=200)
+    training.add_argument("--init-checkpoint", type=Path, default=None)
+    training.add_argument("--early-stop-patience", type=int, default=15)
+    training.add_argument("--early-stop-min-delta", type=float, default=1e-4)
     training.add_argument("--weight-decay", type=float, default=1e-2)
     training.add_argument("--grad-clip", type=float, default=1.0)
     training.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
