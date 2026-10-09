@@ -256,6 +256,8 @@ def checkpoint_payload(model, optimizer, step, bests, args, dataset):
         "format": FORMAT,
         "step": int(step), "best_metrics": {key: float(value)
                                                 for key, value in bests.items()},
+        "initial_checkpoint_step": int(
+            getattr(args, "initial_checkpoint_step", 0)),
         "model": source.state_dict(), "optimizer": optimizer.state_dict(),
         "architecture": {"history_frames": 3, "prediction_frames": 1,
                          "latent_shape": [4, 27, 5], "width": args.width,
@@ -308,6 +310,18 @@ def train(args):
         num_workers=max(0, args.workers // 2), pin_memory=True)
     model = LiDARVideoDiT(
         args.width, args.depth, args.heads, args.mlp_ratio).to(device)
+    args.initial_checkpoint_step = 0
+    if args.init_checkpoint is not None:
+        initial = torch.load(
+            args.init_checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(initial["model"], strict=True)
+        args.initial_checkpoint_step = int(initial.get("step", 0))
+        if rank == 0:
+            print(json.dumps({
+                "loaded_init_checkpoint": str(args.init_checkpoint),
+                "initial_checkpoint_step": args.initial_checkpoint_step,
+                "optimizer": "fresh",
+            }), flush=True)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank])
     optimizer = torch.optim.AdamW(
@@ -403,9 +417,14 @@ def train(args):
                                         "best_value": metrics[metric], **metrics},
                                        indent=2) + "\n")
         if rank == 0 and (save_latest or evaluate):
+            payload = checkpoint_payload(
+                model, optimizer, step, bests, args, training)
+            _atomic_torch_save(payload, run_dir / "latest.pt")
             _atomic_torch_save(
-                checkpoint_payload(model, optimizer, step, bests, args, training),
-                run_dir / "latest.pt")
+                payload, run_dir / f"checkpoint_step_{step:06d}.pt")
+            if metrics is not None:
+                (run_dir / f"checkpoint_step_{step:06d}_metrics.json").write_text(
+                    json.dumps({"step": step, **metrics}, indent=2) + "\n")
             writer.flush()
     if writer is not None:
         writer.close()
@@ -426,6 +445,8 @@ def main():
     prepare.add_argument("--splits", nargs="+", default=("train", "val"))
     training.add_argument("--out", type=Path, default=Path("outputs"))
     training.add_argument("--run-name", default="lidar_video_dit_history3_next1")
+    training.add_argument("--init-checkpoint", type=Path, default=None,
+                          help="load model weights and start with a fresh optimizer")
     training.add_argument("--steps", type=int, default=50000)
     training.add_argument("--micro-batch-size", type=int, default=16)
     training.add_argument("--eval-batch-size", type=int, default=16)

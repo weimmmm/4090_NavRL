@@ -59,7 +59,6 @@ from lidar_wam.runner.world_direct_horizon import (
     WorldV2View,
     evaluate_world_v2,
     frame_metrics,
-    weighted_future_loss,
 )
 
 
@@ -671,11 +670,58 @@ def _sha_or_none(path):
     return file_sha256(path) if path is not None and Path(path).is_file() else None
 
 
+class History3V2WindowDataset(V2WindowDataset):
+    """Expose causal ``[t-2,t-1,t]`` latents to an Action-only policy.
+
+    Windows at a scene boundary without three real observations are excluded;
+    no zero latent is presented as a real LiDAR scan.
+    """
+
+    _NUMPY_ROWS = (
+        "shard", "rows", "past_rows", "past_valid", "clearance",
+        "turn_score", "scene_id", "seeds", "source_indices")
+    _TORCH_ROWS = ("goal", "proprio", "world_state")
+
+    def __init__(self, *args, limit=None, random_seed=42, **kwargs):
+        super().__init__(
+            *args, limit=None, random_seed=random_seed, **kwargs)
+        if self.past_rows is None:
+            raise ValueError(
+                "history-three Action training requires an index with past_rows")
+        if not np.array_equal(self.past_rows[:, -1], self.rows[:, 0]):
+            raise RuntimeError("history/current latent alignment mismatch")
+        selection = np.flatnonzero((self.past_rows >= 0).all(axis=1))
+        if limit is not None and len(selection) > int(limit):
+            rng = np.random.default_rng(int(random_seed))
+            selection = np.sort(rng.choice(selection, int(limit), replace=False))
+        if not len(selection):
+            raise RuntimeError(f"No complete history-three windows in {self.split}")
+        tensor_selection = torch.from_numpy(selection)
+        for name in self._NUMPY_ROWS:
+            setattr(self, name, getattr(self, name)[selection])
+        for name in self._TORCH_ROWS:
+            setattr(self, name, getattr(self, name)[tensor_selection])
+
+    def __getitem__(self, index):
+        values = list(super().__getitem__(index))
+        shard_id = int(self.shard[index])
+        history_rows = np.asarray(self.past_rows[index], dtype=np.int64)
+        _, latent = self._handles(shard_id)
+        history = np.asarray(latent[history_rows], dtype=np.float32).copy()
+        values[0] = torch.from_numpy(history)
+        return tuple(values)
+
+
 def _v2_dataset(split, args, overfit=False, samples=None, limit=None):
-    return V2WindowDataset(
+    dataset_type = (
+        History3V2WindowDataset
+        if int(getattr(args, "observation_history_frames", 1)) == 3
+        else V2WindowDataset)
+    return dataset_type(
         split, args.dataset_root, args.latent_root, args.index_root,
         overfit=overfit, samples_per_seed=samples, random_seed=args.seed,
-        limit=limit, all_future_targets=args.command == "train-joint")
+        limit=limit, all_future_targets=args.command == "train-joint",
+        past_horizon=getattr(args, "past_horizon", 10))
 
 
 def _broadcast_stats(dataset, rank):
@@ -844,11 +890,36 @@ def _load_world_v2(path: Path):
     return model, int(payload.get("step", -1))
 
 
+def _adapt_action_position_embeddings(state, model):
+    """Resize temporal action/past positions when loading a 10-step model.
+
+    Older Action Expert checkpoints contain only one ten-action history chunk.
+    Interpolating their learned positions into the new 30-action context lets
+    a fine-tune start from the existing policy instead of failing on a shape
+    mismatch.  All other parameters remain strict checkpoint matches.
+    """
+    target_state = model.state_dict()
+    result = dict(state)
+    for key in ("action_expert.action_position", "action_expert.past_position"):
+        value = result.get(key)
+        target = target_state.get(key)
+        if value is None or target is None or tuple(value.shape) == tuple(target.shape):
+            continue
+        if value.ndim != 3 or target.ndim != 3 or value.shape[0] != target.shape[0]:
+            continue
+        resized = F.interpolate(
+            value.float().transpose(1, 2), size=target.shape[1],
+            mode="linear", align_corners=True).transpose(1, 2)
+        result[key] = resized.to(dtype=value.dtype)
+    return result
+
+
 def _make_v2_model(args):
     if args.command == "train-action":
         return ActionOnlyModel(
             args.action_width, args.action_depth, args.action_heads,
-            args.action_ffn_width), -1
+            args.action_ffn_width, past_horizon=args.past_horizon,
+            observation_history_frames=args.observation_history_frames), -1
     world_payload = torch.load(
         args.world_checkpoint, map_location="cpu", weights_only=False)
     world_gate = world_payload.get("validation", {}).get("gate", {})
@@ -862,16 +933,14 @@ def _make_v2_model(args):
     model = JointWorldActionModel(
         world, width=args.action_width, depth=args.action_depth,
         heads=args.action_heads, ffn_width=args.action_ffn_width,
-        future_attention_layers=args.future_attention_layers)
+        future_attention_layers=args.future_attention_layers,
+        past_horizon=args.past_horizon)
     action_payload = torch.load(
         args.action_checkpoint, map_location="cpu", weights_only=False)
     action_state = action_payload["model"]
     selected = {key: value for key, value in action_state.items()
                 if key.startswith(("observation.", "action_expert."))}
-    position_key = "action_expert.action_position"
-    if (position_key in selected
-            and selected[position_key].shape[1] != ACTION_HORIZON):
-        selected[position_key] = selected[position_key][:, :ACTION_HORIZON].clone()
+    selected = _adapt_action_position_embeddings(selected, model)
     candidate_missing = not any(
         key.startswith("action_expert.candidate_") for key in selected)
     incompatible = model.load_state_dict(selected, strict=False)
@@ -1091,6 +1160,9 @@ def _checkpoint_v2(path, model, optimizer, step, stats, args, world_step,
             "action_horizon": ACTION_HORIZON, "action_dim": ACTION_DIM,
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
+            "past_horizon": args.past_horizon,
+            "observation_history_frames": int(
+                getattr(args, "observation_history_frames", 1)),
             "future_attention_layers": (
                 args.future_attention_layers if is_joint else 0),
             "world_horizon": 1 if is_joint else 0,
@@ -1141,6 +1213,9 @@ def _candidate_policy_v2(path, model, step, stats, args, validation):
             "action_horizon": ACTION_HORIZON, "action_dim": ACTION_DIM,
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
+            "past_horizon": args.past_horizon,
+            "observation_history_frames": int(
+                getattr(args, "observation_history_frames", 1)),
         },
         "provenance": {
             "dataset_manifest_sha256": file_sha256(args.dataset_root/"manifest.json"),
@@ -1165,6 +1240,7 @@ def _candidate_joint_policy_v2(path, model, step, stats, args, validation):
             "action_horizon": ACTION_HORIZON, "action_dim": ACTION_DIM,
             "width": args.action_width, "depth": args.action_depth,
             "heads": args.action_heads, "ffn_width": args.action_ffn_width,
+            "past_horizon": args.past_horizon,
             "world_horizon": 1,
             "future_attention_layers": args.future_attention_layers,
             "joint_denoising": True,
@@ -1271,6 +1347,8 @@ def train_v2(args):
                 resume_state = dict(resume_state)
                 resume_state[position_key] = resume_state[position_key][
                     :, :ACTION_HORIZON].clone()
+            resume_state = _adapt_action_position_embeddings(
+                resume_state, _unwrap(model))
         if args.command == "train-action":
             incompatible = _unwrap(model).load_state_dict(
                 resume_state, strict=False)
@@ -1327,6 +1405,7 @@ def train_v2(args):
             "reset_stats": bool(args.reset_stats),
             "world_size": world_size,
             "global_batch_size": args.micro_batch_size*args.grad_accumulation*world_size,
+            "observation_history_frames": args.observation_history_frames,
             "precision": args.precision, "semantics": coordinate_semantics(),
             "action_validation_samples": len(val_data),
             "world_validation_samples": len(world_val_data),
@@ -1823,7 +1902,8 @@ def evaluate_v2(args):
             DirectHorizonWorldModel(), architecture["width"],
             architecture["depth"], architecture["heads"],
             architecture["ffn_width"],
-            architecture.get("future_attention_layers", 2))
+            architecture.get("future_attention_layers", 2),
+            architecture.get("past_horizon", 10))
         model.load_state_dict(payload["model"], strict=True)
     elif payload.get("format") in (JOINT_TRAINING_FORMAT_V3,
                                    JOINT_TRAINING_FORMAT_V4):
@@ -1833,7 +1913,10 @@ def evaluate_v2(args):
     else:
         model = ActionOnlyModel(
             architecture["width"], architecture["depth"], architecture["heads"],
-            architecture["ffn_width"])
+            architecture["ffn_width"],
+            architecture.get("past_horizon", 10),
+            observation_history_frames=int(
+                architecture.get("observation_history_frames", 1)))
         selected = {key: value for key, value in payload["model"].items()
                     if key.startswith(("observation.", "action_expert."))}
         position_key = "action_expert.action_position"
@@ -1844,6 +1927,10 @@ def evaluate_v2(args):
                    if key.startswith("action_expert.candidate_")}
         if set(incompatible.missing_keys) not in (set(), allowed):
             raise ValueError(f"action checkpoint mismatch: {incompatible}")
+    # The dataset must expose the same history length as the checkpoint.
+    args.past_horizon = int(architecture.get("past_horizon", 10))
+    args.observation_history_frames = int(
+        architecture.get("observation_history_frames", 1))
     model.to(device).eval()
     dataset = _v2_dataset(args.split, args, limit=args.eval_samples)
     summary = evaluate_actions_v2(model, dataset, payload["stats"], args, device)
@@ -1853,7 +1940,7 @@ def evaluate_v2(args):
     print(json.dumps(result, indent=2), flush=True)
 
 
-def _v2_common(parser):
+def _v2_common(parser, past_horizon: int = 30):
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--latent-root", type=Path, required=True)
     parser.add_argument("--index-root", type=Path, default=None)
@@ -1864,6 +1951,14 @@ def _v2_common(parser):
     parser.add_argument("--action-depth", type=int, default=8)
     parser.add_argument("--action-heads", type=int, default=8)
     parser.add_argument("--action-ffn-width", type=int, default=2048)
+    parser.add_argument(
+        "--past-horizon", type=int, default=int(past_horizon),
+        help=("Number of previously executed low-level actions exposed to the "
+              "Action Expert; must be a multiple of the 10-step chunk."))
+    parser.add_argument(
+        "--observation-history-frames", type=int, choices=(1, 3), default=1,
+        help=("Observed VAE latents exposed to the Action Expert. One keeps "
+              "the original policy; three uses causal [t-2,t-1,t] latents."))
     parser.add_argument("--future-attention-layers", type=int, default=2)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="bf16")
     parser.add_argument("--eval-batch-size", type=int, default=64)
@@ -1879,7 +1974,7 @@ def _v2_common(parser):
 
 
 def _v2_train_arguments(parser, joint=False):
-    _v2_common(parser)
+    _v2_common(parser, past_horizon=10 if joint else 30)
     parser.add_argument("--steps", type=int, default=10000 if joint else 20000)
     parser.add_argument("--micro-batch-size", type=int, default=1 if joint else 4)
     parser.add_argument("--grad-accumulation", type=int, default=4 if joint else 8)
@@ -2059,6 +2154,10 @@ def main():
         else:
             if args.grad_accumulation <= 0 or args.micro_batch_size <= 0:
                 parser.error("batch sizes and gradient accumulation must be positive")
+            if args.past_horizon < 10 or args.past_horizon % 10:
+                parser.error(
+                    "--past-horizon must be a positive multiple of 10 "
+                    "(one action chunk), e.g. 10 or 30")
             if args.eval_every <= 0 or args.checkpoint_every < 0:
                 parser.error(
                     "--eval-every must be positive and --checkpoint-every "

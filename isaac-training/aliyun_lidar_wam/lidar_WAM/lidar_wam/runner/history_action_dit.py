@@ -387,7 +387,14 @@ def _payload(model, optimizer, step, args, stats, world_payload, metrics):
             "history_frames": 3, "prediction_frames": 1,
             "future_action_rollout_steps": 3,
             "latent_shape": [4, 27, 5], "width": args.width,
-            "depth": args.depth, "heads": args.heads,
+            # World checkpoints can be deeper than the newly-created Action
+            # DiT.  Keep ``depth`` as the action depth for backward
+            # compatibility and serialize the two depths independently so
+            # deployment reconstructs the pretrained World exactly.
+            "depth": args.depth,
+            "action_depth": args.depth,
+            "world_depth": len(source.world.blocks),
+            "heads": args.heads,
             "mlp_ratio": args.mlp_ratio, "action_horizon": 10,
             "action_dim": 3, "past_horizon": args.past_horizon,
             "shared_world_depth": args.shared_world_depth,
@@ -604,6 +611,8 @@ def train(args):
                          + 0.5 * metrics_val["action_sample_l1"])
                 checkpoint = _payload(model, optimizer, step, args, stats,
                                       world_payload, metrics_val)
+                _atomic_save(
+                    checkpoint, run_dir / f"checkpoint_step_{step:06d}.pt")
                 _atomic_save(checkpoint, run_dir / "latest.pt")
                 if score < best_score:
                     best_score = score

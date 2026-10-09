@@ -118,13 +118,15 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
                 HISTORY_JOINT_GOAL_SPATIAL_FORMAT)):
         architecture = dict(payload.get("architecture", {}))
         width = int(architecture.get("width", 512))
-        depth = int(architecture.get("depth", 8))
+        action_depth = int(architecture.get(
+            "action_depth", architecture.get("depth", 8)))
+        world_depth = int(architecture.get("world_depth", action_depth))
         heads = int(architecture.get("heads", 8))
         mlp_ratio = float(architecture.get("mlp_ratio", 4.0))
-        world = LiDARVideoDiT(width=width, depth=depth, heads=heads,
+        world = LiDARVideoDiT(width=width, depth=world_depth, heads=heads,
                                mlp_ratio=mlp_ratio)
         model = JointHistoryWorldActionDiT(
-            world, width=width, depth=depth, heads=heads,
+            world, width=width, depth=action_depth, heads=heads,
             mlp_ratio=mlp_ratio,
             past_horizon=int(architecture.get("past_horizon", 30)),
             shared_world_depth=int(architecture.get("shared_world_depth", 6)))
