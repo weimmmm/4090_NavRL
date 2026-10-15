@@ -21,7 +21,7 @@ import torch
 from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.runner import stage1
 from lidar_wam.runner.lidar_video_dit import (
-    HistoryLatentDataset, sample_next,
+    HistoryLatentDataset, configure_prediction_from_payload, sample_next,
 )
 
 
@@ -35,6 +35,7 @@ def load_model(checkpoint: Path, device: torch.device):
         mlp_ratio=float(architecture["mlp_ratio"]),
     ).to(device).eval()
     model.load_state_dict(payload["model"], strict=True)
+    configure_prediction_from_payload(model, payload)
     return model, payload
 
 
@@ -91,7 +92,9 @@ def main(args):
         parameter.requires_grad_(False)
     scale = float(dataset.vae_metadata["scaling_factor"])
     history_device = history[None].to(device)
-    predicted = sample_next(model, history_device, args.flow_steps)[0]
+    predicted = sample_next(
+        model, history_device, args.flow_steps,
+        num_samples=args.flow_ensemble_size)[0]
     current_latent = history[-1:].to(device)
     current_reconstruction = vae.decode(current_latent / scale).sample[0].float().cpu().numpy()
     predicted_image = vae.decode(predicted[None] / scale).sample[0].float().cpu().numpy()
@@ -126,6 +129,7 @@ def main(args):
         "checkpoint_step": int(payload.get("step", -1)),
         "validation_index": index,
         "flow_steps": int(args.flow_steps),
+        "flow_ensemble_size": int(args.flow_ensemble_size),
         "point_counts": point_counts,
         "output": str(args.output),
     }
@@ -143,4 +147,5 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--flow-steps", type=int, default=20)
+    parser.add_argument("--flow-ensemble-size", type=int, default=1)
     main(parser.parse_args())

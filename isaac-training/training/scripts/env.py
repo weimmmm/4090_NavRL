@@ -18,6 +18,10 @@ import omni.isaac.orbit.utils.math as math_utils
 from omni.isaac.orbit.assets import RigidObject, RigidObjectCfg
 from omni.isaac.core.objects.ground_plane import GroundPlane
 import time
+from pathlib import Path
+
+import trimesh
+from omni.isaac.orbit.terrains.utils import create_prim_from_mesh
 
 class NavigationEnv(IsaacEnv):
 
@@ -30,12 +34,49 @@ class NavigationEnv(IsaacEnv):
 
     def __init__(self, cfg):
         print("[Navigation Environment]: Initializing Env...")
+        from fixed_route_selection import validate_fixed_route_slice
+        self.fixed_route_start_index = cfg.env.get("fixed_route_start_index", 0)
+        scene_path_value = str(cfg.env.get("scene_path", "") or "").strip()
+        self.fixed_scene = None
+        if scene_path_value:
+            scene_path = Path(scene_path_value).expanduser().resolve()
+            self.fixed_scene = torch.load(scene_path, map_location="cpu")
+        elif str(cfg.env.get("runtime_scene_id", "") or "").strip():
+            from generate_fixed_environments import build_scene_payload
+
+            self.fixed_scene = build_scene_payload(
+                str(cfg.env.runtime_scene_id),
+                int(cfg.env.num_obstacles),
+                int(cfg.env.map_seed),
+                int(cfg.env.route_seed),
+                num_drones=max(1024, int(cfg.env.num_envs)),
+            )
+
+        if self.fixed_scene is not None:
+            validate_fixed_route_slice(int(self.fixed_scene["num_drones"]),
+                                       int(cfg.env.num_envs), self.fixed_route_start_index)
+            if int(cfg.env.num_obstacles) != int(self.fixed_scene["obstacle_count"]):
+                raise ValueError(
+                    f"scene obstacle_count={self.fixed_scene['obstacle_count']} but "
+                    f"env.num_obstacles={cfg.env.num_obstacles}"
+                )
+        elif self.fixed_route_start_index != 0:
+            raise ValueError("A nonzero fixed-route offset requires a saved/runtime fixed scene")
         # LiDAR params:
         self.lidar_range = cfg.sensor.lidar_range
+        self.lidar_hfov = float(cfg.sensor.get("lidar_hfov", 360.0))
         self.lidar_vfov = (max(-89., cfg.sensor.lidar_vfov[0]), min(89., cfg.sensor.lidar_vfov[1]))
         self.lidar_vbeams = cfg.sensor.lidar_vbeams
         self.lidar_hres = cfg.sensor.lidar_hres
-        self.lidar_hbeams = int(360/self.lidar_hres)
+        self.lidar_h_sample = int(cfg.sensor.get("lidar_h_sample", 1))
+        self.lidar_v_sample = int(cfg.sensor.get("lidar_v_sample", 1))
+        if self.lidar_h_sample < 1 or self.lidar_v_sample < 1:
+            raise ValueError("LiDAR sampling factors must be positive integers")
+        self.lidar_hbeams = int(self.lidar_hfov / self.lidar_hres)
+        self.lidar_raw_hbeams = self.lidar_hbeams * self.lidar_h_sample
+        self.lidar_raw_vbeams = self.lidar_vbeams * self.lidar_v_sample
+        self.lidar_raw_hres = self.lidar_hres / self.lidar_h_sample
+        self.dyn_obs_feature_count = int(cfg.get("dynamic_observation_count", 1))
 
         super().__init__(cfg, cfg.headless)
         
@@ -51,8 +92,11 @@ class NavigationEnv(IsaacEnv):
             attach_yaw_only=True,
             # attach_yaw_only=False,
             pattern_cfg=patterns.BpearlPatternCfg(
-                horizontal_res=self.lidar_hres, # horizontal default is set to 10
-                vertical_ray_angles=torch.linspace(*self.lidar_vfov, self.lidar_vbeams) 
+                horizontal_fov=self.lidar_hfov,
+                horizontal_res=self.lidar_raw_hres,
+                vertical_ray_angles=torch.linspace(
+                    *self.lidar_vfov, self.lidar_raw_vbeams
+                ),
             ),
             debug_vis=False,
             mesh_prim_paths=[self.cfg.sensor.get(
@@ -61,7 +105,8 @@ class NavigationEnv(IsaacEnv):
         )
         self.lidar = RayCaster(ray_caster_cfg)
         self.lidar._initialize_impl()
-        self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams) 
+        self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams)
+        self.lidar_raw_resolution = (self.lidar_raw_hbeams, self.lidar_raw_vbeams)
         
         # start and target 
         with torch.device(self.device):
@@ -72,6 +117,10 @@ class NavigationEnv(IsaacEnv):
             self.target_dir = torch.zeros(self.num_envs, 1, 3)
             self.height_range = torch.zeros(self.num_envs, 1, 2)
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
+            self.eval_start_pos = torch.zeros(self.num_envs, 3)
+            self.eval_route_id = torch.zeros(self.num_envs, dtype=torch.long)
+            self.eval_source_route_index = torch.arange(self.num_envs, dtype=torch.long)
+            self.goal_stop_count = torch.zeros(self.num_envs, 1, dtype=torch.long)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.     
@@ -97,52 +146,70 @@ class NavigationEnv(IsaacEnv):
         light.spawn.func(light.prim_path, light.spawn, light.init_state.pos)
         sky_light.spawn.func(sky_light.prim_path, sky_light.spawn)
         
-        # Ground Plane: create it locally so startup does not depend on Nucleus assets.
-        GroundPlane(
-            prim_path="/World/defaultGroundPlane",
-            size=300.0,
-            z_position=0.01,
-            color=np.array([0.1, 0.1, 0.1]),
-        )
-
         self.map_range = [20.0, 20.0, 4.5]
-
-        terrain_cfg = TerrainImporterCfg(
-            num_envs=self.num_envs,
-            env_spacing=0.0,
-            prim_path="/World/ground",
-            terrain_type="generator",
-            terrain_generator=TerrainGeneratorCfg(
-                seed=0,
-                size=(self.map_range[0]*2, self.map_range[1]*2), 
-                border_width=5.0,
-                num_rows=1, 
-                num_cols=1, 
-                horizontal_scale=0.1,
-                vertical_scale=0.1,
-                slope_threshold=0.75,
-                use_cache=False,
-                color_scheme="height",
-                sub_terrains={
-                    "obstacles": HfDiscreteObstaclesTerrainCfg(
-                        horizontal_scale=0.1,
-                        vertical_scale=0.1,
-                        border_width=0.0,
-                        num_obstacles=self.cfg.env.num_obstacles,
-                        obstacle_height_mode="range",
-                        obstacle_width_range=(0.4, 1.1),
-                        obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
-                        obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
-                        platform_width=0.0,
-                    ),
-                },
-            ),
-            visual_material = None,
-            max_init_terrain_level=None,
-            collision_group=-1,
-            debug_vis=False,
-        )
-        terrain_importer = TerrainImporter(terrain_cfg)
+        if self.fixed_scene is not None:
+            # Build one static mesh containing the floor and every explicit box.
+            # Physics and RayCaster therefore consume the exact same fixed map.
+            meshes = [trimesh.creation.box(extents=(50.0, 50.0, 0.02))]
+            centers = self.fixed_scene["obstacle_center_xyz"].numpy()
+            sizes = self.fixed_scene["obstacle_size_xyz"].numpy()
+            for center, size in zip(centers, sizes):
+                transform = trimesh.transformations.translation_matrix(center)
+                meshes.append(trimesh.creation.box(extents=size, transform=transform))
+            self.terrain_mesh = trimesh.util.concatenate(meshes)
+            create_prim_from_mesh(
+                "/World/ground/terrain",
+                self.terrain_mesh,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.18, 0.18, 0.20)
+                ),
+                physics_material=sim_utils.RigidBodyMaterialCfg(),
+            )
+        else:
+            # Ground Plane: create it locally so startup does not depend on Nucleus assets.
+            GroundPlane(
+                prim_path="/World/defaultGroundPlane",
+                size=300.0,
+                z_position=0.01,
+                color=np.array([0.1, 0.1, 0.1]),
+            )
+            terrain_cfg = TerrainImporterCfg(
+                num_envs=self.num_envs,
+                env_spacing=0.0,
+                prim_path="/World/ground",
+                terrain_type="generator",
+                terrain_generator=TerrainGeneratorCfg(
+                    seed=0,
+                    size=(self.map_range[0]*2, self.map_range[1]*2),
+                    border_width=5.0,
+                    num_rows=1,
+                    num_cols=1,
+                    horizontal_scale=0.1,
+                    vertical_scale=0.1,
+                    slope_threshold=0.75,
+                    use_cache=False,
+                    color_scheme="height",
+                    sub_terrains={
+                        "obstacles": HfDiscreteObstaclesTerrainCfg(
+                            horizontal_scale=0.1,
+                            vertical_scale=0.1,
+                            border_width=0.0,
+                            num_obstacles=self.cfg.env.num_obstacles,
+                            obstacle_height_mode="range",
+                            obstacle_width_range=(0.4, 1.1),
+                            obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
+                            obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
+                            platform_width=0.0,
+                        ),
+                    },
+                ),
+                visual_material=None,
+                max_init_terrain_level=None,
+                collision_group=-1,
+                debug_vis=False,
+            )
+            terrain_importer = TerrainImporter(terrain_cfg)
+            self.terrain_mesh = terrain_importer.meshes["terrain"]
 
         if (self.cfg.env_dyn.num_obstacles == 0):
             return
@@ -308,7 +375,7 @@ class NavigationEnv(IsaacEnv):
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
-                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
+                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.dyn_obs_feature_count, num_dim_each_dyn_obs_state), device=self.device),
                 }),
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
@@ -340,6 +407,7 @@ class NavigationEnv(IsaacEnv):
             "episode_len": UnboundedContinuousTensorSpec(1),
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
+            "out_of_bounds": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
         }).expand(self.num_envs).to(self.device)
 
@@ -375,9 +443,41 @@ class NavigationEnv(IsaacEnv):
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.    
         else:
-            self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
-            self.target_pos[:, 0, 1] = -24.
-            self.target_pos[:, 0, 2] = 2.            
+            if self.fixed_scene is not None:
+                from fixed_route_selection import fixed_route_indices
+                indices = fixed_route_indices(env_ids, self.fixed_route_start_index)
+                self.eval_source_route_index[env_ids] = indices.to(self.device)
+                self.eval_route_id[env_ids] = self.fixed_scene["route_id"][indices].to(self.device)
+                self.eval_start_pos[env_ids] = self.fixed_scene["start_position"][indices].to(self.device)
+                self.target_pos[env_ids, 0] = self.fixed_scene["goal_position"][indices].to(self.device)
+                return
+            edge = float(self.cfg.env.eval_edge)
+            route_offset = int(self.cfg.env.get("eval_route_offset", 0))
+            route = (env_ids.long() + route_offset) % 4
+            start_lateral = torch.empty(len(env_ids), device=self.device).uniform_(-edge, edge)
+            goal_lateral = torch.empty(len(env_ids), device=self.device).uniform_(-edge, edge)
+            start = torch.zeros(len(env_ids), 3, device=self.device)
+            goal = torch.zeros(len(env_ids), 3, device=self.device)
+            start[:, 2] = 2.0
+            goal[:, 2] = 2.0
+
+            # 0: top->bottom, 1: bottom->top, 2: left->right, 3: right->left.
+            top_bottom = route == 0
+            bottom_top = route == 1
+            left_right = route == 2
+            right_left = route == 3
+            start[top_bottom, 0], start[top_bottom, 1] = start_lateral[top_bottom], edge
+            goal[top_bottom, 0], goal[top_bottom, 1] = goal_lateral[top_bottom], -edge
+            start[bottom_top, 0], start[bottom_top, 1] = start_lateral[bottom_top], -edge
+            goal[bottom_top, 0], goal[bottom_top, 1] = goal_lateral[bottom_top], edge
+            start[left_right, 0], start[left_right, 1] = -edge, start_lateral[left_right]
+            goal[left_right, 0], goal[left_right, 1] = edge, goal_lateral[left_right]
+            start[right_left, 0], start[right_left, 1] = edge, start_lateral[right_left]
+            goal[right_left, 0], goal[right_left, 1] = -edge, goal_lateral[right_left]
+
+            self.eval_route_id[env_ids] = route
+            self.eval_start_pos[env_ids] = start
+            self.target_pos[env_ids, 0] = goal
 
 
     def _reset_idx(self, env_ids: torch.Tensor):
@@ -401,10 +501,7 @@ class NavigationEnv(IsaacEnv):
             # pos[:, 0, 1] = -24.
             # pos[:, 0, 2] = 2.
         else:
-            pos = torch.zeros(len(env_ids), 1, 3, device=self.device)
-            pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
-            pos[:, 0, 1] = 24.
-            pos[:, 0, 2] = 2.
+            pos = self.eval_start_pos[env_ids].unsqueeze(1).clone()
         
         # Coordinate change: after reset, the drone's target direction should be changed
         self.target_dir[env_ids] = self.target_pos[env_ids] - pos
@@ -415,10 +512,16 @@ class NavigationEnv(IsaacEnv):
         facing_yaw = torch.atan2(diff[..., 1], diff[..., 0])
         rpy[..., 2] = facing_yaw
 
-        rot = euler_to_quaternion(rpy)
+        if self.fixed_scene is not None and not self.training:
+            from fixed_route_selection import fixed_route_indices
+            indices = fixed_route_indices(env_ids, self.fixed_route_start_index)
+            rot = self.fixed_scene["initial_orientation_wxyz"][indices].to(self.device).unsqueeze(1)
+        else:
+            rot = euler_to_quaternion(rpy)
         self.drone.set_world_poses(pos, rot, env_ids)
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.prev_drone_vel_w[env_ids] = 0.
+        self.goal_stop_count[env_ids] = 0
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
@@ -440,12 +543,15 @@ class NavigationEnv(IsaacEnv):
 
         # >>>>>>>>>>>>The relevant code starts from here<<<<<<<<<<<<
         # -----------Network Input I: LiDAR range data--------------
-        self.lidar_scan = self.lidar_range - (
+        self.lidar_scan_raw = self.lidar_range - (
             (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
             .norm(dim=-1)
             .clamp_max(self.lidar_range)
-            .reshape(self.num_envs, 1, *self.lidar_resolution)
-        ) # lidar scan store the data that is range - distance and it is in lidar's local frame
+            .reshape(self.num_envs, 1, *self.lidar_raw_resolution)
+        )
+        self.lidar_scan = self.lidar_scan_raw[
+            ..., ::self.lidar_h_sample, ::self.lidar_v_sample
+        ] # legacy 36 x 6 observation; SUPER consumes the full raw point cloud
 
         # Optional render for LiDAR
         if self._should_render(0):
@@ -455,7 +561,7 @@ class NavigationEnv(IsaacEnv):
             #     eye=x.cpu() + torch.as_tensor(self.cfg.viewer.eye),
             #     target=x.cpu() + torch.as_tensor(self.cfg.viewer.lookat)                        
             # )
-            v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_resolution, 3)
+            v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_raw_resolution, 3)
             # self.debug_draw.vector(x.expand_as(v[:, 0]), v[:, 0])
             # self.debug_draw.vector(x.expand_as(v[:, -1]), v[:, -1])
             self.debug_draw.vector(x.expand_as(v[:, 0])[0], v[0, 0])
@@ -491,7 +597,7 @@ class NavigationEnv(IsaacEnv):
             dyn_obs_rpos_expanded = dyn_obs_pos_expanded[..., :3] - self.root_state[..., :3] 
             dyn_obs_rpos_expanded[:, int(self.dyn_obs_state.size(0)/2):, 2] = 0.
             dyn_obs_distance_2d = torch.norm(dyn_obs_rpos_expanded[..., :2], dim=2)  # Shape: (1000, 40). calculate 2d distance to each obstacle for all drones
-            _, closest_dyn_obs_idx = torch.topk(dyn_obs_distance_2d, self.cfg.algo.feature_extractor.dyn_obs_num, dim=1, largest=False) # pick top N closest obstacle index
+            _, closest_dyn_obs_idx = torch.topk(dyn_obs_distance_2d, self.dyn_obs_feature_count, dim=1, largest=False) # pick top N closest obstacle index
             dyn_obs_range_mask = dyn_obs_distance_2d.gather(1, closest_dyn_obs_idx) > self.lidar_range
 
             # relative distance of obstacles in the goal frame
@@ -538,7 +644,7 @@ class NavigationEnv(IsaacEnv):
             closest_dyn_obs_distance_reward[dyn_obs_range_mask] = self.cfg.sensor.lidar_range
             
         else:
-            dyn_obs_states = torch.zeros(self.num_envs, 1, self.cfg.algo.feature_extractor.dyn_obs_num, 10, device=self.cfg.device)
+            dyn_obs_states = torch.zeros(self.num_envs, 1, self.dyn_obs_feature_count, 10, device=self.cfg.device)
             dynamic_collision = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.cfg.device)
             
         # -----------------Network Input Final--------------
@@ -552,7 +658,7 @@ class NavigationEnv(IsaacEnv):
 
         # -----------------Reward Calculation-----------------
         # a. safety reward for static obstacles
-        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan_raw).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
         
 
         # b. safety reward for dynamic obstacles
@@ -573,7 +679,7 @@ class NavigationEnv(IsaacEnv):
 
 
         # f. Collision condition with its penalty
-        static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
+        static_collision = einops.reduce(self.lidar_scan_raw, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
         collision = static_collision | dynamic_collision
         
         # Final reward calculation
@@ -586,10 +692,23 @@ class NavigationEnv(IsaacEnv):
         # self.reward[collision] -= 50. # collision
 
         # Terminate Conditions
-        reach_goal = (distance.squeeze(-1) < 0.5)
+        near_goal = distance.squeeze(-1) < float(self.cfg.env.get("success_distance", 0.5))
+        nearly_stopped = self.drone.vel_w[..., :3].norm(dim=-1) < float(
+            self.cfg.env.get("success_speed", 0.2)
+        )
+        stable = near_goal & nearly_stopped
+        self.goal_stop_count = torch.where(
+            stable,
+            self.goal_stop_count + 1,
+            torch.zeros_like(self.goal_stop_count),
+        )
+        reach_goal = self.goal_stop_count >= int(self.cfg.env.get("success_stop_steps", 10))
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > 4.
-        self.terminated = below_bound | above_bound | collision
+        half_extent = float(self.cfg.env.world_half_extent)
+        horizontal_out = (self.drone.pos[..., :2].abs() > half_extent).any(dim=-1)
+        out_of_bounds = below_bound | above_bound | horizontal_out
+        self.terminated = reach_goal | out_of_bounds | collision
         self.truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1) # progress buf is to track the step number
 
         # update previous velocity for smoothness calculation in the next ieteration
@@ -600,6 +719,7 @@ class NavigationEnv(IsaacEnv):
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
+        self.stats["out_of_bounds"] = out_of_bounds.float()
         self.stats["truncated"] = self.truncated.float()
 
         return TensorDict({

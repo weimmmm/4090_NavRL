@@ -16,7 +16,9 @@ import torch
 
 from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.runner import stage1
-from lidar_wam.runner.lidar_video_dit import HistoryLatentDataset, sample_next, _decode
+from lidar_wam.runner.lidar_video_dit import (
+    HistoryLatentDataset, _decode, configure_prediction_from_payload,
+    sample_next)
 from lidar_wam.runner.world_direct_horizon import frame_metrics
 
 
@@ -28,6 +30,7 @@ def load_model(checkpoint, device):
         heads=int(cfg["heads"]), mlp_ratio=float(cfg["mlp_ratio"]),
     ).to(device).eval()
     model.load_state_dict(payload["model"], strict=True)
+    configure_prediction_from_payload(model, payload)
     return model, payload
 
 
@@ -124,7 +127,10 @@ def main(args):
     predicted_latents = []
     rollout_history = histories
     for horizon_index in range(args.horizon):
-        predicted = sample_next(model, rollout_history, args.flow_steps)
+        predicted = sample_next(
+            model, rollout_history, args.flow_steps,
+            num_samples=args.flow_ensemble_size,
+            sampling_mode=args.sampling_mode)
         predicted_latents.append(predicted)
         rollout_history = torch.cat((rollout_history[:, 1:], predicted[:, None]), dim=1)
     predicted_latents = torch.stack(predicted_latents, dim=1)
@@ -142,13 +148,26 @@ def main(args):
         for sample_index, sample in enumerate(samples):
             metric = frame_metrics(predicted_images[sample_index, horizon_index],
                                    sample["images"][sample["future_rows"][horizon_index]])
-            rows.append(float(metric["cd_paper_m2"]))
+            rows.append(metric)
+        cd = [float(row["cd_paper_m2"]) for row in rows]
+        nonempty_cd = [float(row["cd_paper_m2"]) for row in rows
+                       if not bool(row["gt_empty"])]
+        depth_sum = sum(float(row["valid_range_abs_error_sum_m"])
+                        for row in rows)
+        depth_count = sum(int(row["valid_range_count"]) for row in rows)
+        tp = sum(int(row["tp"]) for row in rows)
+        fp = sum(int(row["fp"]) for row in rows)
+        fn = sum(int(row["fn"]) for row in rows)
         per_horizon.append({
             "horizon": horizon_index + 1,
-            "cd_mean_m2": float(np.mean(rows)),
-            "cd_median_m2": float(np.median(rows)),
-            "cd_p90_m2": float(np.percentile(rows, 90)),
-            "values_m2": rows,
+            "cd_mean_m2": float(np.mean(cd)),
+            "cd_median_m2": float(np.median(cd)),
+            "cd_p90_m2": float(np.percentile(cd, 90)),
+            "nonempty_gt_cd_mean_m2": float(np.mean(nonempty_cd)),
+            "valid_range_mae_m": depth_sum / max(depth_count, 1),
+            "mask_f1": (2.0 * tp) / max(2 * tp + fp + fn, 1),
+            "nonempty_gt_samples": len(nonempty_cd),
+            "values_m2": cd,
         })
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +207,8 @@ def main(args):
     summary = {
         "checkpoint": str(args.checkpoint), "checkpoint_step": int(payload.get("step", -1)),
         "count": int(args.count), "seed": int(args.seed), "flow_steps": int(args.flow_steps),
+        "flow_ensemble_size": int(args.flow_ensemble_size),
+        "sampling_mode": str(args.sampling_mode),
         "horizon": int(args.horizon), "initial_observation": "GT/sensor history t-2,t-1,t",
         "future_inputs": "previous model prediction only; no future GT is fed back",
         "per_horizon": per_horizon,
@@ -209,4 +230,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=20260924)
     parser.add_argument("--horizon", type=int, default=6)
     parser.add_argument("--flow-steps", type=int, default=20)
+    parser.add_argument("--flow-ensemble-size", type=int, default=1)
+    parser.add_argument("--sampling-mode",
+                        choices=("independent", "zero", "antithetic"),
+                        default="independent")
     main(parser.parse_args())

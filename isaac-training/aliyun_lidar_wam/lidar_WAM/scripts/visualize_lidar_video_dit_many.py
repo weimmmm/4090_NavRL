@@ -15,7 +15,8 @@ import torch
 
 from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.runner import stage1
-from lidar_wam.runner.lidar_video_dit import HistoryLatentDataset, sample_next
+from lidar_wam.runner.lidar_video_dit import (
+    HistoryLatentDataset, configure_prediction_from_payload, sample_next)
 from lidar_wam.runner.world_direct_horizon import frame_metrics
 
 
@@ -35,6 +36,7 @@ def load_model(checkpoint, device):
         heads=int(cfg["heads"]), mlp_ratio=float(cfg["mlp_ratio"]),
     ).to(device).eval()
     model.load_state_dict(payload["model"], strict=True)
+    configure_prediction_from_payload(model, payload)
     return model, payload
 
 
@@ -81,7 +83,9 @@ def main(args):
     scale = float(dataset.vae_metadata["scaling_factor"])
     history = torch.stack(histories).to(device)
     target = torch.stack(targets).to(device)
-    predicted = sample_next(model, history, args.flow_steps)
+    predicted = sample_next(
+        model, history, args.flow_steps,
+        num_samples=args.flow_ensemble_size)
     current_reconstruction = vae.decode(history[:, -1] / scale).sample.float().cpu().numpy()
     predicted_images = vae.decode(predicted / scale).sample.float().cpu().numpy()
     target_images = np.asarray(target_images)
@@ -131,6 +135,7 @@ def main(args):
     summary = {
         "checkpoint": str(args.checkpoint), "checkpoint_step": int(payload.get("step", -1)),
         "count": int(count), "indices": indices.tolist(), "flow_steps": int(args.flow_steps),
+        "flow_ensemble_size": int(args.flow_ensemble_size),
         "prediction_cd_mean_m2": float(np.mean([row["cd_paper_m2"] for row in rows])),
         "prediction_cd_median_m2": float(np.median([row["cd_paper_m2"] for row in rows])),
         "prediction_nonempty_gt_cd_mean_m2": float(np.mean([
@@ -152,4 +157,5 @@ if __name__ == "__main__":
     parser.add_argument("--count", type=int, default=16)
     parser.add_argument("--seed", type=int, default=20260924)
     parser.add_argument("--flow-steps", type=int, default=20)
+    parser.add_argument("--flow-ensemble-size", type=int, default=1)
     main(parser.parse_args())

@@ -1,16 +1,17 @@
-"""Add frozen predicted-next-LiDAR conditioning to a trained Action Expert.
+"""Add frozen autoregressive future-LiDAR conditioning to an Action Expert.
 
 This runner is a controlled ablation, not another shared World/Action joint
 model.  It loads the standalone Action Expert and a history-3 Future-DiT,
 freezes both pretrained networks, and trains only:
 
-* ``FutureChangeAdapter``;
+* ``FutureTokenAdapter`` (predicted latent only, by default);
 * Future cross-attention/norm in the final Action blocks;
 * the corresponding zero-initialized residual gates.
 
-The action path receives only a Future-DiT prediction sampled from noise.
-Ground-truth ``t+1`` LiDAR is never returned by the dataset or passed to the
-model.
+The default action path receives only the predicted next-frame latent sampled
+from noise.  Optional longer horizons use autoregressive predictions, never
+ground-truth future LiDAR.  Residual predictions are reconstructed into
+absolute VAE latents before they enter the adapter.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from lidar_wam.models.action_expert import FutureConditionedActionModel
 from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.runner.action_expert_joint import (
     action_to_flow, flow_to_action, normalize_condition)
+from lidar_wam.runner.lidar_video_dit import configure_prediction_from_payload
 
 
 FORMAT = "navrl-future-conditioned-action-training-v1"
@@ -104,7 +106,8 @@ class FutureActionDataset(Dataset):
         self.base.close()
 
 
-def _load_model(action_path: Path, future_path: Path, device):
+def _load_model(action_path: Path, future_path: Path, device,
+                future_adapter_mode: str = "direct"):
     action_payload = torch.load(action_path, map_location="cpu", weights_only=False)
     future_payload = torch.load(future_path, map_location="cpu", weights_only=False)
     action_arch = dict(action_payload.get("architecture", {}))
@@ -113,8 +116,10 @@ def _load_model(action_path: Path, future_path: Path, device):
         width=int(future_arch.get("width", 512)),
         depth=int(future_arch.get("depth", 8)),
         heads=int(future_arch.get("heads", 8)),
-        mlp_ratio=float(future_arch.get("mlp_ratio", 4.0)))
+        mlp_ratio=float(future_arch.get("mlp_ratio", 4.0)),
+        prediction_frames=int(future_arch.get("prediction_frames", 1)))
     future.load_state_dict(future_payload.get("model", future_payload), strict=True)
+    configure_prediction_from_payload(future, future_payload)
     model = FutureConditionedActionModel(
         future,
         width=int(action_arch.get("width", 512)),
@@ -122,7 +127,8 @@ def _load_model(action_path: Path, future_path: Path, device):
         heads=int(action_arch.get("heads", 8)),
         ffn_width=int(action_arch.get("ffn_width", 2048)),
         past_horizon=int(action_arch.get("past_horizon", 30)),
-        future_attention_layers=2)
+        future_attention_layers=2,
+        future_adapter_mode=future_adapter_mode)
     action_state = {
         key: value for key, value in action_payload["model"].items()
         if key.startswith(("observation.", "action_expert."))}
@@ -164,7 +170,8 @@ def _conditions(batch, device, stats):
     return history, current, action, goal, proprio, past, past_mask
 
 
-def _flow_loss(model, batch, device, stats, future_steps, precision):
+def _flow_loss(model, batch, device, stats, future_steps, future_horizon,
+               precision):
     history, current, action, goal, proprio, past, past_mask = _conditions(
         batch, device, stats)
     target = action_to_flow(action, stats)
@@ -172,7 +179,11 @@ def _flow_loss(model, batch, device, stats, future_steps, precision):
     sigma = torch.rand(len(target), device=device, dtype=target.dtype)
     noisy = ((1-sigma[:, None, None])*target
              + sigma[:, None, None]*noise)
-    future_noise = torch.randn_like(current)
+    future_noise = (
+        torch.randn_like(current) if int(future_horizon) == 1 else
+        torch.randn(
+            len(current), int(future_horizon), *current.shape[1:],
+            device=current.device, dtype=current.dtype))
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
            if precision == "bf16" else contextlib.nullcontext())
     with amp:
@@ -225,8 +236,11 @@ def _validate(model, loader, device, stats, args):
         action_noise = torch.randn(
             target.shape, device=device, dtype=target.dtype,
             generator=generator)
+        future_shape = (
+            current.shape if int(args.future_horizon) == 1 else
+            (len(current), int(args.future_horizon), *current.shape[1:]))
         future_noise = torch.randn(
-            current.shape, device=device, dtype=current.dtype,
+            future_shape, device=device, dtype=current.dtype,
             generator=generator)
         correct_tokens = model.encode_predicted_future(
             history, future_noise, args.future_steps, "correct")
@@ -271,12 +285,22 @@ def _checkpoint(model, optimizer, step, stats, args, metrics,
             "action_horizon": model.action_expert.horizon,
             "past_horizon": model.action_expert.past_horizon,
             "future_attention_layers": 2, "history_frames": 3,
+            "future_adapter_mode": model.future_adapter_mode,
             "future_width": model.future_model.width,
             "future_depth": model.future_model.depth,
             "future_heads": model.future_model.heads,
             "future_mlp_ratio": args.future_mlp_ratio,
+            "future_prediction_target": getattr(
+                model.future_model, "prediction_target", "absolute_latent"),
+            "future_context_space": "absolute_vae_latent",
+            "future_sampling_semantics_version": 2,
+            "future_residual_scale": getattr(
+                model.future_model, "prediction_residual_scale",
+                torch.ones(1, 4, 1, 1, device=next(model.parameters()).device))
+                .detach().float().cpu().reshape(-1).tolist(),
             "future_flow_steps": args.future_steps,
-            "fusion": "one_way_predicted_future_to_action_blocks_7_8",
+            "future_prediction_frames": args.future_horizon,
+            "fusion": "one_way_autoregressive_future_to_action_blocks_7_8",
         },
         "source_action_checkpoint": str(args.action_checkpoint),
         "source_action_step": int(action_payload.get("step", -1)),
@@ -302,7 +326,8 @@ def train(args):
     torch.manual_seed(args.seed+rank)
     np.random.seed(args.seed+rank)
     model, action_payload, future_payload, action_arch, future_arch = _load_model(
-        args.action_checkpoint, args.future_checkpoint, device)
+        args.action_checkpoint, args.future_checkpoint, device,
+        future_adapter_mode=args.future_adapter_mode)
     args.action_heads = int(action_arch.get("heads", 8))
     args.action_ffn_width = int(action_arch.get("ffn_width", 2048))
     args.future_mlp_ratio = float(future_arch.get("mlp_ratio", 4.0))
@@ -366,6 +391,20 @@ def train(args):
     if args.resume_from is not None:
         resume_payload = torch.load(
             args.resume_from, map_location="cpu", weights_only=False)
+        resume_horizon = int(resume_payload.get(
+            "architecture", {}).get("future_prediction_frames", 1))
+        if resume_horizon != int(args.future_horizon):
+            raise ValueError(
+                "resume checkpoint future horizon does not match the current "
+                f"run: checkpoint={resume_horizon}, requested={args.future_horizon}")
+        resume_adapter_mode = str(resume_payload.get(
+            "architecture", {}).get("future_adapter_mode", "change"))
+        if resume_adapter_mode != raw.future_adapter_mode:
+            raise ValueError(
+                "resume checkpoint Future adapter does not match the current "
+                f"run: checkpoint={resume_adapter_mode}, "
+                f"requested={raw.future_adapter_mode}; start a new fusion run "
+                "from the original Action and Future checkpoints")
         raw.load_state_dict(resume_payload["model"], strict=True)
         optimizer.load_state_dict(resume_payload["optimizer"])
         first_step = int(resume_payload.get("step", 0)) + 1
@@ -393,13 +432,14 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             loss, metrics = _flow_loss(
                 model, batch, device, stats, args.future_steps,
+                args.future_horizon,
                 args.precision)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
                 args.grad_clip)
             optimizer.step()
-            if rank == 0 and step % args.log_every == 0:
+            if rank == 0 and (step == first_step or step % args.log_every == 0):
                 row = {key: float(value) for key, value in metrics.items()}
                 row.update({"step": step, "grad_norm": float(grad_norm),
                             "elapsed_min": (time.time()-started)/60.0,
@@ -423,6 +463,7 @@ def train(args):
                         action_payload, future_payload)
                     _atomic_save(payload, run_dir/"latest.pt")
                     if (args.closed_loop_every > 0
+                            and step >= args.closed_loop_start
                             and step % args.closed_loop_every == 0):
                         _atomic_save(
                             payload,
@@ -467,6 +508,14 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--future-steps", type=int, default=4)
+    parser.add_argument(
+        "--future-adapter-mode", choices=("direct", "change"), default="direct",
+        help=("direct: encode only predicted future latent; change: legacy "
+              "concatenation of current, prediction and latent difference."))
+    parser.add_argument(
+        "--future-horizon", type=int, default=1,
+        help=("Number of autoregressively predicted future latent frames. "
+              "The default predicts only t+1."))
     parser.add_argument("--action-steps", type=int, default=10)
     parser.add_argument("--eval-samples", type=int, default=1024)
     parser.add_argument("--eval-every", type=int, default=200)
@@ -474,12 +523,19 @@ def main():
         "--closed-loop-every", type=int, default=500,
         help="Write an immutable checkpoint for asynchronous Isaac evaluation.")
     parser.add_argument(
+        "--closed-loop-start", type=int, default=0,
+        help="Do not enqueue Isaac closed-loop checkpoints before this step.")
+    parser.add_argument(
         "--resume-from", type=Path, default=None,
         help="Resume model and optimizer state from a future-fusion checkpoint.")
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.future_horizon <= 0:
+        parser.error("--future-horizon must be positive")
+    if args.closed_loop_start < 0:
+        parser.error("--closed-loop-start must be nonnegative")
     train(args)
 
 

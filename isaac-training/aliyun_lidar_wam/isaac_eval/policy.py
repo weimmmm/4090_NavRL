@@ -30,6 +30,7 @@ from lidar_wam.models.action_dit import (
     JointHistoryWorldActionDiT, flow_sample_action)
 from lidar_wam.models.lidar_video_dit import LiDARVideoDiT
 from lidar_wam.models.world import DirectHorizonWorldModel
+from lidar_wam.runner.lidar_video_dit import configure_prediction_target
 from lidar_wam.coordinates import (
     ACTION_FRAME,
     CONDITION_FRAME,
@@ -52,8 +53,11 @@ JOINT_TRAINING_FORMAT = "navrl-joint-world-action-training-v3"
 HISTORY_JOINT_FORMAT = "navrl-history-world-action-dit-v1"
 HISTORY_JOINT_MASKED_FORMAT = "navrl-history-world-action-dit-v2-masked-terminal"
 HISTORY_JOINT_GOAL_SPATIAL_FORMAT = "navrl-history-world-action-dit-v2-goal-spatial-attention"
-ACTION_TRAINING_FORMAT_V2 = "navrl-action-expert-training-v2"
-FUTURE_ACTION_FORMAT = "navrl-future-conditioned-action-training-v1"
+FUTURE_ACTION_JOINT_FORMAT = "navrl-future-conditioned-action-training-v1"
+LEGACY_FUTURE_ACTION_JOINT_FORMAT = (
+    "navrl-single-future-action-joint-training-v1")
+FUTURE_ACTION_JOINT_FORMATS = (
+    FUTURE_ACTION_JOINT_FORMAT, LEGACY_FUTURE_ACTION_JOINT_FORMAT)
 
 
 def load_circular_vae(device: torch.device):
@@ -83,16 +87,12 @@ class DeploymentActionModel(nn.Module):
     """The inference-only portion of the joint world/action checkpoint."""
 
     def __init__(self, width: int = 512, depth: int = 8, heads: int = 8,
-                 ffn_width: int = 2048, past_horizon: int = EXECUTION_HORIZON,
-                 horizon: int = EXECUTION_HORIZON,
-                 observation_history_frames: int = 1):
+                 ffn_width: int = 2048):
         super().__init__()
-        self.observation = LiDARObservationEncoder(
-            width, history_frames=observation_history_frames)
+        self.observation = LiDARObservationEncoder(width)
         self.action_expert = ActionFlowExpert(
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
-            future_attention_layers=0, past_horizon=int(past_horizon),
-            horizon=int(horizon))
+            future_attention_layers=0)
 
     def forward(self, noisy_action: torch.Tensor, timestep: torch.Tensor,
                 current_latent: torch.Tensor, goal: torch.Tensor,
@@ -115,35 +115,6 @@ def _policy_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
 def load_deployment_policy(checkpoint_path: Path, device: torch.device,
                            allow_legacy_body: bool = False):
     payload = torch_load(checkpoint_path, "cpu")
-    if (isinstance(payload, dict)
-            and payload.get("format") == FUTURE_ACTION_FORMAT):
-        architecture = dict(payload.get("architecture", {}))
-        future = LiDARVideoDiT(
-            width=int(architecture.get("future_width", 512)),
-            depth=int(architecture.get("future_depth", 8)),
-            heads=int(architecture.get("future_heads", 8)),
-            mlp_ratio=float(architecture.get("future_mlp_ratio", 4.0)))
-        model = FutureConditionedActionModel(
-            future, width=int(architecture.get("width", 512)),
-            depth=int(architecture.get("depth", 8)),
-            heads=int(architecture.get("heads", 8)),
-            ffn_width=int(architecture.get("ffn_width", 2048)),
-            past_horizon=int(architecture.get("past_horizon", 30)),
-            future_attention_layers=int(
-                architecture.get("future_attention_layers", 2)))
-        model.load_state_dict(payload["model"], strict=True)
-        model.deployment_future_steps = int(
-            architecture.get("future_flow_steps", 4))
-        model.to(device=device, dtype=torch.float32).eval()
-        semantics = dict(payload.get("semantics") or coordinate_semantics())
-        semantics.update({
-            "action_horizon": int(architecture.get("action_horizon", 10)),
-            "execution_horizon": EXECUTION_HORIZON,
-            "history_frames": 3,
-            "action_limit_mps": float(semantics.get("action_limit_mps", 2.0)),
-        })
-        return (model, payload["stats"], int(payload.get("step", -1)),
-                semantics)
     # History World/Action DiT training stores causal condition statistics
     # under ``condition_stats`` and keeps the complete World+Action model in
     # the checkpoint.  Its action horizon is ten (the executed chunk), and
@@ -154,12 +125,9 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
                 HISTORY_JOINT_GOAL_SPATIAL_FORMAT)):
         architecture = dict(payload.get("architecture", {}))
         width = int(architecture.get("width", 512))
-        # Older checkpoints used one depth for both branches.  New joint
-        # training can pair a deeper pretrained Future DiT with the existing
-        # eight-layer Action DiT, so reconstruct them independently.
-        depth = int(architecture.get("depth", 8))
-        world_depth = int(architecture.get("world_depth", depth))
-        action_depth = int(architecture.get("action_depth", depth))
+        action_depth = int(architecture.get(
+            "action_depth", architecture.get("depth", 8)))
+        world_depth = int(architecture.get("world_depth", action_depth))
         heads = int(architecture.get("heads", 8))
         mlp_ratio = float(architecture.get("mlp_ratio", 4.0))
         world = LiDARVideoDiT(width=width, depth=world_depth, heads=heads,
@@ -169,19 +137,7 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
             mlp_ratio=mlp_ratio,
             past_horizon=int(architecture.get("past_horizon", 30)),
             shared_world_depth=int(architecture.get("shared_world_depth", 6)))
-        # Some joint checkpoints predate the optional zero-gated World/Future
-        # cross-attention modules.  Their gates are initialized to zero, so
-        # allowing only those missing parameters preserves the checkpoint's
-        # exact deployed behavior while keeping all core weights strict.
-        incompatible = model.load_state_dict(payload["model"], strict=False)
-        optional_prefixes = ("action.world_cross_", "action.future_cross_")
-        unexpected = list(incompatible.unexpected_keys)
-        missing = [key for key in incompatible.missing_keys
-                   if not key.startswith(optional_prefixes)]
-        if unexpected or missing:
-            raise RuntimeError(
-                "Incompatible joint checkpoint: "
-                f"missing={missing}, unexpected={unexpected}")
+        model.load_state_dict(payload["model"], strict=True)
         model.to(device=device, dtype=torch.float32).eval()
         semantics = {
             "condition_frame": CONDITION_FRAME,
@@ -195,41 +151,6 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
         }
         return (model, payload.get("condition_stats", {}),
                 int(payload.get("step", -1)), semantics)
-    # Action-only fine-tuning checkpoints use a ten-step prediction chunk but
-    # retain thirty executed actions as causal history.  They share the
-    # compact ActionFlowExpert state layout; handle this format explicitly so
-    # deployment does not mistake the 30-step history for the noisy chunk.
-    if (isinstance(payload, dict)
-            and payload.get("format") == ACTION_TRAINING_FORMAT_V2):
-        architecture = dict(payload.get("architecture", {}))
-        width = int(architecture.get("width", 512))
-        depth = int(architecture.get("depth", 8))
-        heads = int(architecture.get("heads", 8))
-        ffn_width = int(architecture.get("ffn_width", 2048))
-        horizon = int(architecture.get("action_horizon", EXECUTION_HORIZON))
-        if horizon != EXECUTION_HORIZON:
-            raise ValueError(
-                f"Action training checkpoint predicts {horizon} steps; "
-                f"deployment executes {EXECUTION_HORIZON}")
-        model = DeploymentActionModel(
-            width, depth, heads, ffn_width,
-            past_horizon=int(architecture.get("past_horizon", 30)),
-            horizon=horizon,
-            observation_history_frames=int(
-                architecture.get("observation_history_frames", 1)))
-        model.load_state_dict(payload["model"], strict=True)
-        model.to(device=device, dtype=torch.float32).eval()
-        semantics = dict(payload.get("semantics") or coordinate_semantics())
-        # Older training metadata described the full causal history as the
-        # action horizon.  The model architecture is authoritative here.
-        semantics.update({
-            "action_horizon": horizon,
-            "execution_horizon": EXECUTION_HORIZON,
-            "history_frames": int(
-                architecture.get("observation_history_frames", 1)),
-            "action_limit_mps": float(semantics.get("action_limit_mps", 2.0)),
-        })
-        return model, payload.get("stats", {}), int(payload.get("step", -1)), semantics
     if not isinstance(payload, dict) or "model" not in payload or "stats" not in payload:
         raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
     semantics = payload.get("semantics")
@@ -252,19 +173,74 @@ def load_deployment_policy(checkpoint_path: Path, device: torch.device,
     depth = int(architecture.get("depth", 8))
     heads = int(architecture.get("heads", 8))
     ffn_width = int(architecture.get("ffn_width", 2048))
-    past_horizon = int(architecture.get("past_horizon", EXECUTION_HORIZON))
     state = payload["model"]
-    if payload.get("format") in (JOINT_POLICY_FORMAT, JOINT_TRAINING_FORMAT):
+    if payload.get("format") in FUTURE_ACTION_JOINT_FORMATS:
+        future = LiDARVideoDiT(
+            width=int(architecture.get("future_width", 512)),
+            depth=int(architecture.get("future_depth", 8)),
+            heads=int(architecture.get("future_heads", 8)),
+            mlp_ratio=float(architecture.get("future_mlp_ratio", 4.0)),
+            prediction_frames=int(
+                architecture.get("future_prediction_frames", 1)))
+        anchor_future = None
+        if bool(architecture.get("anchor_future_enabled", False)):
+            anchor_future = LiDARVideoDiT(
+                width=int(architecture.get("anchor_future_width", 512)),
+                depth=int(architecture.get("anchor_future_depth", 8)),
+                heads=int(architecture.get("anchor_future_heads", 8)),
+                mlp_ratio=float(
+                    architecture.get("anchor_future_mlp_ratio", 4.0)),
+                prediction_frames=int(
+                    architecture.get("anchor_future_prediction_frames", 1)))
+        model = FutureConditionedActionModel(
+            future, width=width, depth=depth, heads=heads,
+            ffn_width=ffn_width,
+            action_horizon=int(architecture.get("action_horizon", 10)),
+            aligned_action_chunks=bool(
+                architecture.get("aligned_action_chunks", False)),
+            past_horizon=int(architecture.get("past_horizon", 30)),
+            future_attention_layers=int(
+                architecture.get("future_attention_layers", 2)),
+            freeze_future_model=True,
+            future_adapter_mode=str(
+                architecture.get("future_adapter_mode", "change")),
+            anchor_future_model=anchor_future,
+            adaptive_horizon_gating=bool(
+                architecture.get("adaptive_horizon_gating", False)),
+            goal_conditioned_gating=bool(
+                architecture.get("goal_conditioned_gating", False)),
+            separate_far_future_attention=bool(
+                architecture.get("separate_far_future_attention", False)),
+            adaptive_horizon_gate_scale=float(
+                architecture.get("adaptive_horizon_gate_scale", 1.0)))
+        configure_prediction_target(
+            future,
+            str(architecture.get(
+                "future_prediction_target", "absolute_latent")),
+            architecture.get("future_residual_scale"))
+        if anchor_future is not None:
+            configure_prediction_target(
+                anchor_future,
+                str(architecture.get(
+                    "anchor_future_prediction_target", "absolute_latent")),
+                architecture.get("anchor_future_residual_scale"))
+        model.load_state_dict(state, strict=True)
+        model.future_flow_steps = int(
+            architecture.get("future_flow_steps", 4))
+        # Older shared coordinate metadata describes the 30-step source
+        # action window.  This deployed Future-conditioned head predicts and
+        # executes one ten-step chunk, as recorded by its architecture.
+        semantics = dict(semantics)
+        semantics["action_horizon"] = int(
+            architecture.get("action_horizon", 10))
+        semantics["execution_horizon"] = EXECUTION_HORIZON
+    elif payload.get("format") in (JOINT_POLICY_FORMAT, JOINT_TRAINING_FORMAT):
         model = JointWorldActionModel(
             DirectHorizonWorldModel(), width, depth, heads, ffn_width,
             int(architecture.get("future_attention_layers", 2)))
         model.load_state_dict(state, strict=True)
     else:
-        model = DeploymentActionModel(
-            width, depth, heads, ffn_width, past_horizon=past_horizon,
-            horizon=int(architecture.get("action_horizon", ACTION_HORIZON)),
-            observation_history_frames=int(
-                architecture.get("observation_history_frames", 1)))
+        model = DeploymentActionModel(width, depth, heads, ffn_width)
         if payload.get("format") != COMPACT_FORMAT:
             state = _policy_state_dict(state)
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -281,10 +257,12 @@ def export_compact_checkpoint(source: Path, destination: Path,
     payload = torch_load(source, "cpu")
     if not isinstance(payload, dict) or "model" not in payload or "stats" not in payload:
         raise ValueError(f"Unsupported checkpoint format: {source}")
-    if payload.get("format") in (JOINT_POLICY_FORMAT, JOINT_TRAINING_FORMAT):
+    if payload.get("format") in (
+            JOINT_POLICY_FORMAT, JOINT_TRAINING_FORMAT,
+            *FUTURE_ACTION_JOINT_FORMATS):
         raise ValueError(
-            "A v3 joint policy cannot be stripped to Action-only: its deployed "
-            "action depends on the Future UNet and FutureTokenAdapter.")
+            "A Future-conditioned joint policy cannot be stripped to "
+            "Action-only: its deployed action may depend on Future tokens.")
     if "semantics" not in payload and not allow_legacy_body:
         raise ValueError("refusing to export legacy checkpoint without coordinate semantics")
     selected = _policy_state_dict(payload["model"])
@@ -423,7 +401,8 @@ def sample_actions(model: nn.Module, latent: torch.Tensor,
                    past: torch.Tensor, past_mask: torch.Tensor,
                    stats: dict[str, Any], steps: int,
                    seeds: torch.Tensor,
-                   history: torch.Tensor | None = None) -> torch.Tensor:
+                   history: torch.Tensor | None = None,
+                   future_mode: str = "on") -> torch.Tensor:
     if seeds.numel() != len(latent):
         raise ValueError(
             f"Expected one policy seed per route, got {seeds.numel()} for "
@@ -449,55 +428,51 @@ def sample_actions(model: nn.Module, latent: torch.Tensor,
     if isinstance(model, FutureConditionedActionModel):
         if history is None:
             raise ValueError(
-                "history latents are required by Future-conditioned Action Expert")
+                "history latents are required by Future-conditioned Action DiT")
+        if future_mode not in ("on", "off"):
+            raise ValueError("future_mode must be 'on' or 'off'")
         goal = normalize_condition(goal, stats, "goal")
         proprio = normalize_condition(proprio, stats, "proprio")
         past = action_to_flow(past, stats) * past_mask.unsqueeze(-1)
         observation = model.encode_current(latent)
-        future_rows = []
-        for seed in seeds.detach().cpu().reshape(-1).tolist():
-            generator = torch.Generator(device="cpu").manual_seed(
-                (int(seed)+97_409) % (2**63-1))
-            future_rows.append(torch.randn(
-                (4, 27, 5), generator=generator, dtype=torch.float32))
-        future_noise = torch.stack(future_rows).to(
-            device=latent.device, dtype=latent.dtype, non_blocking=True)
-        future_tokens = model.encode_predicted_future(
-            history, future_noise,
-            steps=int(getattr(model, "deployment_future_steps", 4)),
-            mode="correct")
+        future_tokens = None
+        if future_mode == "on":
+            horizons = int(getattr(model.future_model, "prediction_frames", 1))
+            noise_shape = ((4, 27, 5) if horizons == 1
+                           else (horizons, 4, 27, 5))
+            future_rows = []
+            for seed in seeds.detach().cpu().reshape(-1).tolist():
+                generator = torch.Generator(device="cpu").manual_seed(
+                    (int(seed)+97_409) % (2**63-1))
+                future_rows.append(torch.randn(
+                    noise_shape, generator=generator, dtype=torch.float32))
+            future_noise = torch.stack(future_rows).to(
+                device=latent.device, dtype=latent.dtype, non_blocking=True)
+            future_tokens = model.encode_predicted_future(
+                history, future_noise, model.future_flow_steps,
+                mode="correct", gradient_steps=0)
         value = route_stable_action_noise(
             seeds, latent.device, latent.dtype, model.action_expert.horizon)
         schedule = torch.linspace(
             1, 0, int(steps)+1, device=latent.device, dtype=latent.dtype)
         for current, following in zip(schedule[:-1], schedule[1:]):
             timestep = torch.full(
-                (len(latent),), current*1000.0, device=latent.device,
-                dtype=latent.dtype)
+                (len(latent),), float(current*1000),
+                device=latent.device, dtype=latent.dtype)
             velocity = model.action_expert(
                 value, timestep, observation, goal, proprio, past, past_mask,
                 future_tokens=future_tokens)
             value = value+(following-current)*velocity
         return flow_to_action(value, stats)
 
-    action_horizon = int(model.action_expert.horizon)
-    value = route_stable_action_noise(
-        seeds, latent.device, latent.dtype, horizon=action_horizon)
+    value = route_stable_action_noise(seeds, latent.device, latent.dtype)
     raw_proprio = proprio
     goal = normalize_condition(goal, stats, "goal")
     proprio = normalize_condition(proprio, stats, "proprio")
     past = action_to_flow(past, stats) * past_mask.unsqueeze(-1)
-    if isinstance(model, JointWorldActionModel):
-        observation = model.encode_current(latent)
-    else:
-        history_frames = int(getattr(model.observation, "history_frames", 1))
-        if history_frames > 1:
-            if history is None:
-                raise ValueError(
-                    "history latents are required by history-three Action Expert")
-            observation = model.observation(history)
-        else:
-            observation = model.observation(latent)
+    observation = (model.encode_current(latent)
+                   if isinstance(model, JointWorldActionModel)
+                   else model.observation(latent))
     sigmas = torch.linspace(1, 0, steps + 1, device=latent.device, dtype=latent.dtype)
     joint = isinstance(model, JointWorldActionModel)
     if joint:
@@ -547,43 +522,75 @@ class RecedingHorizonPolicy:
     def __init__(self, checkpoint: Path, num_envs: int, device: torch.device,
                  flow_steps: int = 10, seed: int = 42, action_limit: float = 2.0,
                  allow_legacy_body: bool = False,
-                 route_ids: torch.Tensor | None = None):
+                 route_ids: torch.Tensor | None = None,
+                 future_mode: str = "on",
+                 secondary_checkpoint: Path | None = None,
+                 ensemble_clearance_margin: float = 0.05,
+                 ensemble_goal_weight: float = 0.10,
+                 **_ignored):
         self.device = device
         self.flow_steps = int(flow_steps)
         self.seed = int(seed)
         self.action_limit = float(action_limit)
+        if future_mode not in ("on", "off"):
+            raise ValueError("future_mode must be 'on' or 'off'")
+        self.future_mode = future_mode
         (self.model, self.stats, self.checkpoint_step,
          self.semantics) = load_deployment_policy(
             checkpoint, device, allow_legacy_body=allow_legacy_body)
+        self.secondary_model = None
+        self.secondary_stats = None
+        self.secondary_checkpoint_step = None
+        self.ensemble_clearance_margin = float(ensemble_clearance_margin)
+        self.ensemble_goal_weight = float(ensemble_goal_weight)
+        self.ensemble_primary_plans = 0
+        self.ensemble_secondary_plans = 0
+        if secondary_checkpoint is not None:
+            (self.secondary_model, self.secondary_stats,
+             self.secondary_checkpoint_step,
+             secondary_semantics) = load_deployment_policy(
+                Path(secondary_checkpoint), device,
+                allow_legacy_body=allow_legacy_body)
+            for key in ("condition_frame", "action_frame", "lidar_frame"):
+                if secondary_semantics.get(key) != self.semantics.get(key):
+                    raise ValueError(
+                        f"Ensemble checkpoint {key} mismatch: "
+                        f"{secondary_semantics.get(key)!r} != "
+                        f"{self.semantics.get(key)!r}")
         self.history_joint = isinstance(self.model, JointHistoryWorldActionDiT)
-        self.history_required = (
-            self.history_joint
-            or isinstance(self.model, FutureConditionedActionModel)
-            or int(getattr(
-                getattr(self.model, "observation", None),
-                "history_frames", 1)) > 1)
+        self.future_joint = isinstance(
+            self.model, FutureConditionedActionModel)
         self.execution_horizon = EXECUTION_HORIZON
-        self.past_horizon = int(
-            self.model.action.past_horizon
-            if self.history_joint
-            else self.model.action_expert.past_horizon)
+        self.past_horizon = (
+            int(self.model.action.past_horizon) if self.history_joint else
+            (int(self.model.action_expert.past_horizon)
+             if self.future_joint else EXECUTION_HORIZON))
+        if self.secondary_model is not None:
+            secondary_past = int(self.secondary_model.action_expert.past_horizon)
+            if secondary_past != self.past_horizon:
+                raise ValueError(
+                    "Ensemble checkpoints have different past horizons")
         self.condition_frame = self.semantics["condition_frame"]
         self.executed_head = (
-            "history_world_action_dit_flow10"
-            if self.history_joint else
-            ("future_conditioned_action_flow%d" % int(
-                self.model.action_expert.horizon)
-             if isinstance(self.model, FutureConditionedActionModel) else
-            ("joint_world_action_flow%d" % int(self.model.action_expert.horizon)
-             if isinstance(self.model, JointWorldActionModel)
-             else "flow%d" % int(self.model.action_expert.horizon))))
+            "history_world_action_dit_flow10" if self.history_joint else
+            (f"future{self.model.future_model.prediction_frames}_action_flow"
+             f"{self.model.action_expert.horizon}_execute10_"
+             f"{self.future_mode}" if self.future_joint else
+            ("joint_world_action_flow30"
+             if isinstance(self.model, JointWorldActionModel) else "flow30")))
+        if self.secondary_model is not None:
+            self.executed_head = (
+                f"ensemble_clearance_{self.executed_head}_secondary_"
+                f"future{self.secondary_model.future_model.prediction_frames}_"
+                f"flow{self.secondary_model.action_expert.horizon}_execute10")
         expected_limit = float(self.semantics.get("action_limit_mps", action_limit))
         if abs(expected_limit-self.action_limit) > 1e-6:
             raise ValueError(
                 f"checkpoint action_limit_mps={expected_limit} but environment uses "
                 f"{self.action_limit}")
         expected_horizon = (
-            10 if self.history_joint else int(self.model.action_expert.horizon))
+            int(self.model.action_expert.horizon) if self.future_joint else
+            (10 if self.history_joint else ACTION_HORIZON))
         if int(self.semantics.get("action_horizon", expected_horizon)) != expected_horizon:
             raise ValueError("checkpoint action horizon is incompatible with deployment")
         if int(self.semantics.get(
@@ -601,6 +608,8 @@ class RecedingHorizonPolicy:
         self.history_valid = torch.zeros(num_envs, device=device, dtype=torch.bool)
         self.action_index = torch.full((num_envs,), self.execution_horizon,
                                        device=device, dtype=torch.long)
+        self.ensemble_choice = torch.full(
+            (num_envs,), -1, device=device, dtype=torch.int8)
         self.route_id = (torch.arange(num_envs, device=device, dtype=torch.long)
                          if route_ids is None else
                          torch.as_tensor(route_ids, device=device, dtype=torch.long))
@@ -612,6 +621,36 @@ class RecedingHorizonPolicy:
         self.inference_seconds: list[float] = []
         self.yaw_error_abs: list[torch.Tensor] = []
 
+    def _candidate_score(self, env, indices: torch.Tensor,
+                         actions: torch.Tensor) -> torch.Tensor:
+        """Score a candidate using only current LiDAR, goal, and actions."""
+        actions = actions[:, :self.execution_horizon]
+        direction = env.target_dir[indices, 0]
+        world_velocity = normalized_to_world_velocity(
+            actions, direction, self.action_limit)
+        start = env.drone.pos[indices, 0]
+        path = start[:, None] + torch.cumsum(
+            world_velocity*float(env.cfg.sim.dt), dim=1)
+
+        hits = env.lidar.data.ray_hits_w[indices].reshape(len(indices), -1, 3)
+        sensor = env.lidar.data.pos_w[indices, None, :]
+        hit_range = (hits-sensor).norm(dim=-1)
+        valid = (torch.isfinite(hits).all(dim=-1)
+                 & (hit_range <= float(env.lidar_range)))
+        safe_hits = torch.where(
+            valid[:, :, None], hits, torch.full_like(hits, 1.0e4))
+        clearance = torch.cdist(path, safe_hits).amin(dim=(1, 2))
+        clearance = clearance.clamp_max(float(env.lidar_range))
+
+        target = env.target_pos[indices, 0]
+        progress = ((target-start).norm(dim=-1)
+                    - (target-path[:, -1]).norm(dim=-1))
+        altitude_penalty = (
+            (0.3-path[..., 2]).clamp_min(0)
+            + (path[..., 2]-3.9).clamp_min(0)).amax(dim=1)
+        return (clearance + self.ensemble_goal_weight*progress
+                - 10.0*altitude_penalty)
+
     def reset(self, mask: torch.Tensor | None = None):
         if mask is None:
             mask = torch.ones(len(self.action_index), device=self.device, dtype=torch.bool)
@@ -619,6 +658,7 @@ class RecedingHorizonPolicy:
         self.past[mask] = 0
         self.past_mask[mask] = 0
         self.action_index[mask] = self.execution_horizon
+        self.ensemble_choice[mask] = -1
         self.history_latents[mask] = 0
         self.history_valid[mask] = False
         self.route_replan_count[mask] = 0
@@ -647,8 +687,7 @@ class RecedingHorizonPolicy:
         started = time.perf_counter()
         image = lidar_range_image(env)[indices]
         latent = self.vae.encode(image).latent_dist.mode() * self.scale
-        state = env.drone.get_state(env_frame=False)[indices, 0, :13]
-        if self.history_required:
+        if self.history_joint or self.future_joint:
             valid = self.history_valid[indices]
             if valid.any():
                 valid_indices = indices[valid]
@@ -657,12 +696,13 @@ class RecedingHorizonPolicy:
                     latent[valid, None]), dim=1)
             if (~valid).any():
                 invalid_indices = indices[~valid]
-                self.history_latents[invalid_indices] = latent[
-                    ~valid, None].expand(-1, 3, -1, -1, -1)
+                self.history_latents[invalid_indices] = latent[~valid, None].expand(
+                    -1, 3, -1, -1, -1)
             history = self.history_latents[indices]
             self.history_valid[indices] = True
         else:
             history = None
+        state = env.drone.get_state(env_frame=False)[indices, 0, :13]
         target = env.target_pos[indices, 0]
         if self.condition_frame == CONDITION_FRAME:
             direction = env.target_dir[indices, 0]
@@ -682,7 +722,41 @@ class RecedingHorizonPolicy:
         chosen = sample_actions(
             self.model, latent, goal, proprio, self.past[indices],
             self.past_mask[indices], self.stats, self.flow_steps,
-            base_policy_seeds, history=history)
+            base_policy_seeds, history=history,
+            future_mode=self.future_mode)
+        if self.secondary_model is not None:
+            secondary = sample_actions(
+                self.secondary_model, latent, goal, proprio,
+                self.past[indices], self.past_mask[indices],
+                self.secondary_stats, self.flow_steps, base_policy_seeds,
+                history=history, future_mode=self.future_mode)
+            primary_score = self._candidate_score(env, indices, chosen)
+            secondary_score = self._candidate_score(env, indices, secondary)
+            unassigned = self.ensemble_choice[indices] < 0
+            initial_secondary = (
+                secondary_score
+                > primary_score+self.ensemble_clearance_margin)
+            if unassigned.any():
+                assigned_indices = indices[unassigned]
+                self.ensemble_choice[assigned_indices] = initial_secondary[
+                    unassigned].to(torch.int8)
+                print(json.dumps({
+                    "ensemble_initial_routes": self.route_id[
+                        assigned_indices].detach().cpu().tolist(),
+                    "ensemble_primary_scores": primary_score[
+                        unassigned].detach().cpu().tolist(),
+                    "ensemble_secondary_scores": secondary_score[
+                        unassigned].detach().cpu().tolist(),
+                    "ensemble_choose_secondary": initial_secondary[
+                        unassigned].detach().cpu().tolist(),
+                }), flush=True)
+            select_secondary = self.ensemble_choice[indices].bool()
+            chosen = torch.where(
+                select_secondary[:, None, None],
+                secondary[:, :self.execution_horizon],
+                chosen[:, :self.execution_horizon])
+            self.ensemble_secondary_plans += int(select_secondary.sum())
+            self.ensemble_primary_plans += int((~select_secondary).sum())
         self.actions[indices] = chosen[:, :self.execution_horizon]
         self.action_index[indices] = 0
         self.route_replan_count[indices] += 1
@@ -721,6 +795,17 @@ class RecedingHorizonPolicy:
                 "sensor_goal_yaw_abs_mean_deg": float(yaw.mean()*180.0/torch.pi),
                 "sensor_goal_yaw_abs_p95_deg": float(torch.quantile(yaw, 0.95)*180.0/torch.pi),
                 "sensor_goal_yaw_abs_max_deg": float(yaw.max()*180.0/torch.pi),
+            })
+        if self.secondary_model is not None:
+            total = self.ensemble_primary_plans+self.ensemble_secondary_plans
+            result.update({
+                "ensemble_primary_plans": self.ensemble_primary_plans,
+                "ensemble_secondary_plans": self.ensemble_secondary_plans,
+                "ensemble_secondary_fraction": (
+                    self.ensemble_secondary_plans/max(total, 1)),
+                "ensemble_clearance_margin_m": self.ensemble_clearance_margin,
+                "ensemble_goal_weight": self.ensemble_goal_weight,
+                "secondary_checkpoint_step": self.secondary_checkpoint_step,
             })
         return result
 

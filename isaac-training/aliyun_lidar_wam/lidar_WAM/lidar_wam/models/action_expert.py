@@ -161,7 +161,7 @@ class FutureTokenAdapter(nn.Module):
 
 
 class FutureChangeAdapter(nn.Module):
-    """Encode a predicted next latent and its change from the current scan.
+    """Encode predicted future latents and their changes from the current scan.
 
     The current latent is intentionally included next to the prediction.  This
     lets the adapter distinguish static geometry from predicted motion without
@@ -169,8 +169,52 @@ class FutureChangeAdapter(nn.Module):
     Expert.
     """
 
-    def __init__(self, width: int = 512):
+    def __init__(self, width: int = 512,
+                 temporal_deltas: bool = False,
+                 adaptive_horizon_gating: bool = False,
+                 goal_conditioned_gating: bool = False,
+                 separate_horizon_tokens: bool = False,
+                 adaptive_gate_scale: float = 0.005):
         super().__init__()
+        self.temporal_deltas = bool(temporal_deltas)
+        self.adaptive_horizon_gating = bool(adaptive_horizon_gating)
+        self.goal_conditioned_gating = bool(goal_conditioned_gating)
+        self.separate_horizon_tokens = bool(separate_horizon_tokens)
+        self.adaptive_gate_scale = float(adaptive_gate_scale)
+        if not 0.0 < self.adaptive_gate_scale <= 1.0:
+            raise ValueError("adaptive_gate_scale must be in (0, 1]")
+        if self.adaptive_horizon_gating and not self.temporal_deltas:
+            raise ValueError(
+                "Adaptive horizon gating requires temporal deltas")
+        if self.goal_conditioned_gating and not self.adaptive_horizon_gating:
+            raise ValueError(
+                "Goal-conditioned gating requires adaptive horizon gating")
+        if self.separate_horizon_tokens and not self.temporal_deltas:
+            raise ValueError(
+                "Separate horizon tokens require temporal deltas")
+        if self.separate_horizon_tokens and self.adaptive_horizon_gating:
+            raise ValueError(
+                "Separate horizon attention and adaptive scalar gating are "
+                "mutually exclusive")
+        # The direct-three model currently supports at most t+1:t+3.  These
+        # gates are absent from historical one-frame checkpoints and start at
+        # zero, making temporal_change exactly reduce to the proven t+1 path.
+        self.horizon_gate = (
+            nn.Parameter(torch.zeros(2)) if self.temporal_deltas else None)
+        # A tiny per-sample residual around the global t+2/t+3 gates.  It sees
+        # only pooled predicted-delta tokens, so it introduces no privileged
+        # state or future ground truth.  Zero initialization preserves the
+        # selected global-gate policy exactly at step zero.
+        self.adaptive_gate = (
+            nn.Sequential(
+                nn.LayerNorm(3*width + (4 if self.goal_conditioned_gating else 0)),
+                nn.Linear(3*width + (4 if self.goal_conditioned_gating else 0), 64),
+                nn.SiLU(),
+                nn.Linear(64, 2),
+            ) if self.adaptive_horizon_gating else None)
+        if self.adaptive_gate is not None:
+            nn.init.zeros_(self.adaptive_gate[-1].weight)
+            nn.init.zeros_(self.adaptive_gate[-1].bias)
         self.net = nn.Sequential(
             CircularConv2d(12, 128, 3), nn.SiLU(),
             CircularConv2d(128, width, 3),
@@ -182,21 +226,109 @@ class FutureChangeAdapter(nn.Module):
             persistent=False)
 
     def forward(self, current: torch.Tensor,
-                predicted_next: torch.Tensor) -> torch.Tensor:
+                predicted_next: torch.Tensor,
+                goal: torch.Tensor | None = None
+                ) -> (torch.Tensor | tuple[
+                    torch.Tensor, torch.Tensor | None]):
         expected = (4, 27, 5)
-        if (current.ndim != 4 or predicted_next.ndim != 4
-                or tuple(current.shape[1:]) != expected
-                or tuple(predicted_next.shape[1:]) != expected
+        multi_horizon = predicted_next.ndim == 5
+        if (current.ndim != 4 or tuple(current.shape[1:]) != expected
                 or len(current) != len(predicted_next)):
             raise ValueError(
-                "Expected matching current/predicted latents [B,4,27,5], got "
+                "Expected current latent [B,4,27,5] and matching predictions, got "
                 f"{tuple(current.shape)} and {tuple(predicted_next.shape)}")
+        if multi_horizon:
+            if tuple(predicted_next.shape[2:]) != expected:
+                raise ValueError(
+                    "Expected predicted future [B,H,4,27,5], got "
+                    f"{tuple(predicted_next.shape)}")
+            batch, horizons = predicted_next.shape[:2]
+            if self.temporal_deltas:
+                # Preserve the proven next-one-frame representation for t+1,
+                # then expose actual temporal increments for farther frames:
+                # [t1-t, t2-t1, t3-t2].  Repeating the current frame for all
+                # horizons makes absolute, mostly-static geometry dominate and
+                # gives t+2/t+3 almost no route-specific information.
+                reference = torch.cat(
+                    (current[:, None], predicted_next[:, :-1]), dim=1)
+            else:
+                reference = current[:, None].expand(
+                    -1, horizons, -1, -1, -1)
+            current = reference.flatten(0, 1)
+            predicted_next = predicted_next.flatten(0, 1)
+        elif predicted_next.ndim != 4 or tuple(predicted_next.shape[1:]) != expected:
+            raise ValueError(
+                "Expected predicted next latent [B,4,27,5], got "
+                f"{tuple(predicted_next.shape)}")
         value = torch.cat(
             (current, predicted_next, predicted_next-current), dim=1)
         feature = self.net(value)
         tokens = self.norm(feature.flatten(2).transpose(1, 2))
-        return (tokens + 0.10*self.polar_position.to(tokens.dtype)
-                + self.type_embedding.to(tokens.dtype))
+        tokens = (tokens + 0.10*self.polar_position.to(tokens.dtype)
+                  + self.type_embedding.to(tokens.dtype))
+        if multi_horizon:
+            tokens = tokens.reshape(batch, horizons, tokens.shape[1], -1)
+            if self.temporal_deltas:
+                if horizons > 3:
+                    raise ValueError(
+                        "temporal_change supports at most three horizons")
+                if self.separate_horizon_tokens:
+                    if horizons not in (1, 3):
+                        raise ValueError(
+                            "Separate horizon attention requires one or three "
+                            f"future frames, got {horizons}")
+                    near = tokens[:, 0]
+                    if horizons == 1:
+                        return near, None
+                    horizon_ids = torch.arange(
+                        2, horizons+1, device=tokens.device,
+                        dtype=tokens.dtype)
+                    horizon_position = sinusoidal_embedding(
+                        horizon_ids, tokens.shape[-1])
+                    far = tokens[:, 1:] + 0.10*horizon_position[None, :, None]
+                    return near, far.flatten(1, 2)
+                if horizons == 1:
+                    # The shuffled-far regularizer uses the proven t+1 path as
+                    # its target.  No farther-horizon gate is involved.
+                    tokens = tokens[:, 0]
+                elif self.adaptive_gate is not None:
+                    if horizons != 3:
+                        raise ValueError(
+                            "Adaptive horizon gating requires three futures")
+                    raw_gate = self.horizon_gate[:horizons-1]
+                    pooled = tokens.mean(dim=2).flatten(1)
+                    if self.goal_conditioned_gating:
+                        if goal is None or tuple(goal.shape) != (batch, 4):
+                            raise ValueError(
+                                "Goal-conditioned horizon gating requires "
+                                f"normalized goal [B,4], got "
+                                f"{None if goal is None else tuple(goal.shape)}")
+                        pooled = torch.cat((pooled, goal.to(pooled.dtype)), dim=-1)
+                    # Keep route-specific modulation close to the globally
+                    # validated gates.  The previous unbounded residual grew
+                    # to 0.15 (about 30x the safe gate) and hurt closed loop.
+                    residual = self.adaptive_gate_scale*torch.tanh(
+                        self.adaptive_gate(pooled))
+                    raw_gate = raw_gate[None] + residual
+                    farther = torch.tanh(raw_gate).to(tokens.dtype)
+                    weights = torch.cat((
+                        tokens.new_ones(batch, 1), farther), dim=1)
+                    tokens = (tokens*weights[:, :, None, None]).sum(1)
+                else:
+                    raw_gate = self.horizon_gate[:horizons-1]
+                    farther = torch.tanh(raw_gate).to(tokens.dtype)
+                    weights = torch.cat((tokens.new_ones(1), farther))
+                    tokens = (tokens*weights[None, :, None, None]).sum(1)
+            else:
+                horizon_ids = torch.arange(
+                    1, horizons+1, device=tokens.device, dtype=tokens.dtype)
+                horizon_position = sinusoidal_embedding(
+                    horizon_ids, tokens.shape[-1])
+                tokens = tokens + 0.10*horizon_position[None, :, None]
+                tokens = tokens.flatten(1, 2)
+        elif self.separate_horizon_tokens:
+            return tokens, None
+        return tokens
 
 
 class ActionSemanticAdapter(nn.Module):
@@ -224,9 +356,17 @@ class ActionFlowBlock(nn.Module):
     """Action attention with optional zero-gated predicted-future context."""
 
     def __init__(self, width: int, heads: int, ffn_width: int,
-                 future_attention: bool = False):
+                 future_attention: bool = False,
+                 separate_far_future_attention: bool = False,
+                 aligned_action_chunks: bool = False):
         super().__init__()
         self.future_attention = bool(future_attention)
+        self.separate_far_future_attention = bool(
+            separate_far_future_attention)
+        self.aligned_action_chunks = bool(aligned_action_chunks)
+        if self.separate_far_future_attention and not self.future_attention:
+            raise ValueError(
+                "Far-future attention requires future attention")
         self.norm1 = nn.LayerNorm(width)
         self.norm2 = nn.LayerNorm(width)
         self.norm3 = nn.LayerNorm(width)
@@ -246,28 +386,91 @@ class ActionFlowBlock(nn.Module):
             # The new path starts as an exact no-op for checkpoint-safe
             # initialization from the pretrained Action Expert.
             self.future_gate = nn.Parameter(torch.zeros(()))
+        if self.separate_far_future_attention:
+            self.norm_far_future = nn.LayerNorm(width)
+            self.far_future_attn = nn.MultiheadAttention(
+                width, heads, batch_first=True)
+            # Exact one-frame policy at initialization.  Gradients first
+            # update this scalar; once nonzero they also reach the cloned
+            # far-future attention weights.
+            self.far_future_gate = nn.Parameter(torch.zeros(()))
 
     def forward(self, action: torch.Tensor, context: torch.Tensor,
                 time_embedding: torch.Tensor,
-                future_tokens: torch.Tensor | None = None) -> torch.Tensor:
+                future_tokens: (torch.Tensor | tuple[
+                    torch.Tensor, torch.Tensor | None] | None) = None
+                ) -> torch.Tensor:
         shift1, scale1, gate1, shift2, scale2, gate2 = (
             self.modulation(time_embedding).chunk(6, dim=-1)
         )
         value = self.norm1(action)
         value = value * (1 + scale1[:, None]) + shift1[:, None]
-        value = self.self_attn(value, value, value, need_weights=False)[0]
+        self_mask = None
+        if self.aligned_action_chunks:
+            if action.shape[1] != 30:
+                raise ValueError(
+                    "Aligned three-horizon Action attention requires 30 "
+                    f"tokens, got {action.shape[1]}")
+            # Preserve the exact pretrained ten-action computation in every
+            # temporal chunk.  Cross-chunk lookahead is introduced only by
+            # the explicitly gated predicted-Future path below, so merely
+            # extending the output horizon cannot perturb the executed head.
+            chunk = torch.arange(30, device=action.device) // 10
+            self_mask = chunk[:, None] != chunk[None, :]
+        value = self.self_attn(
+            value, value, value, attn_mask=self_mask,
+            need_weights=False)[0]
         action = action + torch.tanh(gate1[:, None]) * value
         action = action + self.cross_attn(
             self.norm2(action), context, context, need_weights=False
         )[0]
-        if future_tokens is not None:
+        near_future = future_tokens
+        far_future = None
+        if isinstance(future_tokens, tuple):
+            near_future, far_future = future_tokens
+        if near_future is not None:
             if not self.future_attention:
                 raise ValueError(
                     "future tokens were passed to a block without future attention")
-            future_value = self.future_attn(
-                self.norm_future(action), future_tokens, future_tokens,
-                need_weights=False)[0]
+            if self.aligned_action_chunks:
+                future_value = torch.zeros_like(action)
+                future_value[:, :10] = self.future_attn(
+                    self.norm_future(action[:, :10]), near_future,
+                    near_future, need_weights=False)[0]
+            else:
+                future_value = self.future_attn(
+                    self.norm_future(action), near_future, near_future,
+                    need_weights=False)[0]
             action = action + torch.tanh(self.future_gate) * future_value
+        if far_future is not None:
+            if not self.separate_far_future_attention:
+                raise ValueError(
+                    "far-future tokens require separate far-future attention")
+            if self.aligned_action_chunks:
+                if far_future.shape[1] % 2:
+                    raise ValueError(
+                        "Aligned far-Future tokens must contain equal t+2 "
+                        "and t+3 grids")
+                split = far_future.shape[1] // 2
+                t2, t3 = far_future[:, :split], far_future[:, split:]
+                far_value = torch.zeros_like(action)
+                # The executed chunk may anticipate both farther horizons.
+                far_value[:, :10] = self.far_future_attn(
+                    self.norm_far_future(action[:, :10]), far_future,
+                    far_future, need_weights=False)[0]
+                # The two auxiliary action chunks provide strong, explicitly
+                # time-aligned supervision for the same far-Future mapping.
+                far_value[:, 10:20] = self.far_future_attn(
+                    self.norm_far_future(action[:, 10:20]), t2, t2,
+                    need_weights=False)[0]
+                far_value[:, 20:30] = self.far_future_attn(
+                    self.norm_far_future(action[:, 20:30]), t3, t3,
+                    need_weights=False)[0]
+            else:
+                far_value = self.far_future_attn(
+                    self.norm_far_future(action), far_future, far_future,
+                    need_weights=False)[0]
+            action = action + torch.tanh(self.far_future_gate) * far_value
         value = self.norm3(action)
         value = value * (1 + scale2[:, None]) + shift2[:, None]
         action = action + torch.tanh(gate2[:, None]) * self.ffn(value)
@@ -281,13 +484,21 @@ class ActionFlowExpert(nn.Module):
                  width: int = 512, depth: int = 8, heads: int = 8,
                  ffn_width: int = 2048, goal_dim: int = 4,
                  proprio_dim: int = 10, past_horizon: int = 10,
-                 future_attention_layers: int = 2):
+                 future_attention_layers: int = 2,
+                 separate_far_future_attention: bool = False,
+                 aligned_action_chunks: bool = False):
         super().__init__()
         self.action_dim = int(action_dim)
         self.horizon = int(horizon)
         self.width = int(width)
         self.past_horizon = int(past_horizon)
         self.future_attention_layers = int(future_attention_layers)
+        self.separate_far_future_attention = bool(
+            separate_far_future_attention)
+        self.aligned_action_chunks = bool(aligned_action_chunks)
+        if self.aligned_action_chunks and self.horizon != 30:
+            raise ValueError(
+                "Aligned action chunks require action horizon 30")
         if not 0 <= self.future_attention_layers <= depth:
             raise ValueError("future_attention_layers must be in [0, depth]")
         self.action_in = nn.Linear(action_dim, width)
@@ -304,7 +515,11 @@ class ActionFlowExpert(nn.Module):
         self.blocks = nn.ModuleList([
             ActionFlowBlock(
                 width, heads, ffn_width,
-                future_attention=index >= first_future_block)
+                future_attention=index >= first_future_block,
+                separate_far_future_attention=(
+                    self.separate_far_future_attention
+                    and index >= first_future_block),
+                aligned_action_chunks=self.aligned_action_chunks)
             for index in range(depth)
         ])
         self.norm = nn.LayerNorm(width)
@@ -356,7 +571,8 @@ class ActionFlowExpert(nn.Module):
 
     def decode_semantics(self, value: torch.Tensor, context: torch.Tensor,
                          time: torch.Tensor,
-                         future_tokens: torch.Tensor | None = None):
+                         future_tokens: (torch.Tensor | tuple[
+                             torch.Tensor, torch.Tensor | None] | None) = None):
         """Run post-fusion blocks and map hidden tokens to flow velocity."""
         first_future_block = len(self.blocks) - self.future_attention_layers
         for block in self.blocks[first_future_block:]:
@@ -376,7 +592,9 @@ class ActionFlowExpert(nn.Module):
                 observation_tokens: torch.Tensor, goal: torch.Tensor,
                 proprio: torch.Tensor, past_actions: torch.Tensor,
                 past_mask: torch.Tensor,
-                future_tokens: torch.Tensor | None = None) -> torch.Tensor:
+                future_tokens: (torch.Tensor | tuple[
+                    torch.Tensor, torch.Tensor | None] | None) = None
+                ) -> torch.Tensor:
         value, context, time = self.encode_semantics(
             noisy_action, timestep, observation_tokens, goal, proprio,
             past_actions, past_mask)
@@ -672,73 +890,267 @@ class ActionOnlyModel(nn.Module):
 
 
 class FutureConditionedActionModel(nn.Module):
-    """Frozen history Future-DiT plus a checkpoint-safe Action Expert.
+    """Future-DiT plus a checkpoint-safe Action Expert.
 
-    This is deliberately a one-way fusion model: the Future-DiT predicts one
-    next LiDAR latent from three observed latents, and only the final Action
-    blocks may read that prediction.  Actions never condition the Future-DiT,
-    and no ground-truth future latent is accepted by this interface.
+    This is deliberately a one-way fusion model.  Future-DiT predictions may
+    be produced directly or rolled out autoregressively from three observed
+    latents, and only the final Action blocks may read their tokens.  Actions
+    never condition the Future-DiT.  Joint training may compute an auxiliary
+    supervised Future velocity, but ground-truth future is never used as
+    Action context.
     """
 
     def __init__(self, future_model: nn.Module, width: int = 512,
                  depth: int = 8, heads: int = 8, ffn_width: int = 2048,
                  past_horizon: int = 30,
-                 future_attention_layers: int = 2):
+                 future_attention_layers: int = 2,
+                 freeze_future_model: bool = True,
+                 future_adapter_mode: str = "change",
+                 anchor_future_model: nn.Module | None = None,
+                 adaptive_horizon_gating: bool = False,
+                 goal_conditioned_gating: bool = False,
+                 separate_far_future_attention: bool = False,
+                 adaptive_horizon_gate_scale: float = 0.005,
+                 action_horizon: int = 10,
+                 aligned_action_chunks: bool = False):
         super().__init__()
         self.future_model = future_model
+        self.anchor_future_model = anchor_future_model
         self.observation = LiDARObservationEncoder(width)
         self.action_expert = ActionFlowExpert(
+            horizon=action_horizon,
             width=width, depth=depth, heads=heads, ffn_width=ffn_width,
             past_horizon=past_horizon,
-            future_attention_layers=future_attention_layers)
-        self.future_adapter = FutureChangeAdapter(width)
-        self.future_model.requires_grad_(False)
+            future_attention_layers=future_attention_layers,
+            separate_far_future_attention=separate_far_future_attention,
+            aligned_action_chunks=aligned_action_chunks)
+        if future_adapter_mode not in (
+                "change", "temporal_change", "direct"):
+            raise ValueError(
+                "future_adapter_mode must be 'change', 'temporal_change', "
+                "or 'direct'")
+        self.future_adapter_mode = future_adapter_mode
+        self.future_adapter = (
+            FutureTokenAdapter(width) if future_adapter_mode == "direct"
+            else FutureChangeAdapter(
+                width, temporal_deltas=(
+                    future_adapter_mode == "temporal_change"),
+                adaptive_horizon_gating=adaptive_horizon_gating,
+                goal_conditioned_gating=goal_conditioned_gating,
+                separate_horizon_tokens=separate_far_future_attention,
+                adaptive_gate_scale=adaptive_horizon_gate_scale))
+        self.future_model_frozen = bool(freeze_future_model)
+        self.future_model.requires_grad_(not self.future_model_frozen)
+        if self.anchor_future_model is not None:
+            self.anchor_future_model.requires_grad_(False)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # The pretrained Future-DiT is an immutable feature producer even
-        # while the newly added fusion layers are being optimized.
-        self.future_model.eval()
+        # Fusion-only ablations keep Future-DiT immutable.  True joint
+        # training explicitly opts out so Future-DiT follows the parent mode.
+        if self.future_model_frozen:
+            self.future_model.eval()
+        if self.anchor_future_model is not None:
+            self.anchor_future_model.eval()
         return self
 
     def encode_current(self, current_latent: torch.Tensor) -> torch.Tensor:
         return self.observation(current_latent)
 
-    @torch.no_grad()
-    def predict_next(self, history: torch.Tensor, initial_noise: torch.Tensor,
-                     steps: int = 4) -> torch.Tensor:
+    def adapt_predicted_future(
+            self, current_latent: torch.Tensor,
+            predicted_future: torch.Tensor,
+            goal: torch.Tensor | None = None
+            ) -> (torch.Tensor | tuple[
+                torch.Tensor, torch.Tensor | None]):
+        """Convert predicted latent frame(s) to Action cross-attention tokens."""
+        if self.future_adapter_mode == "direct":
+            return self.future_adapter(predicted_future)
+        return self.future_adapter(current_latent, predicted_future, goal=goal)
+
+    @staticmethod
+    def _zero_future_tokens(tokens):
+        if isinstance(tokens, tuple):
+            near, far = tokens
+            return (torch.zeros_like(near),
+                    None if far is None else torch.zeros_like(far))
+        return torch.zeros_like(tokens)
+
+    @staticmethod
+    def _shuffle_future_tokens(tokens):
+        if isinstance(tokens, tuple):
+            near, far = tokens
+            return (near, None if far is None or len(far) <= 1
+                    else far.roll(1, dims=0))
+        return tokens.roll(1, dims=0) if len(tokens) > 1 else tokens
+
+    def _predict_with_future_model(
+            self, future_model: nn.Module, history: torch.Tensor,
+            initial_noise: torch.Tensor, steps: int = 4,
+            gradient_steps: int | None = None) -> torch.Tensor:
         if history.ndim != 5 or tuple(history.shape[1:]) != (3, 4, 27, 5):
             raise ValueError(
                 f"Expected history [B,3,4,27,5], got {tuple(history.shape)}")
-        if initial_noise.shape != history[:, 0].shape:
+        prediction_frames = int(getattr(
+            future_model, "prediction_frames", 1))
+        expected_noise = ((len(history), 4, 27, 5) if prediction_frames == 1
+                          else (len(history), prediction_frames, 4, 27, 5))
+        if tuple(initial_noise.shape) != expected_noise:
             raise ValueError(
-                "Future noise must have shape [B,4,27,5], got "
+                f"Future noise must have shape {expected_noise}, got "
                 f"{tuple(initial_noise.shape)}")
+        steps = int(steps)
+        if steps <= 0:
+            raise ValueError("Future flow steps must be positive")
+        if gradient_steps is None:
+            gradient_steps = steps
+        gradient_steps = int(gradient_steps)
+        if not 0 <= gradient_steps <= steps:
+            raise ValueError("gradient_steps must be in [0, steps]")
         value = initial_noise
         schedule = torch.linspace(
-            1, 0, int(steps)+1, device=history.device, dtype=history.dtype)
-        for current, following in zip(schedule[:-1], schedule[1:]):
+            1, 0, steps+1, device=history.device, dtype=history.dtype)
+        gradient_start = steps-gradient_steps
+        for index, (current, following) in enumerate(
+                zip(schedule[:-1], schedule[1:])):
             timestep = torch.full(
                 (len(history),), current, device=history.device,
                 dtype=history.dtype)
-            velocity = self.future_model(history, value, timestep)
-            value = value + (following-current)*velocity
-        return value
+            track_gradient = torch.is_grad_enabled() and index >= gradient_start
+            with torch.set_grad_enabled(track_gradient):
+                velocity = future_model(history, value, timestep)
+                value = value + (following-current)*velocity
+        prediction_target = getattr(
+            future_model, "prediction_target", "absolute_latent")
+        if prediction_target == "absolute_latent":
+            return value
+        if prediction_target != "normalized_residual":
+            raise ValueError(
+                f"Unknown Future prediction target {prediction_target!r}")
+        scale = getattr(future_model, "prediction_residual_scale", None)
+        if scale is None:
+            raise ValueError(
+                "Normalized-residual Future model is missing its residual scale")
+        scale = scale.to(device=value.device, dtype=value.dtype)
+        current = history[:, -1]
+        if value.ndim == 5:
+            # Direct multi-frame residuals all reference the last observed
+            # frame. Autoregressive sampling calls this method separately for
+            # each horizon with an updated history.
+            current = current[:, None]
+            scale = scale[:, None]
+        # Adapter inputs and autoregressive history must contain absolute,
+        # scaled VAE latents, not the normalized residual flow endpoint.
+        return current + value * scale
+
+    def predict_next(self, history: torch.Tensor, initial_noise: torch.Tensor,
+                     steps: int = 4,
+                     gradient_steps: int | None = None) -> torch.Tensor:
+        return self._predict_with_future_model(
+            self.future_model, history, initial_noise, steps, gradient_steps)
+
+    def predict_anchor_next(
+            self, history: torch.Tensor, initial_noise: torch.Tensor,
+            steps: int = 4) -> torch.Tensor:
+        if self.anchor_future_model is None:
+            raise RuntimeError("No next-one-frame anchor Future-DiT is loaded")
+        return self._predict_with_future_model(
+            self.anchor_future_model, history, initial_noise, steps,
+            gradient_steps=0)
+
+    def apply_anchor_prediction(
+            self, history: torch.Tensor, future_noise: torch.Tensor,
+            predicted: torch.Tensor, steps: int = 4) -> torch.Tensor:
+        if self.anchor_future_model is None:
+            return predicted
+        if predicted.ndim != 5 or predicted.shape[1] < 2:
+            raise ValueError(
+                "Anchored Future fusion requires direct multi-frame "
+                f"predictions, got {tuple(predicted.shape)}")
+        anchor_noise = (
+            future_noise[:, 0] if future_noise.ndim == 5 else future_noise)
+        anchor = self.predict_anchor_next(
+            history, anchor_noise, steps=steps)
+        return torch.cat((anchor[:, None], predicted[:, 1:]), dim=1)
 
     def encode_predicted_future(
             self, history: torch.Tensor, future_noise: torch.Tensor,
-            steps: int = 4, mode: str = "correct") -> torch.Tensor | None:
+            steps: int = 4, mode: str = "correct",
+            gradient_steps: int | None = None,
+            goal: torch.Tensor | None = None) -> torch.Tensor | None:
         """Return causal Future tokens for controlled ablation experiments."""
         if mode == "disabled":
             return None
-        predicted = self.predict_next(history, future_noise, steps)
-        tokens = self.future_adapter(history[:, -1], predicted)
-        if mode == "zero":
-            return torch.zeros_like(tokens)
-        if mode == "shuffled":
-            if len(tokens) > 1:
-                return tokens.roll(1, dims=0)
+        gate = getattr(self.future_adapter, "horizon_gate", None)
+        exact_anchor_only = (
+            not self.training and self.anchor_future_model is not None
+            and gate is not None and bool(torch.count_nonzero(gate) == 0))
+        exact_anchor_only = (
+            exact_anchor_only
+            and not self.action_expert.separate_far_future_attention)
+        if exact_anchor_only:
+            anchor_noise = (
+                future_noise[:, 0] if future_noise.ndim == 5 else future_noise)
+            predicted = self.predict_anchor_next(
+                history, anchor_noise, steps=steps)
+            tokens = self.adapt_predicted_future(
+                history[:, -1], predicted, goal=goal)
+            if mode == "zero":
+                return self._zero_future_tokens(tokens)
+            if mode == "shuffled":
+                return self._shuffle_future_tokens(tokens)
+            if mode != "correct":
+                raise ValueError(
+                    "future mode must be correct, zero, shuffled, or disabled")
             return tokens
+        prediction_frames = int(getattr(
+            self.future_model, "prediction_frames", 1))
+        if future_noise.ndim == 4:
+            if prediction_frames != 1:
+                raise ValueError(
+                    f"Direct-{prediction_frames} Future-DiT requires "
+                    "[B,H,4,27,5] noise")
+            predicted = self.predict_next(
+                history, future_noise, steps, gradient_steps)
+        elif future_noise.ndim == 5:
+            if tuple(future_noise.shape[2:]) != (4, 27, 5):
+                raise ValueError(
+                    "Expected future rollout noise [B,H,4,27,5], got "
+                    f"{tuple(future_noise.shape)}")
+            if prediction_frames > 1:
+                if future_noise.shape[1] != prediction_frames:
+                    raise ValueError(
+                        f"Direct Future-DiT predicts {prediction_frames} "
+                        f"frames, got {future_noise.shape[1]} noise frames")
+                # One joint flow rollout: every horizon reads only the same
+                # three observed frames, never an earlier prediction.
+                predicted = self.predict_next(
+                    history, future_noise, steps, gradient_steps)
+            else:
+                # Backwards-compatible autoregressive rollout for the old
+                # next-one-frame Future-DiT.
+                rollout_history = history
+                predictions = []
+                for horizon in range(future_noise.shape[1]):
+                    prediction = self.predict_next(
+                        rollout_history, future_noise[:, horizon], steps,
+                        gradient_steps)
+                    predictions.append(prediction)
+                    rollout_history = torch.cat(
+                        (rollout_history[:, 1:], prediction[:, None]), dim=1)
+                predicted = torch.stack(predictions, dim=1)
+        else:
+            raise ValueError(
+                "Future noise must be [B,4,27,5] or [B,H,4,27,5], got "
+                f"{tuple(future_noise.shape)}")
+        predicted = self.apply_anchor_prediction(
+            history, future_noise, predicted, steps)
+        tokens = self.adapt_predicted_future(
+            history[:, -1], predicted, goal=goal)
+        if mode == "zero":
+            return self._zero_future_tokens(tokens)
+        if mode == "shuffled":
+            return self._shuffle_future_tokens(tokens)
         if mode != "correct":
             raise ValueError(
                 "future mode must be correct, zero, shuffled, or disabled")
@@ -752,12 +1164,15 @@ class FutureConditionedActionModel(nn.Module):
             future_noise: torch.Tensor, future_steps: int = 4,
             future_mode: str = "correct",
             observation_tokens: torch.Tensor | None = None,
-            future_tokens: torch.Tensor | None = None) -> torch.Tensor:
+            future_tokens: (torch.Tensor | tuple[
+                torch.Tensor, torch.Tensor | None] | None) = None,
+            future_gradient_steps: int | None = None) -> torch.Tensor:
         if observation_tokens is None:
             observation_tokens = self.encode_current(current_latent)
         if future_tokens is None and future_mode != "disabled":
             future_tokens = self.encode_predicted_future(
-                history, future_noise, future_steps, future_mode)
+                history, future_noise, future_steps, future_mode,
+                future_gradient_steps, goal=goal)
         return self.action_expert(
             noisy_action, action_timestep, observation_tokens, goal, proprio,
             past_actions, past_mask, future_tokens=future_tokens)
@@ -767,8 +1182,19 @@ class FutureConditionedActionModel(nn.Module):
                 goal: torch.Tensor, proprio: torch.Tensor,
                 past_actions: torch.Tensor, past_mask: torch.Tensor,
                 history: torch.Tensor, future_noise: torch.Tensor,
-                future_steps: int = 4, future_mode: str = "correct"):
+                future_steps: int = 4, future_mode: str = "correct",
+                future_noisy_target: torch.Tensor | None = None,
+                future_timestep: torch.Tensor | None = None,
+                future_gradient_steps: int | None = None):
+        future_velocity = None
+        if future_noisy_target is not None:
+            if future_timestep is None:
+                raise ValueError(
+                    "future_timestep is required with future_noisy_target")
+            future_velocity = self.future_model(
+                history, future_noisy_target, future_timestep)
         return (self.predict_action_velocity(
             noisy_action, action_timestep, current_latent, goal, proprio,
             past_actions, past_mask, history, future_noise, future_steps,
-            future_mode), None)
+            future_mode, future_gradient_steps=future_gradient_steps),
+                future_velocity)

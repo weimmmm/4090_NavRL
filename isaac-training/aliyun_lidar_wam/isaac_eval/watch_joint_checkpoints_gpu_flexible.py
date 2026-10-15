@@ -42,13 +42,17 @@ def evaluation_command(args, checkpoint: Path, output: Path, gpu: int,
         f"cd {args.container_root / 'isaac-training/aliyun_lidar_wam'} && "
         f"/isaac-sim/python.sh isaac_eval/evaluate.py "
         f"--checkpoint {checkpoint_in} --output {output_in} "
-        f"--environment {environment_in} --device cuda:0 "
+        # Do not remap CUDA_VISIBLE_DEVICES here.  PyTorch honors that
+        # remapping, but Isaac Sim's Vulkan renderer selects a physical GPU
+        # with ``activeGpu``.  Passing logical cuda:0 after exposing GPU N
+        # therefore makes CUDA use GPU N while Vulkan can still use physical
+        # GPU 0.  Use the physical index consistently for both subsystems.
+        f"--environment {environment_in} --device cuda:{gpu} "
         f"--route-start {route_start} --route-limit {route_limit} "
         f"--flow-steps {args.flow_steps}"
     )
     return [
-        "docker", "exec", "-e", f"CUDA_VISIBLE_DEVICES={gpu}",
-        args.container, "bash", "-lc", command,
+        "docker", "exec", args.container, "bash", "-lc", command,
     ]
 
 

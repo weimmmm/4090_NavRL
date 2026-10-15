@@ -79,12 +79,17 @@ class VideoDiTBlock(nn.Module):
 
 
 class LiDARVideoDiT(nn.Module):
-    """Predict one next latent from three clean historical LiDAR latents.
+    """Predict one or more future latents from three clean LiDAR latents.
 
     Inputs:
       history: ``[B,3,4,27,5]`` clean frozen-VAE latents
-      noisy_next: ``[B,4,27,5]`` rectified-flow state
+      noisy_next: ``[B,4,27,5]`` for one frame, or
+        ``[B,H,4,27,5]`` for a direct joint ``H``-frame prediction
       timestep: ``[B]`` in [0, 1]
+
+    For ``prediction_frames > 1`` the future frames are denoised jointly in a
+    single DiT call.  They may attend to each other and to all three observed
+    frames, while observed history tokens remain unable to read future noise.
     """
 
     history_frames = 3
@@ -93,14 +98,29 @@ class LiDARVideoDiT(nn.Module):
     latent_width = 5
 
     def __init__(self, width: int = 512, depth: int = 8, heads: int = 8,
-                 mlp_ratio: float = 4.0):
+                 mlp_ratio: float = 4.0, prediction_frames: int = 1,
+                 motion_conditioning: bool = False, past_horizon: int = 30,
+                 proprio_dim: int = 10, goal_dim: int = 4):
         super().__init__()
+        # The standalone Future DiT is latent-only.  Keep the legacy
+        # conditioning arguments accepted for runner/checkpoint compatibility;
+        # motion-conditioned branches belong to the joint World/Action model,
+        # not this Future model.
+        if motion_conditioning:
+            raise ValueError(
+                "LiDARVideoDiT does not implement motion conditioning; "
+                "use the joint World/Action model for that path")
         self.width = int(width)
         self.depth = int(depth)
         self.heads = int(heads)
+        self.prediction_frames = int(prediction_frames)
+        if self.prediction_frames <= 0:
+            raise ValueError("prediction_frames must be positive")
+        self.total_frames = self.history_frames + self.prediction_frames
         self.tokens_per_frame = self.latent_height * self.latent_width
         self.input_projection = nn.Linear(self.latent_channels, width)
-        self.frame_position = nn.Parameter(torch.zeros(1, 4, 1, width))
+        self.frame_position = nn.Parameter(
+            torch.zeros(1, self.total_frames, 1, width))
         nn.init.normal_(self.frame_position, std=0.02)
         self.register_buffer(
             "spatial_position",
@@ -123,11 +143,11 @@ class LiDARVideoDiT(nn.Module):
             "block_causal_mask", self._make_attention_mask(), persistent=False)
 
     def _make_attention_mask(self) -> torch.Tensor:
-        total = 4 * self.tokens_per_frame
-        history = 3 * self.tokens_per_frame
+        total = self.total_frames * self.tokens_per_frame
+        history = self.history_frames * self.tokens_per_frame
         # True means disallowed for torch MultiheadAttention.  Clean history
-        # never reads the noisy prediction block; the prediction block reads
-        # all three history frames and itself.
+        # never reads noisy prediction blocks.  Direct future blocks jointly
+        # read all three history frames and all future flow states.
         mask = torch.zeros(total, total, dtype=torch.bool)
         mask[:history, history:] = True
         return mask
@@ -178,20 +198,69 @@ class LiDARVideoDiT(nn.Module):
             tokens = block(tokens, condition, mask)
         return tokens
 
+    def encode_future_features(self, history: torch.Tensor,
+                               future: torch.Tensor,
+                               timestep: torch.Tensor,
+                               depth: int | None = None) -> torch.Tensor:
+        """Encode history plus predicted future frame(s), returning their tokens."""
+        expected_history = (3, 4, 27, 5)
+        expected_future = (self.prediction_frames, 4, 27, 5)
+        if history.ndim != 5 or tuple(history.shape[1:]) != expected_history:
+            raise ValueError(
+                f"Expected history [B,3,4,27,5], got {tuple(history.shape)}")
+        squeeze = self.prediction_frames == 1 and future.ndim == 4
+        if squeeze:
+            future = future[:, None]
+        if future.ndim != 5 or tuple(future.shape[1:]) != expected_future:
+            raise ValueError(
+                f"Expected future [B,{self.prediction_frames},4,27,5], got "
+                f"{tuple(future.shape)}")
+        depth = self.depth if depth is None else int(depth)
+        if not 0 <= depth <= self.depth:
+            raise ValueError(f"depth must be in [0,{self.depth}], got {depth}")
+        history_tokens = self.encode_history(history)
+        future_tokens = future.permute(0, 1, 3, 4, 2).reshape(
+            len(future), self.prediction_frames, self.tokens_per_frame,
+            self.latent_channels)
+        future_tokens = self.input_projection(future_tokens)
+        future_tokens = future_tokens + self.frame_position[:, 3:]
+        future_tokens = future_tokens + self.spatial_position.to(
+            future_tokens.dtype)
+        tokens = torch.cat((history_tokens, future_tokens.flatten(1, 2)), dim=1)
+        condition = self.time_mlp(timestep_embedding(timestep, self.width))
+        for block in self.blocks[:depth]:
+            tokens = block(tokens, condition, self.block_causal_mask)
+        value = tokens[:, self.history_frames * self.tokens_per_frame:]
+        if squeeze:
+            return value
+        return value.reshape(
+            len(history), self.prediction_frames, self.tokens_per_frame,
+            self.width)
+
     def forward(self, history: torch.Tensor, noisy_next: torch.Tensor,
                 timestep: torch.Tensor,
-                history_tokens: torch.Tensor | None = None) -> torch.Tensor:
+                history_tokens: torch.Tensor | None = None,
+                **kwargs) -> torch.Tensor:
+        # ``lidar_video_dit``'s generic flow runner passes optional motion
+        # keyword arguments even when motion conditioning is disabled.  They
+        # are intentionally ignored on this latent-only Future DiT path.
         expected_history = (3, 4, 27, 5)
         if history.ndim != 5 or tuple(history.shape[1:]) != expected_history:
             raise ValueError(
                 f"Expected history [B,3,4,27,5], got {tuple(history.shape)}")
-        if noisy_next.ndim != 4 or tuple(noisy_next.shape[1:]) != (4, 27, 5):
+        squeeze = self.prediction_frames == 1 and noisy_next.ndim == 4
+        noisy_future = noisy_next[:, None] if squeeze else noisy_next
+        expected_future = (self.prediction_frames, 4, 27, 5)
+        if (noisy_future.ndim != 5
+                or tuple(noisy_future.shape[1:]) != expected_future):
             raise ValueError(
-                f"Expected noisy next [B,4,27,5], got {tuple(noisy_next.shape)}")
+                f"Expected noisy future [B,{self.prediction_frames},4,27,5], "
+                f"got {tuple(noisy_next.shape)}")
         if history_tokens is None:
-            video = torch.cat((history, noisy_next[:, None]), dim=1)
+            video = torch.cat((history, noisy_future), dim=1)
             tokens = video.permute(0, 1, 3, 4, 2).reshape(
-                len(video), 4, self.tokens_per_frame, 4)
+                len(video), self.total_frames, self.tokens_per_frame,
+                self.latent_channels)
             tokens = self.input_projection(tokens)
             tokens = tokens + self.frame_position + self.spatial_position.to(tokens.dtype)
             tokens = tokens.flatten(1, 2)
@@ -201,24 +270,23 @@ class LiDARVideoDiT(nn.Module):
                 raise ValueError(
                     f"Expected history tokens [B,{expected_tokens[0]},{expected_tokens[1]}], "
                     f"got {tuple(history_tokens.shape)}")
-            noisy_tokens = noisy_next.permute(0, 2, 3, 1).reshape(
-                len(noisy_next), self.tokens_per_frame, self.latent_channels)
+            noisy_tokens = noisy_future.permute(0, 1, 3, 4, 2).reshape(
+                len(noisy_future), self.prediction_frames,
+                self.tokens_per_frame, self.latent_channels)
             noisy_tokens = self.input_projection(noisy_tokens)
-            # ``noisy_tokens`` is already flattened to [B,135,C].  Squeeze
-            # the singleton frame axis from the positional buffers; keeping
-            # the four-dimensional buffers here would broadcast to [1,B,135,C]
-            # and silently corrupt the batch dimension.
-            noisy_tokens = noisy_tokens + self.frame_position[:, 3] + self.spatial_position[:, 0].to(
+            noisy_tokens = noisy_tokens + self.frame_position[:, 3:] + self.spatial_position.to(
                 noisy_tokens.dtype)
-            tokens = torch.cat((history_tokens, noisy_tokens), dim=1)
+            tokens = torch.cat((history_tokens, noisy_tokens.flatten(1, 2)), dim=1)
         condition = self.time_mlp(timestep_embedding(timestep, self.width))
         mask = self.block_causal_mask
         for block in self.blocks:
             tokens = block(tokens, condition, mask)
-        future = tokens[:, -self.tokens_per_frame:]
+        future = tokens[:, -self.prediction_frames*self.tokens_per_frame:]
         shift, scale = self.final_modulation(condition).chunk(2, dim=-1)
         future = self.final_norm(future) * (1 + scale[:, None]) + shift[:, None]
         future = self.output_projection(future)
-        return future.reshape(
-            len(history), self.latent_height, self.latent_width,
-            self.latent_channels).permute(0, 3, 1, 2).contiguous()
+        future = future.reshape(
+            len(history), self.prediction_frames, self.latent_height,
+            self.latent_width, self.latent_channels).permute(
+                0, 1, 4, 2, 3).contiguous()
+        return future[:, 0] if squeeze else future

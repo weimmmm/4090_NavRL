@@ -127,3 +127,75 @@ isaac-training/training/scripts/outputs/
 isaac-training/third_party/warp/_build/
 
 isaac-training/outputs/
+
+# Local experiment snapshots and generated reports (keep the original code).
+/.runtime/
+/artifacts/
+/.tmp_*
+**/logs/
+**/tensorboard/
+**/runs/
+events.out.tfevents.*
+
+# Recorded datasets and latent caches, including dataset symlinks.
+/datasets/
+/isaac-training/aliyun_lidar_wam/datasets/
+/isaac-training/training/datasets/
+**/latent_cache/
+**/latent_caches/
+*.hdf5
+*.npz
+*.npy
+*.pickle
+*.parquet
+*.arrow
+*.pcd
+*.ply
+*.bag
+*.mcap
+
+# Model weights and exported models, wherever an experiment saves them.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.plan
+*.bin
+
+# Generated figures, recordings and binary reports.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.exr
+*.avi
+*.mov
+*.mkv
+*.webm
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Experiment metrics, not general JSON/YAML configuration files.
+**/action_expert_checkpoint_*.json
+**/*_metrics.json
+**/*_summary.json
+**/*_samples.json
+**/best_validation.json
+**/metrics.json
+**/summary.json
+
+# Local backups made during migration; retain the active source/config files.
+*.pre_l20_migration

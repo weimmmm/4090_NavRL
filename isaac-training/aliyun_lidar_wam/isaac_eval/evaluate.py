@@ -31,6 +31,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path,
                         default=default_checkpoint)
+    parser.add_argument(
+        "--secondary-checkpoint", type=Path,
+        help=("Optional second causal policy. Both candidates are generated "
+              "and a current-LiDAR clearance score selects each chunk."))
+    parser.add_argument(
+        "--ensemble-clearance-margin", type=float, default=0.05,
+        help=("Required safety-score advantage before selecting the secondary "
+              "policy; meters, with goal progress included below."))
+    parser.add_argument(
+        "--ensemble-goal-weight", type=float, default=0.10,
+        help="Weight of predicted ten-step goal progress in ensemble scoring.")
     parser.add_argument("--output", type=Path, default=ROOT / "isaac_eval" / "results")
     parser.add_argument(
         "--environment", type=Path,
@@ -52,8 +63,12 @@ def parse_args():
     parser.add_argument("--static-obstacles", type=int,
                         help="Must match --environment when one is used.")
     parser.add_argument("--flow-steps", type=int, default=10)
+    parser.add_argument(
+        "--future-mode", choices=("on", "off"), default="on",
+        help=("For Future-conditioned checkpoints: run Future-DiT and its "
+              "cross-attention, or skip both for a same-weight ablation."))
     parser.add_argument("--goal-radius", type=float, default=0.5,
-                        help="Enter braking when within this distance (m).")
+                        help="Enter terminal braking inside this distance (m).")
     parser.add_argument("--settle-speed", type=float, default=0.1,
                         help="Maximum speed for a settled goal stop (m/s).")
     parser.add_argument("--settle-steps", type=int, default=10,
@@ -81,6 +96,8 @@ def parse_args():
     if args.route_start < 0:
         parser.error("--route-start must be nonnegative")
     args.checkpoint = args.checkpoint.expanduser().resolve()
+    if args.secondary_checkpoint is not None:
+        args.secondary_checkpoint = args.secondary_checkpoint.expanduser().resolve()
     args.output = args.output.expanduser().resolve()
     if args.environment is not None:
         args.environment = args.environment.expanduser().resolve()
@@ -88,6 +105,10 @@ def parse_args():
             parser.error(f"environment does not exist: {args.environment}")
     if not args.checkpoint.is_file():
         parser.error(f"checkpoint does not exist: {args.checkpoint}")
+    if (args.secondary_checkpoint is not None
+            and not args.secondary_checkpoint.is_file()):
+        parser.error(
+            f"secondary checkpoint does not exist: {args.secondary_checkpoint}")
     return parser, args
 
 
@@ -152,6 +173,9 @@ def summarize(episodes, latency, args, checkpoint_step, elapsed):
     successful = [row for row in episodes if row["termination_reason"] == "reach_goal"]
     result = {
         "checkpoint": str(args.checkpoint),
+        "secondary_checkpoint": (
+            str(args.secondary_checkpoint)
+            if args.secondary_checkpoint is not None else None),
         "checkpoint_step": checkpoint_step,
         "environment_file": str(args.environment) if args.environment else None,
         "environment_sha256": args.environment_sha256,
@@ -165,6 +189,7 @@ def summarize(episodes, latency, args, checkpoint_step, elapsed):
         "replan_interval_steps": 10,
         "generated_horizon_steps": getattr(args, "generated_horizon_steps", 30),
         "executed_head": getattr(args, "executed_head", "flow30"),
+        "future_mode": getattr(args, "future_mode_effective", "not_applicable"),
         "flow_steps": args.flow_steps,
         "goal_radius_m": float(args.goal_radius),
         "goal_terminal_control": "zero_velocity_until_settled_inside_goal",
@@ -273,12 +298,18 @@ def main():
             action_limit=float(cfg.algo.actor.action_limit),
             allow_legacy_body=args.allow_legacy_body,
             route_ids=(environment.get("source_env_ids")
-                       if environment is not None else None))
+                       if environment is not None else None),
+            future_mode=args.future_mode,
+            secondary_checkpoint=args.secondary_checkpoint,
+            ensemble_clearance_margin=args.ensemble_clearance_margin,
+            ensemble_goal_weight=args.ensemble_goal_weight)
         args.condition_frame = policy.condition_frame
         args.executed_head = policy.executed_head
+        args.future_mode_effective = policy.future_mode
         args.generated_horizon_steps = int(
-            policy.model.action.action_horizon
-            if policy.history_joint else 30)
+            policy.model.action.action_horizon if policy.history_joint else
+            (policy.model.action_expert.horizon
+             if policy.future_joint else 30))
         args.executed_horizon_steps = 10
         args.checkpoint_semantics = policy.semantics
         path_length = torch.zeros(args.num_envs, device=device)
@@ -336,11 +367,9 @@ def main():
                     goal_stop_attempts[start_braking] += 1
                     goal_stop_entry[start_braking] = env.drone.pos[start_braking, 0]
                 policy.act(td, env)
-                # The deployment policy still generates its normal chunk so
-                # its internal history remains well-defined, but once inside
-                # the goal sphere the executed command is hard-zeroed.  A
-                # route is successful only after the vehicle settles inside
-                # the sphere; simply crossing it at speed is not success.
+                # Keep policy history/replanning intact, but execute a hard
+                # zero command after entering the goal sphere. A route only
+                # succeeds after remaining inside while physically settled.
                 if braking.any():
                     td["agents", "action"][braking] = 0.0
                     td["agents", "action_normalized"][braking] = 0.0
@@ -449,7 +478,6 @@ def main():
                         "duration_s": float(episode_steps[index]) * float(cfg.sim.dt),
                         "path_length_m": float(path_length[index]),
                         "min_clearance_m": float(min_clearance[index]),
-                        "final_goal_distance_m": float(goal_distance[index]),
                         "final_speed_mps": float(speed[index]),
                         "goal_stop_attempts": int(goal_stop_attempts[index]),
                         "goal_stop_steps": int(settle_streak[index]),

@@ -2,8 +2,16 @@ drone:
   model_name: "hummingbird"
 
 sensor:
-  lidar_range: 4.
-  lidar_vfov: [-10, 20.] # degree
-  lidar_vbeams: 4 # number of vertical beams
-  lidar_hres: 10. # degree
-  mesh_prim_path: "/World/defaultGroundPlane"
+  lidar_range: 5.0
+  lidar_hfov: 360.0
+  lidar_vfov: [-7.0, 52.0]
+  lidar_vbeams: 6
+  lidar_hres: 10.0
+  # SUPER receives the raw 108 x 18 scan. The legacy environment observation
+  # remains 36 x 6 by strided sampling, so its tensor interface is unchanged.
+  lidar_h_sample: 3
+  lidar_v_sample: 3
+  # The generated height-field (including static obstacles) is the collision
+  # mesh SUPER must observe. The floor itself is represented by SUPER's
+  # virtual_ground_height.
+  mesh_prim_path: "/World/ground/terrain"
