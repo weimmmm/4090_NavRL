@@ -31,6 +31,13 @@ from lidar_wam.runner.super_action_expert import _atomic_save, _autocast
 from lidar_wam.runner.online_supervision import (
     TARGET_MODES, current_state_anchor_loss, masked_online_tail_loss,
     selective_online_correction_loss, student_feasible_target)
+from lidar_wam.models.flow_online_sft import DifferentiableFlowPolicy
+
+
+def policy_wrapper(expert, project_output=True):
+    return (DifferentiableFlowPolicy(expert, project_output=project_output)
+            if getattr(expert, "flow_only", False)
+            else DirectPolicy(expert, project_output=project_output))
 
 
 def tail(model):
@@ -63,6 +70,8 @@ def serve(args):
     world = int(os.environ.get("WORLD_SIZE", "1"))
     torch.cuda.set_device(local)
     device = torch.device("cuda", local)
+    if args.cuda_memory_fraction is not None:
+        torch.cuda.set_per_process_memory_fraction(args.cuda_memory_fraction, device)
     if world > 1:
         dist.init_process_group("nccl")
     torch.manual_seed(args.seed+rank)
@@ -72,7 +81,11 @@ def serve(args):
     expert.online_freeze_policy_output_head = args.freeze_policy_output_head
     expert.online_teacher_target_mode = args.teacher_target_mode
     expert.online_supervision_horizon = args.supervision_horizon
-    model = DirectPolicy(expert, project_output=not args.unclipped_training_output)
+    flow_only = bool(getattr(expert, "flow_only", False))
+    if flow_only and (args.mode != "pure-online" or args.supervision_horizon != 1
+                      or args.teacher_target_mode != "student-box"):
+        raise ValueError("Flow SFT requires pure-online first-action labels in the per-axis box")
+    model = policy_wrapper(expert, project_output=not args.unclipped_training_output)
     if world > 1:
         model = DDP(model, device_ids=[local], broadcast_buffers=False)
     parameters = [value for _, value in tail(expert)]
@@ -87,7 +100,7 @@ def serve(args):
         raise ValueError("Selective correction threshold must be finite and nonnegative")
     if selective and (not pure or args.supervision_horizon != 1
                       or args.anchor_weight != 0 or args.unclipped_training_output
-                      or args.teacher_target_mode != "student-norm"):
+                      or args.teacher_target_mode != ("student-box" if flow_only else "student-norm")):
         raise ValueError("Selective correction requires pure-online feasible first-action labels, "
                          "normal deployment projection, and no simultaneous anchor/tail ablation")
     if args.supervision_horizon == 10 and not pure:
@@ -102,7 +115,9 @@ def serve(args):
             raise ValueError("Anchor must be the original expert, not an SFT checkpoint")
         if source["vae"] != payload["vae"] or source["condition_stats"] != payload["condition_stats"]:
             raise ValueError("Original anchor inputs/normalization differ from student")
-        reference = DirectPolicy(build_model(source).to(device))
+        if source.get("format") != payload.get("format"):
+            raise ValueError("Reference and student formats differ")
+        reference = policy_wrapper(build_model(source).to(device))
         reference.eval().requires_grad_(False)
         del source
     cache = None
@@ -135,6 +150,10 @@ def serve(args):
                                       "fresh states plus offline anchors"),
                   "maximum_global_batch_size": args.per_gpu_batch_size*world,
                   "student_update_before_chunk_generation": True,
+                  "flow_only": flow_only,
+                  "sampling_steps": expert.sample_steps if flow_only else 0,
+                  "differentiates_through_all_euler_steps": flow_only,
+                  "shared_student_reference_noise": flow_only and reference is not None,
                   "trainable_names": [name for name, _ in tail(expert)]}
         (args.out/"config.json").write_text(json.dumps(config, indent=2, default=str)+"\n")
         if cache is not None:
@@ -157,7 +176,7 @@ def serve(args):
     def save(current_step):
         saved = {key: value for key, value in payload.items() if key != "model"}
         saved.update(model=expert.state_dict(), step=current_step,
-                     architecture={**payload["architecture"], "training_action_diffusion": False},
+                     architecture={**payload["architecture"], "training_action_diffusion": flow_only},
                      online_sft={"step": current_step, "source_checkpoint": str(args.checkpoint),
                                  "lr": args.lr, "online_weight": args.online_weight,
                                  "mode": args.mode, "uses_offline_replay": not pure,
@@ -252,6 +271,9 @@ def serve(args):
             if (args.teacher_target_mode == "student-norm"
                     and np.any(np.linalg.norm(fresh["target"], axis=-1)>1.0001)):
                 raise ValueError("Online labels exceed the student's deployed velocity range")
+            if (args.teacher_target_mode == "student-box"
+                    and np.any(np.abs(fresh["target"]) > 1.0001)):
+                raise ValueError("Online labels exceed the per-axis velocity range")
             indices = np.arange(rank, n, world)
             real_count = len(indices)
             if pure:
@@ -270,9 +292,14 @@ def serve(args):
                 indices = np.asarray([0])
             b = {key: torch.from_numpy(value[indices]).to(device).float() for key, value in fresh.items()}
             optimizer.zero_grad(set_to_none=True)
+            # Identical noise prevents stochastic sample differences from
+            # being mistaken for original-versus-PPO policy disagreement.
+            sample_noise = (torch.randn(len(b["latent"]), 10, 3, device=device)
+                            if flow_only else None)
             with _autocast(device, "bf16"):
-                prediction = model(*(b[key] if pure else torch.cat((a[key], b[key]))
-                                     for key in ("latent", "goal", "proprio")))
+                inputs = tuple(b[key] if pure else torch.cat((a[key], b[key]))
+                               for key in ("latent", "goal", "proprio"))
+                prediction = model(*inputs, sample_noise) if flow_only else model(*inputs)
                 p = prediction[offline_count:]
                 # Global offline mean remains correctly weighted when active
                 # online states divide unevenly between the four GPUs.
@@ -293,7 +320,9 @@ def serve(args):
                 selective_metrics = torch.zeros(4, device=device)
                 if reference is not None:
                     with torch.no_grad():
-                        original = reference(b["latent"], b["goal"], b["proprio"])
+                        ref_inputs = (b["latent"], b["goal"], b["proprio"])
+                        original = (reference(*ref_inputs, sample_noise) if flow_only
+                                    else reference(*ref_inputs))
                     if selective:
                         loss, selective_metrics = selective_online_correction_loss(
                             p, first_target, original, args.selective_correction_threshold_mps,
@@ -308,6 +337,8 @@ def serve(args):
                 raise FloatingPointError("Non-finite online SFT loss")
             loss.backward()
             grad = nn.utils.clip_grad_norm_(parameters, 1.)
+            if not bool(torch.isfinite(grad)):
+                raise FloatingPointError("Non-finite online SFT gradient; optimizer update rejected")
             optimizer.step()
             step += 1
             deployed_p = student_feasible_target(p) if args.unclipped_training_output else p
@@ -389,10 +420,12 @@ def batch_benchmark(args):
     """Measure configured-batch forward/backward/Adam memory, not estimates."""
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
+    if args.cuda_memory_fraction is not None:
+        torch.cuda.set_per_process_memory_fraction(args.cuda_memory_fraction, device)
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     payload.pop("optimizer", None)
-    expert = build_model(payload).to(device)
-    model = DirectPolicy(expert)
+    expert = build_model(payload, freeze_policy_output_head=args.freeze_policy_output_head).to(device)
+    model = policy_wrapper(expert)
     optimizer = torch.optim.AdamW([p for _, p in tail(expert)], lr=args.lr)
     pure = args.mode == "pure-online"
     if pure:
@@ -450,11 +483,14 @@ def main():
     parser.add_argument("--unclipped-training-output", action="store_true",
                         help="Regress pre-projection commands; deployment stays bounded at 2 m/s")
     parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--cuda-memory-fraction", type=float, default=None)
     parser.add_argument("--online-weight", type=float, default=1.)
     parser.add_argument("--seed", type=int, default=20261014)
     args = parser.parse_args()
     if args.save_every <= 0:
         parser.error("--save-every must be positive")
+    if args.cuda_memory_fraction is not None and not 0 < args.cuda_memory_fraction <= 1:
+        parser.error("--cuda-memory-fraction must be in (0,1]")
     if not np.isfinite(args.anchor_weight) or args.anchor_weight < 0:
         parser.error("Anchor weight must be finite and nonnegative")
     if not np.isfinite(args.online_tail_weight) or args.online_tail_weight < 0:

@@ -59,6 +59,24 @@ class RefillTests(unittest.TestCase):
         selected, _ = select_fresh(fewer, 4096, torch.Generator().manual_seed(7))
         self.assertEqual(int(selected.sum()), 3)  # Never duplicate labels to fill a batch.
 
+    def test_flow_only_refill_has_no_legacy_history_interface(self):
+        n = 3
+        p = SimpleNamespace(required_history_frames=1, is_flow_only_action_expert=True,
+                            bootstrap_action_chunks=1, history=[torch.randn(n, 2, 108, 20)],
+                            previous_velocity=torch.randn(n, 3),
+                            warmup_chunks=torch.zeros(n, dtype=torch.long))
+        names = ("chunk", "goal_braking", "reference_started", "previous_reference_velocity",
+                 "safety_heading", "last_ego_command", "last_world_command",
+                 "last_reference_velocity_world", "reference_position", "reference_yaw", "chunk_frame_yaw")
+        for name in names:
+            setattr(p, name, torch.ones(n, 10, 3) if name == "chunk" else torch.ones(n, 3))
+        p._quaternion_yaw = lambda q: torch.zeros(len(q), 3)
+        p._goal_frame_yaw = lambda pos: torch.zeros(len(pos), 3)
+        reset_policy_slots(p, torch.tensor([1]), torch.randn(n, 13))
+        self.assertFalse(hasattr(p, "past"))
+        self.assertTrue(bool((p.chunk[1] == 0).all()))
+        self.assertTrue(bool((p.chunk[0] == 1).all()))
+
     def test_partial_reset_preserves_other_episode_bookkeeping(self):
         from tensordict import TensorDict
 

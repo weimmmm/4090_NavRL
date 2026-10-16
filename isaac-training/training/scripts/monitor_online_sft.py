@@ -5,6 +5,7 @@ failed evaluation cannot reset, interrupt, or roll back the ongoing learner.
 Every scheduled snapshot is queued, not overwritten with newer weights.
 """
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import shutil
 import subprocess
 import time
 
-from run_action_dagger_sft import ROOT, PROJECT, TRAIN, PY, DEPS
+from run_action_dagger_sft import ROOT, HOST, PROJECT, TRAIN, PY, DEPS
 from online_sft_jobs import (atomic_json, docker_command, read_json,
                              run_logged, snapshot_steps, wait_snapshot)
 
@@ -43,6 +44,10 @@ def main():
     parser.add_argument("--include-start", action="store_true")
     parser.add_argument("--baseline-sr", type=float, default=.84375)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--flow-only", action="store_true")
+    parser.add_argument("--min-free-mib", type=int, default=0)
+    parser.add_argument("--tensorboard", type=Path,
+                        help="Optional separate event directory for an algorithm ablation")
     args = parser.parse_args()
     status_path = args.host_out / f"{args.kind}_status.json"
     steps = snapshot_steps(args.start_step, args.final_step, args.every,
@@ -58,6 +63,22 @@ def main():
         if not wait_snapshot(args.host_out/checkpoint_name, args.host_out):
             errors.append({"step": step, "error": "Training ended without this snapshot"})
             continue
+        gpu_lock = None
+        if args.flow_only and args.kind == "closed-loop":
+            lock_dir = HOST.parent/".runtime"
+            lock_dir.mkdir(exist_ok=True)
+            gpu_lock = (lock_dir/f"sft_gpu{args.gpu}_eval.lock").open("a")
+            fcntl.flock(gpu_lock, fcntl.LOCK_EX)
+        while args.min_free_mib > 0:
+            free = int(subprocess.check_output(
+                ["nvidia-smi", f"--id={args.gpu}", "--query-gpu=memory.free",
+                 "--format=csv,noheader,nounits"], text=True).strip())
+            if free >= args.min_free_mib:
+                break
+            atomic_json(status_path, {"stage": "waiting_for_gpu_memory", "gpu": args.gpu,
+                                      "free_mib": free, "snapshot_step": step,
+                                      "completed": completed, "errors": errors})
+            time.sleep(5)
         before = read_json(args.host_out / "progress.json")
         started = time.time()
         checkpoint = args.out / checkpoint_name
@@ -84,6 +105,18 @@ def main():
                            "wam_eval.goal_stop_adapter.enter_speed_mps=0.2", "wam_eval.safety_filter.enabled=false",
                            f"wam_eval.metrics_path={job}/metrics.json",
                            f"wam_eval.trajectory_path={job}/trajectories.npz"]
+                if args.flow_only:
+                    command = ["seed=0" if item == "seed=20261014" else item
+                               for item in command]
+                    command = ["env.scene_path=aliyun_lidar_wam/datasets/"
+                               "wam_40x40_obs200_350_settled_5m/environments/map40_obs0350.pt"
+                               if item.startswith("env.scene_path=") else item for item in command]
+                    command += ["env.fixed_route_start_index=0", "env.success_distance=0.5",
+                                "env.success_speed=0.2", "env.success_stop_steps=10",
+                                "wam_eval.action_generation=flow", "wam_eval.sample_steps=10",
+                                "wam_eval.action_seed=271828", "wam_eval.action_noise_scale=1.0",
+                                "wam_eval.use_past_actions=false", "sensor.lidar_range=5.0",
+                                "wam_eval.cuda_memory_fraction=0.12"]
             else:
                 environment = {"CUDA_VISIBLE_DEVICES": str(args.gpu), "PYTHONUNBUFFERED": "1",
                                "PYTHONPATH": f"{PROJECT}:{DEPS}"}
@@ -94,15 +127,25 @@ def main():
             # Timeout lives INSIDE the container so an unresponsive Isaac app
             # is stopped along with its own children, not merely docker exec.
             bounded = ["timeout", "--signal=TERM", "--kill-after=15s", str(args.timeout), *command]
-            run_logged(docker_command(args.container, bounded, environment, ROOT),
-                       host_job/"worker.log", timeout=args.timeout+60)
+            if args.flow_only and args.kind == "closed-loop":
+                # Match the historical baseline's interpreter, allocator,
+                # BLAS/OMP threads and all environment/control overrides.
+                from run_flow_action_training import evaluation_command
+                exact = evaluation_command(args.host_out/checkpoint_name,
+                                           host_job, HOST.parent, routes=args.eval_num_envs)
+                exact = [args.container if x == "navrl-collect-gpu0" else x for x in exact]
+                exact[exact.index("1800")] = str(args.timeout)
+                run_logged(exact, host_job/"worker.log", timeout=args.timeout+60)
+            else:
+                run_logged(docker_command(args.container, bounded, environment, ROOT),
+                           host_job/"worker.log", timeout=args.timeout+60)
             metrics = read_json(host_job/"metrics.json")
             if not metrics:
                 raise RuntimeError("Evaluator exited without valid metrics")
             if args.kind == "closed-loop":
                 if int(metrics["checkpoint_step"]) != step:
                     raise RuntimeError("Closed-loop snapshot step differs from requested step")
-                record_closed_loop(job/"metrics.json", args.out/"tensorboard", step,
+                record_closed_loop(job/"metrics.json", args.tensorboard or args.out/"tensorboard", step,
                                    host_job/"tensorboard.log")
                 sr = float(metrics["rates"]["sr"])
                 if sr > best_sr:
@@ -135,6 +178,9 @@ def main():
             atomic_json(host_job/"error.json", failure)
             print(json.dumps(failure), flush=True)
             # Continue draining snapshots; NEVER stop/modify the actor or learner.
+        finally:
+            if gpu_lock is not None:
+                gpu_lock.close()
     atomic_json(status_path, {"stage": "complete" if not errors else "complete_with_errors",
                               "gpu": args.gpu, "completed": completed, "errors": errors,
                               "best_sr": best_sr if args.kind == "closed-loop" else None})

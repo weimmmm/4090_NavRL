@@ -28,6 +28,16 @@ class TeacherBenchmarkTests(unittest.TestCase):
             self.assertTrue(torch.equal(out[:, 0], torch.tensor([[1., 0., 0.]])))
         self.assertTrue(torch.equal(teacher_ego_chunk(world, quat, "native", 10)[:, 0], world))
 
+    def test_box_matches_flow_sft_labels_without_total_speed_cap(self):
+        from lidar_wam.runner.online_supervision import online_teacher_target
+        world = torch.tensor([[2.5, 2., 1.], [.1, -.2, .3]])
+        quat = torch.tensor([[1., 0., 0., 0.]]).expand(2, -1)
+        out = teacher_ego_chunk(world, quat, "student-box", 10)
+        expected = online_teacher_target(world/2., "student-box")*2.
+        self.assertTrue(torch.equal(out[:, 0], expected))
+        self.assertGreater(float(out[0, 0].norm()), 2.)
+        self.assertLessEqual(float(out.abs().max()), 2.)
+
     def test_current_yaw_rotation_matches_existing_student_contract(self):
         world = torch.tensor([[0., 2., 0.]])
         quat = torch.tensor([[2**-.5, 0., 0., 2**-.5]])

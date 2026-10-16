@@ -9,6 +9,7 @@ derives yaw, and calls the original unmodified LeePositionController.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
 import os
@@ -46,6 +47,7 @@ HISTORY3_CURRENT_LEE_ACTION_EXPERT_FORMAT = (
     "navrl-action-dit-final-lee-ego-bc-history3-v2")
 HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT = (
     "navrl-action-dit-final-lee-ego-bc-history1-v3")
+FLOW_ACTION_EXPERT_FORMAT = "navrl-action-expert-flow-history1-v3"
 
 
 def _resolve(project_dir: Path, value: str) -> Path:
@@ -72,6 +74,11 @@ class WamLeePolicy:
         self.dt = float(cfg.sim.dt)
         self.interval = int(cfg.wam_eval.replan_interval_steps)
         self.sample_steps = int(cfg.wam_eval.sample_steps)
+        self.action_generation = str(cfg.wam_eval.get("action_generation", "auto"))
+        if self.action_generation not in {"auto", "direct", "flow"}:
+            raise ValueError("wam_eval.action_generation must be auto, direct or flow")
+        self.use_auxiliary_flow = False
+        self.use_flow_generation = False
         self.action_noise_scale = float(cfg.wam_eval.action_noise_scale)
         self.bootstrap_forward_speed = float(
             cfg.wam_eval.get("bootstrap_forward_speed_mps", 0.0))
@@ -131,48 +138,67 @@ class WamLeePolicy:
             HISTORY3_FINAL_LEE_ACTION_EXPERT_FORMAT,
             HISTORY3_CURRENT_LEE_ACTION_EXPERT_FORMAT,
             HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT}
+        self.is_flow_only_action_expert = checkpoint_format == FLOW_ACTION_EXPERT_FORMAT
+        self.is_standalone_action_expert = (
+            self.is_deterministic_action_expert or self.is_flow_only_action_expert)
         self.required_history_frames = 3
         if checkpoint_format not in {
                 FORMAT, ACTION_EXPERT_FORMAT, LEE_ACTION_EXPERT_FORMAT,
                 FINAL_LEE_ACTION_EXPERT_FORMAT,
                 HISTORY3_FINAL_LEE_ACTION_EXPERT_FORMAT,
                 HISTORY3_CURRENT_LEE_ACTION_EXPERT_FORMAT,
-                HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT}:
+                HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT,
+                FLOW_ACTION_EXPERT_FORMAT}:
             raise ValueError(
                 f"unsupported policy checkpoint: {checkpoint_format!r}")
-        if str(requested_past_mode).lower() == "auto":
-            self.use_past_actions = bool(payload.get(
-                "past_action_conditioning", {}).get(
-                    "deployment_use_past_actions", True))
-        elif isinstance(requested_past_mode, bool):
-            self.use_past_actions = requested_past_mode
-        elif str(requested_past_mode).lower() in {"true", "1", "yes"}:
-            self.use_past_actions = True
-        elif str(requested_past_mode).lower() in {"false", "0", "no"}:
-            self.use_past_actions = False
+        if self.is_flow_only_action_expert:
+            if str(requested_past_mode).lower() not in {"auto", "false", "0", "no"}:
+                raise ValueError("Flow-only checkpoint has no historical motion interface")
         else:
-            raise ValueError(
-                "wam_eval.use_past_actions must be auto, true, or false")
-        self.past_input_semantics = str(payload.get(
-            "past_action_conditioning", {}).get(
-                "input_semantics", "reference_velocity"))
-        if self.past_input_semantics not in {
-            "reference_velocity", "actual_velocity", "actual_vehicle_velocity",
-            "measured_ego_velocity",
-            "measured_velocity_in_current_observation_ego_frame"}:
-            raise ValueError(
-                f"unsupported checkpoint past input {self.past_input_semantics!r}")
+            if str(requested_past_mode).lower() == "auto":
+                self.use_past_actions = bool(payload.get(
+                    "past_action_conditioning", {}).get(
+                        "deployment_use_past_actions", True))
+            elif isinstance(requested_past_mode, bool):
+                self.use_past_actions = requested_past_mode
+            elif str(requested_past_mode).lower() in {"true", "1", "yes"}:
+                self.use_past_actions = True
+            elif str(requested_past_mode).lower() in {"false", "0", "no"}:
+                self.use_past_actions = False
+            else:
+                raise ValueError("wam_eval.use_past_actions must be auto, true, or false")
+            self.past_input_semantics = str(payload.get(
+                "past_action_conditioning", {}).get("input_semantics", "reference_velocity"))
+            if self.past_input_semantics not in {
+                "reference_velocity", "actual_velocity", "actual_vehicle_velocity",
+                "measured_ego_velocity", "measured_velocity_in_current_observation_ego_frame"}:
+                raise ValueError(f"unsupported checkpoint past input {self.past_input_semantics!r}")
         self.mask_world_position = bool(payload.get(
             "proprio_conditioning", {}).get("mask_world_position", False))
         self.use_proprio = bool(payload.get(
             "proprio_conditioning", {}).get("deployment_use_proprio", True))
         architecture = dict(payload.get("architecture", {}))
-        if self.is_deterministic_action_expert:
+        self.training_action_diffusion = bool(architecture.get(
+            "training_action_diffusion", checkpoint_format in {
+                ACTION_EXPERT_FORMAT, LEE_ACTION_EXPERT_FORMAT}))
+        if self.is_standalone_action_expert:
             from lidar_wam.models.action_expert import SuperActionExpertModel
 
-            if bool(architecture.get("deployment_action_diffusion", True)):
+            if self.is_flow_only_action_expert and self.action_generation == "direct":
+                raise ValueError("Flow-only checkpoint has no Direct head")
+            self.use_auxiliary_flow = (
+                not self.is_flow_only_action_expert and self.action_generation == "flow")
+            self.use_flow_generation = (
+                self.is_flow_only_action_expert or self.use_auxiliary_flow)
+            if self.use_flow_generation:
+                from lidar_wam.models.action_flow_sampling import sample_action_flow
+                self.auxiliary_flow_sampler = sample_action_flow
+                if self.sample_steps <= 0:
+                    raise ValueError("Flow sampling requires positive sample_steps")
+
+            if bool(architecture.get("deployment_action_diffusion", True)) != self.is_flow_only_action_expert:
                 raise ValueError(
-                    "Action Expert checkpoint is not marked for deterministic deployment")
+                    "Action Expert checkpoint deployment mode contradicts its format")
             self.lidar_history_frames = int(
                 architecture.get("history_lidar_frames", 1))
             if self.lidar_history_frames not in (1, 3):
@@ -183,10 +209,11 @@ class WamLeePolicy:
                     HISTORY3_CURRENT_LEE_ACTION_EXPERT_FORMAT}
                     and self.lidar_history_frames != 3):
                 raise ValueError("history3 checkpoint must declare 3 LiDAR frames")
-            if (checkpoint_format == HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT
+            if (checkpoint_format in {HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT,
+                                      FLOW_ACTION_EXPERT_FORMAT}
                     and self.lidar_history_frames != 1):
                 raise ValueError("history1 checkpoint must declare 1 LiDAR frame")
-            model = SuperActionExpertModel(
+            model_kwargs = dict(
                 width=int(architecture.get("width", 512)),
                 depth=int(architecture.get("depth", 8)),
                 heads=int(architecture.get("heads", 8)),
@@ -194,9 +221,14 @@ class WamLeePolicy:
                 horizon=int(architecture.get("action_horizon", 10)),
                 action_dim=int(architecture.get("action_dim", 3)),
                 proprio_dim=int(architecture.get("proprio_dim", 10)),
-                past_horizon=int(architecture.get("past_horizon", 30)),
                 lidar_history_frames=self.lidar_history_frames,
             )
+            if self.is_flow_only_action_expert:
+                from lidar_wam.models.flow_action_expert import FlowActionExpertModel
+                model = FlowActionExpertModel(**model_kwargs, sample_steps=self.sample_steps)
+            else:
+                model = SuperActionExpertModel(
+                    **model_kwargs, past_horizon=int(architecture.get("past_horizon", 30)))
             self.required_history_frames = self.lidar_history_frames
             self.flow_sample_action = None
         else:
@@ -248,6 +280,24 @@ class WamLeePolicy:
                 or not bool(torch.isfinite(self.action_target_scale).all())
                 or bool((self.action_target_scale <= 0.0).any())):
             raise ValueError("invalid action model_output_scale_xyz")
+        if self.is_flow_only_action_expert:
+            # Bounds are in the model's current yaw-only ego-FLU frame.
+            # A subsequent yaw rotation preserves norm but not per-axis bounds;
+            # do not clamp again in world axes or radially rescale the command.
+            self.action_axis_limit = torch.as_tensor(
+                action_interface.get("physical_axis_limit_mps_xyz", []),
+                device=self.device, dtype=torch.float32)
+            if (action_interface.get("normalized_output_constraint") != "unit_box_after_euler"
+                    or action_interface.get("physical_output_constraint") != "per_axis"
+                    or action_interface.get("physical_norm_limit_mps", "missing") is not None
+                    or self.action_frame != "current_observation_yaw_only_ego_flu"
+                    or self.action_semantics != "actual_velocity_input_to_original_lee"
+                    or tuple(self.action_axis_limit.shape) != (3,)
+                    or not bool(torch.isfinite(self.action_axis_limit).all())
+                    or not bool((self.action_axis_limit == 2.0).all())
+                    or not bool((self.action_target_scale == 2.0).all())):
+                raise ValueError("Flow-only requires ego-FLU per-axis +/-2 m/s metadata and scale")
+            self.action_axis_limit = self.action_axis_limit.view(1, 1, 3)
         if self.action_semantics not in {
             "final_lee_target_velocity",
             "actual_velocity_input_to_original_lee",
@@ -300,13 +350,15 @@ class WamLeePolicy:
             if key in ("goal_mean", "goal_std", "proprio_mean", "proprio_std")
         }
         self.action_seed = int(cfg.wam_eval.action_seed)
-        self.generator = (None if self.is_deterministic_action_expert else
+        self.generator = (None if (self.is_standalone_action_expert
+                                  and not self.use_flow_generation) else
                           torch.Generator(device=self.device).manual_seed(
                               self.action_seed))
         self.history = []
-        self.past = torch.zeros(self.num_envs, 30, 3, device=self.device)
-        self.past_world = torch.zeros_like(self.past)
-        self.past_mask = torch.zeros(self.num_envs, 30, device=self.device)
+        if not self.is_flow_only_action_expert:
+            self.past = torch.zeros(self.num_envs, 30, 3, device=self.device)
+            self.past_world = torch.zeros_like(self.past)
+            self.past_mask = torch.zeros(self.num_envs, 30, device=self.device)
         self.chunk = torch.zeros(self.num_envs, 10, 3, device=self.device)
         self.previous_velocity = None
         self.reference_position = torch.zeros(
@@ -332,6 +384,7 @@ class WamLeePolicy:
         self.last_reference_velocity_world = torch.zeros_like(
             self.last_ego_command)
         self.command_abs_max = 0.0
+        self.command_norm_max = 0.0
         self.inference_calls = 0
 
     def set_active(self, active):
@@ -518,6 +571,21 @@ class WamLeePolicy:
         return ((value - self.stats[f"{name}_mean"])
                 / self.stats[f"{name}_std"])
 
+    def _legacy_history_conditions(self, position, quaternion):
+        """Legacy policies only; never called by the current-only flow policy."""
+        if self.past_input_semantics == "measured_velocity_in_current_observation_ego_frame":
+            past = self._world_to_yaw_frame(self.past_world, self._quaternion_yaw(quaternion))
+        elif self.action_semantics in {
+                "lee_velocity_only_equivalent_goal_frame", "super_reference_velocity",
+                "super_reference_velocity_residual"}:
+            self.chunk_frame_yaw.copy_(self._goal_frame_yaw(position))
+            past = self._world_to_yaw_frame(self.past_world, self.chunk_frame_yaw)
+        else:
+            past = self.past
+        if self.use_past_actions:
+            return past, self.past_mask
+        return self.torch.zeros_like(past), self.torch.zeros_like(self.past_mask)
+
     def _sample_chunk(self, state, acceleration_world):
         torch = self.torch
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -531,7 +599,7 @@ class WamLeePolicy:
             goal = torch.cat((goal_ego, goal_ego.norm(dim=-1, keepdim=True)), -1)
             quaternion = quaternion / quaternion.norm(
                 dim=-1, keepdim=True).clamp_min(1.0e-6)
-            if self.is_deterministic_action_expert:
+            if self.is_standalone_action_expert:
                 proprio = torch.cat(
                     (velocity_ego, acceleration_ego, quaternion), -1)
             else:
@@ -539,34 +607,12 @@ class WamLeePolicy:
                                       acceleration_ego, quaternion), -1)
                 if self.mask_world_position:
                     proprio[:, :3] = 0.0
-            if self.past_input_semantics == (
-                    "measured_velocity_in_current_observation_ego_frame"):
-                past = self._world_to_yaw_frame(
-                    self.past_world, self._quaternion_yaw(quaternion))
-            elif self.action_semantics in {
-                    "lee_velocity_only_equivalent_goal_frame",
-                    "super_reference_velocity",
-                    "super_reference_velocity_residual"}:
-                self.chunk_frame_yaw.copy_(self._goal_frame_yaw(position))
-                past = self._world_to_yaw_frame(
-                    self.past_world, self.chunk_frame_yaw)
-            else:
-                past = self.past
-            if self.use_past_actions:
-                model_past = past
-                model_past_mask = self.past_mask
-            else:
-                # Diagnostic/deployment ablation for the train/deploy exposure
-                # gap: training sees expert past actions, while closed loop sees
-                # its own predictions.  Keeping both values and mask at zero
-                # removes that autoregressive feedback without changing the
-                # LiDAR, state, action target, Lee controller, or timing.
-                model_past = self.torch.zeros_like(past)
-                model_past_mask = self.torch.zeros_like(self.past_mask)
+            if not self.is_flow_only_action_expert:
+                model_past, model_past_mask = self._legacy_history_conditions(position, quaternion)
             model_proprio = self._normalise(proprio, "proprio")
             if not self.use_proprio:
                 model_proprio = self.torch.zeros_like(model_proprio)
-            if self.is_deterministic_action_expert:
+            if self.is_standalone_action_expert:
                 if self.lidar_history_frames == 1:
                     latent = (
                         self.vae.encode(self.history[-1]).latent_dist.mode()
@@ -580,11 +626,23 @@ class WamLeePolicy:
                     latent = self.vae.encode(flat).latent_dist.mode() * self.scale
                     latent = latent.reshape(
                         self.num_envs, self.lidar_history_frames, 4, 27, 5)
-                past_scale = float(self.stats.get(
-                    "past_velocity_scale_mps", 2.0))
-                sampled = self.model.predict_action(
-                    latent, self._normalise(goal, "goal"), model_proprio,
-                    model_past / past_scale, model_past_mask)
+                if not self.is_flow_only_action_expert:
+                    past_scale = float(self.stats.get("past_velocity_scale_mps", 2.0))
+                if self.is_flow_only_action_expert:
+                    sampled = self.model.predict_action(
+                        latent, self._normalise(goal, "goal"), model_proprio,
+                        generator=self.generator, noise_scale=self.action_noise_scale)
+                elif self.use_auxiliary_flow:
+                    sampled = self.auxiliary_flow_sampler(
+                        self.model.diffusion, self.model.encode_current(latent),
+                        self._normalise(goal, "goal"), model_proprio,
+                        model_past / past_scale, model_past_mask,
+                        steps=self.sample_steps, generator=self.generator,
+                        noise_scale=self.action_noise_scale)
+                else:
+                    sampled = self.model.predict_action(
+                        latent, self._normalise(goal, "goal"), model_proprio,
+                        model_past / past_scale, model_past_mask)
             else:
                 images = torch.stack(self.history[-3:], dim=1)
                 flat = images.reshape(self.num_envs * 3, 2, 108, 20)
@@ -604,14 +662,14 @@ class WamLeePolicy:
             # The final-Lee Action Expert is trained in normalized action
             # units.  Its payload records the physical m/s scale explicitly.
             sampled *= self.action_target_scale
-            # Keep the learned command inside the same physical domain as the
-            # collector.  The labels were norm-clamped to SUPER's 2 m/s
-            # maximum, while an unconstrained regression head can overshoot a
-            # little at inference (especially after leaving the expert
-            # manifold).  This is an adapter-side bound; Lee itself is not
-            # modified.
-            speed = sampled.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
-            sampled *= (self.max_reference_speed / speed).clamp_max(1.0)
+            if self.is_flow_only_action_expert:
+                sampled = torch.maximum(torch.minimum(sampled, self.action_axis_limit),
+                                        -self.action_axis_limit)
+            else:
+                # Preserve legacy deployment behavior for existing Direct and
+                # auxiliary-Flow baselines; this is NOT a dataset norm bound.
+                speed = sampled.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+                sampled *= (self.max_reference_speed / speed).clamp_max(1.0)
         else:
             sampled /= self.action_target_scale
         if self.action_semantics == "super_reference_velocity_residual":
@@ -630,6 +688,9 @@ class WamLeePolicy:
             # The override expires before the next model-generated chunk.
             sampled.zero_()
             sampled[..., 0] = self.bootstrap_forward_speed
+            if self.is_flow_only_action_expert:
+                sampled = torch.maximum(torch.minimum(sampled, self.action_axis_limit),
+                                        -self.action_axis_limit)
         self.chunk.copy_(sampled)
         self.inference_calls += 1
 
@@ -753,34 +814,34 @@ class WamLeePolicy:
         torch.nan_to_num_(motor_command, 0.0)
         tensordict.set(("agents", "action"), motor_command)
 
-        self.past = torch.roll(self.past, -1, dims=1)
-        self.past_world = torch.roll(self.past_world, -1, dims=1)
-        self.past_mask = torch.roll(self.past_mask, -1, dims=1)
-        if self.past_input_semantics == "actual_vehicle_velocity":
-            # New v2 demonstrations condition on measured ego velocity, not
-            # teacher-forced commands.  Keep the same frame online.
-            self.past[:, -1] = self._world_to_ego(velocity, quaternion)
-        else:
-            self.past[:, -1] = action_command
-        if self.past_input_semantics in {
-                "actual_velocity", "actual_vehicle_velocity",
-                "measured_ego_velocity",
-                "measured_velocity_in_current_observation_ego_frame"}:
-            # This measured state exists with the same semantics both in the
-            # HDF5 expert data and online, removing command-history teacher
-            # forcing without changing the action target or Lee controller.
-            self.past_world[:, -1] = velocity
-            self.past_mask[:, -1] = self.active.to(torch.float32)
-        else:
-            self.past_world[:, -1] = reference_velocity
-            self.past_mask[:, -1] = (self.active & ready).to(torch.float32)
+        if not self.is_flow_only_action_expert:
+            self._update_legacy_history(velocity, quaternion, action_command, reference_velocity, ready)
         self.last_ego_command.copy_(action_command)
         self.last_world_command.copy_(world_command)
         self.last_reference_velocity_world.copy_(reference_velocity)
         self.command_abs_max = max(
             self.command_abs_max, float(action_command.abs().max()))
+        self.command_norm_max = max(
+            self.command_norm_max, float(action_command.norm(dim=-1).max()))
         self.step_index += 1
         return tensordict
+
+    def _update_legacy_history(self, velocity, quaternion, action_command, reference_velocity, ready):
+        torch = self.torch
+        self.past = torch.roll(self.past, -1, dims=1)
+        self.past_world = torch.roll(self.past_world, -1, dims=1)
+        self.past_mask = torch.roll(self.past_mask, -1, dims=1)
+        self.past[:, -1] = (self._world_to_ego(velocity, quaternion)
+                            if self.past_input_semantics == "actual_vehicle_velocity"
+                            else action_command)
+        if self.past_input_semantics in {
+                "actual_velocity", "actual_vehicle_velocity", "measured_ego_velocity",
+                "measured_velocity_in_current_observation_ego_frame"}:
+            self.past_world[:, -1] = velocity
+            self.past_mask[:, -1] = self.active.to(torch.float32)
+        else:
+            self.past_world[:, -1] = reference_velocity
+            self.past_mask[:, -1] = (self.active & ready).to(torch.float32)
 
 
 @hydra.main(config_path=CONFIG_DIR, config_name="train", version_base=None)
@@ -814,7 +875,8 @@ def main(cfg):
             FINAL_LEE_ACTION_EXPERT_FORMAT,
             HISTORY3_FINAL_LEE_ACTION_EXPERT_FORMAT,
             HISTORY3_CURRENT_LEE_ACTION_EXPERT_FORMAT,
-            HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT}:
+            HISTORY1_CURRENT_LEE_ACTION_EXPERT_FORMAT,
+            FLOW_ACTION_EXPERT_FORMAT}:
         required_files.append(world_checkpoint)
     for required in required_files:
         if not required.is_file():
@@ -822,6 +884,11 @@ def main(cfg):
     cfg.env.scene_path = str(route_scene_path)
 
     device_index = int(str(cfg.device).split(":")[-1])
+    memory_fraction = cfg.wam_eval.get("cuda_memory_fraction", None)
+    if memory_fraction is not None:
+        if not 0.0 < float(memory_fraction) <= 1.0:
+            raise ValueError("wam_eval.cuda_memory_fraction must be in (0, 1]")
+        torch.cuda.set_per_process_memory_fraction(float(memory_fraction), device_index)
     active_gpu = int(os.environ.get("ISAAC_ACTIVE_GPU", device_index))
     sim_app = SimulationApp({
         "headless": bool(cfg.headless),
@@ -942,9 +1009,16 @@ def main(cfg):
                 "osr": 1.0 - route_counts["collision"] / max(1, len(indices)),
             }
         metrics = {
-            "policy": ("deterministic_action_expert_to_original_lee"
+            "policy": ("flow_action_expert_to_original_lee"
+                       if policy.is_flow_only_action_expert else
+                       "auxiliary_action_flow_to_original_lee"
+                       if policy.use_auxiliary_flow else
+                       "deterministic_action_expert_to_original_lee"
                        if policy.is_deterministic_action_expert else
                        "dual_dit_velocity_to_original_lee"),
+            "action_generation": (
+                "flow" if policy.use_flow_generation else
+                "direct" if policy.is_deterministic_action_expert else "legacy_flow"),
             "action_semantics": policy.action_semantics,
             "action_frame": policy.action_frame,
             "action_target_representation": policy.action_target_representation,
@@ -956,26 +1030,32 @@ def main(cfg):
             "scene_path": str(scene_path),
             "route_scene_path": str(route_scene_path),
             "map_sha256": str(requested_map["map_sha256"]),
+            "initial_conditions_sha256": hashlib.sha256(np.concatenate((
+                env.eval_start_pos.detach().cpu().float().numpy().reshape(-1),
+                env.target_pos[:, 0].detach().cpu().float().numpy().reshape(-1),
+                np.asarray(state_history[0])[:, :7].reshape(-1),
+            )).tobytes()).hexdigest(),
             "fixed_route_start_index": env.fixed_route_start_index,
             "num_envs": num_envs,
             "physics_dt_s": float(cfg.sim.dt),
             "replan_interval_steps": policy.interval,
             "sample_steps": (
-                0 if policy.is_deterministic_action_expert else policy.sample_steps),
+                0 if (policy.is_standalone_action_expert
+                      and not policy.use_flow_generation) else policy.sample_steps),
             "action_seed": policy.action_seed,
             "action_noise_scale": (
-                0.0 if policy.is_deterministic_action_expert
+                0.0 if (policy.is_standalone_action_expert
+                        and not policy.use_flow_generation)
                 else policy.action_noise_scale),
-            "training_action_diffusion": bool(
-                checkpoint_format in {
-                    ACTION_EXPERT_FORMAT, LEE_ACTION_EXPERT_FORMAT}),
-            "deployment_action_diffusion": False,
+            "training_action_diffusion": policy.training_action_diffusion,
+            "deployment_action_diffusion": (
+                policy.use_flow_generation or not policy.is_standalone_action_expert),
             "bootstrap_forward_speed_mps": policy.bootstrap_forward_speed,
             "bootstrap_action_chunks": policy.bootstrap_action_chunks,
             "goal_stop_adapter_enabled": policy.goal_stop_enabled,
             "goal_stop_interventions": policy.goal_stop_interventions,
-            "use_past_actions": policy.use_past_actions,
-            "past_input_semantics": policy.past_input_semantics,
+            "use_past_actions": getattr(policy, "use_past_actions", False),
+            "past_input_semantics": getattr(policy, "past_input_semantics", None),
             "mask_world_position": policy.mask_world_position,
             "use_proprio": policy.use_proprio,
             "safety_filter_enabled": policy.safety_enabled,
@@ -984,6 +1064,10 @@ def main(cfg):
             "recorded_physics_steps": recorded_steps,
             "inference_calls": policy.inference_calls,
             "command_abs_max_mps": policy.command_abs_max,
+            "command_norm_max_mps": policy.command_norm_max,
+            "flow_per_axis_limit_mps_xyz": (
+                policy.action_axis_limit.flatten().tolist()
+                if policy.is_flow_only_action_expert else None),
             "wall_time_s": elapsed,
             "counts": counts,
             "rates": {
@@ -1001,6 +1085,9 @@ def main(cfg):
         # Optional standalone teacher audit supplies truthful policy metadata.
         # Ordinary student training/evaluations have no such attribute and
         # retain the exact existing schema, controller and termination logic.
+        if policy.is_flow_only_action_expert:
+            metrics.pop("use_past_actions")
+            metrics.pop("past_input_semantics")
         metrics.update(getattr(policy, "benchmark_metadata", {}))
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")

@@ -6,7 +6,7 @@ def teacher_ego_chunk(world_velocity, quaternion_wxyz, mode, physics_step,
                       bootstrap_steps=10, bootstrap_speed=1., horizon=10):
     if (world_velocity.ndim != 2 or world_velocity.shape[-1] != 3
             or quaternion_wxyz.shape != (len(world_velocity), 4)
-            or mode not in ("native", "student-norm") or horizon != 10
+            or mode not in ("native", "student-norm", "student-box") or horizon != 10
             or min(physics_step, bootstrap_steps) < 0):
         raise ValueError("Invalid teacher benchmark command contract")
     if not bool(torch.isfinite(world_velocity).all() & torch.isfinite(quaternion_wxyz).all()):
@@ -22,6 +22,8 @@ def teacher_ego_chunk(world_velocity, quaternion_wxyz, mode, physics_step,
                        world_velocity[:, 2]), dim=-1)
     if mode == "student-norm":
         ego = ego/(ego.norm(dim=-1, keepdim=True)/2.).clamp_min(1.)
+    elif mode == "student-box":
+        ego = ego.clamp(-2., 2.)
     if physics_step < bootstrap_steps:
         ego = torch.zeros_like(ego)
         ego[:, 0] = bootstrap_speed

@@ -27,13 +27,13 @@ class TeacherBenchmarkPolicy(BasePolicy):
         from collect_action_dagger import static_observation
         from teacher_benchmark_commands import teacher_ego_chunk
 
-        if (not self.is_deterministic_action_expert or self.use_past_actions
+        if (not self.is_standalone_action_expert or getattr(self, "use_past_actions", False)
                 or self.action_semantics != "actual_velocity_input_to_original_lee"
                 or not self.goal_stop_enabled or self.safety_enabled):
             raise ValueError("Keep the original single-frame student adapter/strict braking")
         self.mode = str(cfg.wam_eval.teacher_velocity_domain)
         self.interval = int(cfg.wam_eval.teacher_query_interval_physics_steps)
-        if self.mode not in ("native", "student-norm") or self.interval not in (1, 10):
+        if self.mode not in ("native", "student-norm", "student-box") or self.interval not in (1, 10):
             raise ValueError("Teacher benchmark supports native/feasible commands and K=1/10")
         self.bootstrap_physics_steps = 10
         self.teacher_path = evaluator._resolve(
@@ -67,6 +67,8 @@ class TeacherBenchmarkPolicy(BasePolicy):
         self.checkpoint_step = 27000
         self.benchmark_metadata = {
             "policy": "privileged_ppo_online_sft_teacher",
+            "action_generation": "ppo_teacher_diagnostic", "sample_steps": 0,
+            "training_action_diffusion": False, "deployment_action_diffusion": False,
             "checkpoint": str(self.teacher_path), "teacher_sha256": digest,
             "student_scaffold_checkpoint_not_queried": str(checkpoint),
             "teacher_query_interval_physics_steps": self.interval,

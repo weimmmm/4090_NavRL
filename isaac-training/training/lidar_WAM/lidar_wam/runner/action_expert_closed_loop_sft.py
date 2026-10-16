@@ -28,6 +28,25 @@ from lidar_wam.runner.super_lee_action_data import SuperLeeActionDataset, discov
 
 def build_model(payload, *, freeze_policy_output_head=False):
     arch = payload["architecture"]
+    from lidar_wam.models.flow_action_expert import FLOW_ACTION_EXPERT_FORMAT, FlowActionExpertModel
+    if payload.get("format") == FLOW_ACTION_EXPERT_FORMAT:
+        if (payload["action_interface"].get("normalized_output_constraint") != "unit_box_after_euler"
+                or list(payload["action_interface"]["model_output_scale_mps_xyz"]) != [2., 2., 2.]):
+            raise ValueError("Flow SFT must retain the per-axis +/-2 m/s deployment contract")
+        model = FlowActionExpertModel(
+            width=arch["width"], depth=arch["depth"], heads=arch["heads"],
+            ffn_width=arch["ffn_width"], horizon=arch["action_horizon"],
+            action_dim=arch["action_dim"], proprio_dim=arch["proprio_dim"],
+            sample_steps=int(arch.get("sampling_steps", 10)))
+        if len(model.diffusion.blocks) != 8 or model.sample_steps != 10:
+            raise ValueError("Online Flow SFT requires the baseline's eight blocks / ten Euler steps")
+        model.load_state_dict(payload["model"], strict=True)
+        model.requires_grad_(False)
+        for block in model.diffusion.blocks[-2:]:
+            block.requires_grad_(True)
+        model.diffusion.norm.requires_grad_(not freeze_policy_output_head)
+        model.diffusion.out.requires_grad_(not freeze_policy_output_head)
+        return model
     model = SuperActionExpertModel(
         width=arch["width"], depth=arch["depth"], heads=arch["heads"],
         ffn_width=arch["ffn_width"], horizon=arch["action_horizon"],

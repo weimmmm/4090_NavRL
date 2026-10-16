@@ -26,7 +26,7 @@ def check_gpus(args, training_gpus):
         index, free, uuid = (part.strip() for part in line.split(","))
         cards[int(index)] = {"free_mib": int(free), "uuid": uuid}
     roles = ([(gpu, 2048) for gpu in training_gpus]
-             + [(args.sim_gpu, 8000), (args.eval_gpu, 6000)])
+             + [(args.sim_gpu, args.sim_min_free_mib), (args.eval_gpu, 6000)])
     if not args.skip_fixed_validation:
         roles.append((args.validation_gpu, 2048))
     for gpu, minimum in roles:
@@ -58,13 +58,21 @@ def main():
     parser.add_argument("--route-seed-base", type=int, default=9500000)
     parser.add_argument("--start-step", type=int, default=0)
     parser.add_argument("--baseline-sr", type=float, default=.8125)
+    parser.add_argument("--flow-only", action="store_true",
+                        help="Adapt the ten-Euler, per-axis Flow-only baseline; no Direct head")
+    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--cuda-memory-fraction", type=float, default=None)
+    parser.add_argument("--actor-cuda-memory-fraction", type=float, default=.20)
+    parser.add_argument("--sim-min-free-mib", type=int, default=8000)
+    parser.add_argument("--low-memory-actor-physx", action="store_true",
+                        help="Bound unused PhysX contact buffers for <=64 rigid-body drones")
     parser.add_argument("--smoke-updates", type=int, default=8)
     parser.add_argument("--smoke-eval-num-envs", type=int, default=16)
     parser.add_argument("--updates", type=int, default=10000, help="Additional optimizer updates")
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--evaluate-start", action="store_true",
                         help="Also evaluate the untouched source policy on the same 128 routes")
-    parser.add_argument("--teacher-target-mode", choices=("raw", "student-norm"), default="raw",
+    parser.add_argument("--teacher-target-mode", choices=("raw", "student-norm", "student-box"), default="raw",
                         help="Label-only ablation; never changes deployed velocity bounds")
     parser.add_argument("--anchor-weight", type=float, default=0.,
                         help="Frozen original policy trust penalty on current online states only")
@@ -90,22 +98,32 @@ def main():
     parser.add_argument("--fixed-windows", type=int, default=4096)
     parser.add_argument("--job-timeout", type=int, default=900)
     args = parser.parse_args()
+    if args.flow_only and (args.checkpoint is None or args.teacher_target_mode != "student-box"
+                          or not args.skip_fixed_validation or args.supervision_horizon != 1):
+        parser.error("Flow SFT requires an explicit checkpoint, student-box labels, "
+                     "first-action supervision and --skip-fixed-validation")
     if (not 0 <= args.selective_correction_threshold_mps < float("inf")
             or (args.selective_correction_threshold_mps > 0
                 and (args.anchor_weight != 0 or args.supervision_horizon != 1
-                     or args.unclipped_training_output or args.teacher_target_mode != "student-norm"))):
+                     or args.unclipped_training_output
+                     or args.teacher_target_mode not in ("student-norm", "student-box")))):
         parser.error("Selective correction requires a finite positive threshold, feasible first labels, "
                      "bounded output and no simultaneous anchor/tail ablation")
     training_gpus = [int(value) for value in args.training_gpus.split(",")]
+    world_size = len(training_gpus)
     validate_gpu_roles(training_gpus, args.sim_gpu, args.eval_gpu,
                        None if args.skip_fixed_validation else args.validation_gpu)
-    if len(training_gpus) != 4 or min(args.updates, args.smoke_updates, args.eval_every,
+    if not 1 <= world_size <= 8 or min(args.updates, args.smoke_updates, args.eval_every,
             args.per_gpu_batch_size, args.fixed_windows, args.inference_batch_size, args.job_timeout) <= 0:
-        parser.error("Expected four GPUs and positive update/interval/window/batch counts")
+        parser.error("Expected 1..8 GPUs and positive update/interval/window/batch counts")
     fleet = args.smoke_num_envs if args.smoke else args.num_envs
-    if not 4 <= fleet <= 2048 or fleet % 4:
-        parser.error("Fleet must be a multiple of four and at most 2048")
-    minimum = min(args.min_global_batch_size, fleet, args.per_gpu_batch_size*4)
+    if not 4 <= fleet <= 2048:
+        parser.error("Fleet must contain 4..2048 drones; uneven DDP batches are supported")
+    if not 0 < args.actor_cuda_memory_fraction <= 1 or args.sim_min_free_mib < 1:
+        parser.error("Invalid actor memory limit or minimum free memory")
+    if args.low_memory_actor_physx and fleet > 64:
+        parser.error("Low-memory actor PhysX buffers are restricted to <=64 drones")
+    minimum = min(args.min_global_batch_size, fleet, args.per_gpu_batch_size*world_size)
     if (minimum <= 0 or args.run_name in ("", ".", "..")
             or Path(args.run_name).name != args.run_name):
         parser.error("Minimum fresh batch must be positive; run name must not contain a path")
@@ -149,16 +167,18 @@ def main():
     atomic_json(host_out/"status.json", state)
     train_env = {"CUDA_VISIBLE_DEVICES": args.training_gpus, "OMP_NUM_THREADS": "4",
                  "PYTHONPATH": f"{PROJECT}:{DEPS}", "PYTHONUNBUFFERED": "1"}
-    command = [PY, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=4", "-m",
+    command = [PY, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={world_size}", "-m",
                "lidar_wam.runner.action_expert_online_sft", "serve", "--socket", socket,
                "--checkpoint", checkpoint, "--out", out, "--max-updates", final_step,
-               "--start-step", args.start_step, "--lr", "0.000005", "--save-every", args.eval_every,
+               "--start-step", args.start_step, "--lr", args.lr, "--save-every", args.eval_every,
                "--per-gpu-batch-size", args.per_gpu_batch_size, "--mode", "pure-online",
                "--online-weight", "1", "--refill-enabled",
                "--teacher-target-mode", args.teacher_target_mode, "--anchor-weight", args.anchor_weight,
                "--supervision-horizon", args.supervision_horizon,
                "--selective-correction-threshold-mps", args.selective_correction_threshold_mps,
                "--online-tail-weight", args.online_tail_weight]
+    if args.cuda_memory_fraction is not None:
+        command += ["--cuda-memory-fraction", args.cuda_memory_fraction]
     if args.anchor_checkpoint:
         command += ["--anchor-checkpoint", args.anchor_checkpoint]
     if args.unclipped_training_output:
@@ -189,6 +209,8 @@ def main():
                        "--baseline-sr", 1.0 if args.smoke else args.baseline_sr]
             if args.evaluate_start:
                 command.append("--include-start")
+            if args.flow_only:
+                command.append("--flow-only")
             workers.append(start_logged(list(map(str, command)), host_out/f"{kind}_monitor.log"))
         sim_env = {"ISAAC_ACTIVE_GPU": "0", "PYTHONUNBUFFERED": "1", "PYTHONPATH": f"{PROJECT}:{DEPS}",
                    "NAVRL_ASSETS_ROOT": "http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/2023.1.0"}
@@ -203,11 +225,24 @@ def main():
                    f"+online.teacher_checkpoint={PROJECT}/outputs/privileged_ppo_checkpoint_27000.pt",
                    f"+online.socket={socket}", f"+online.output={out}/actor.json",
                    f"+online.target_updates={final_step}", f"+online.inference_batch_size={args.inference_batch_size}",
-                   "+online.refill_enabled=true", f"+online.learn_batch_capacity={args.per_gpu_batch_size*4}",
+                   "+online.refill_enabled=true", f"+online.learn_batch_capacity={args.per_gpu_batch_size*world_size}",
                    f"+online.minimum_batch_size={minimum}", f"+online.stop_file={out}/stop_requested",
                    f"+online.teacher_target_mode={args.teacher_target_mode}",
                    f"+online.supervision_horizon={args.supervision_horizon}",
                    f"+online.test_force_refill={'true' if args.smoke else 'false'}", "+online.final_session=true"]
+        if args.flow_only:
+            command += ["wam_eval.action_generation=flow", "wam_eval.sample_steps=10",
+                        "wam_eval.action_seed=271828", "wam_eval.action_noise_scale=1.0",
+                        "wam_eval.use_past_actions=false", "sensor.lidar_range=5.0",
+                        f"wam_eval.cuda_memory_fraction={args.actor_cuda_memory_fraction}"]
+        if args.low_memory_actor_physx:
+            command += ["sim.gpu_max_rigid_contact_count=65536",
+                        "sim.gpu_max_rigid_patch_count=16384",
+                        "sim.gpu_found_lost_pairs_capacity=262144",
+                        "sim.gpu_found_lost_aggregate_pairs_capacity=1048576",
+                        "sim.gpu_total_aggregate_pairs_capacity=262144",
+                        "sim.gpu_max_soft_body_contacts=1024",
+                        "sim.gpu_max_particle_contacts=1024"]
         actor = start_logged(docker_command(args.sim_container, command, sim_env, ROOT), host_out/"actor.log")
         state.update(stage="continuous_online_sft", actor_host_pid=actor.pid, learner_host_pid=learner.pid)
         atomic_json(host_out/"status.json", state)

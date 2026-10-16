@@ -34,11 +34,14 @@ def sample_routes(count, rng, edge=24., height=2.):
 
 def reset_policy_slots(student, ids, state):
     """Clear only selected rows; keep global K=10 clock/model/other rows intact."""
-    if student.required_history_frames != 1 or student.use_past_actions:
+    if student.required_history_frames != 1 or getattr(student, "use_past_actions", False):
         raise ValueError("Refill currently supports the single-frame/no-past baseline only")
-    for name in ("past", "past_world", "past_mask", "chunk", "goal_braking", "reference_started",
+    names = ("chunk", "goal_braking", "reference_started",
                  "previous_reference_velocity", "safety_heading", "last_ego_command",
-                 "last_world_command", "last_reference_velocity_world"):
+                 "last_world_command", "last_reference_velocity_world")
+    if not getattr(student, "is_flow_only_action_expert", False):
+        names = ("past", "past_world", "past_mask") + names
+    for name in names:
         getattr(student, name)[ids] = 0
     for image in student.history:
         image[ids] = 0
@@ -131,6 +134,8 @@ def run_refill(cfg, env, base_policy, lee, checkpoint, teacher, teacher_sensor,
     n = env.num_envs
     student = make_refill_policy(base_policy, cfg, env, lee, checkpoint, checkpoint)
     target_mode = str(cfg.online.get("teacher_target_mode", "raw"))
+    if getattr(student.model, "flow_only", False) and target_mode != "student-box":
+        raise ValueError("Flow-only online actor requires per-axis box teacher labels")
     if packet.get("teacher_target_mode", "raw") != target_mode:
         raise ValueError("Actor and learner teacher-label modes differ")
     if target_mode == "student-norm" and (
@@ -151,14 +156,21 @@ def run_refill(cfg, env, base_policy, lee, checkpoint, teacher, teacher_sensor,
     active = torch.ones(n, dtype=torch.bool, device=env.device)
     pending_reset = torch.zeros_like(active)
     pending = {}
+    failure_feedback = int(cfg.online.get("failure_window_chunks", 0)) > 0
+    if failure_feedback and not getattr(connection, "synchronize_online", False):
+        raise ValueError("Delayed feedback requires the synchronized local learner")
+    episode_serial = torch.zeros(n, dtype=torch.long, device=env.device)
+    failure_events = []
     physics = queries = samples = replacements = completed = skipped_small = 0
     counts = {key: 0 for key in ("success", "collision", "out_of_bounds", "goal_brake_failed", "timeout")}
     test_resets = 0
 
-    def online_predict(latent, goal, proprio, past, mask):
+    def online_predict(latent, goal, proprio, *legacy, **kwargs):
         nonlocal version, packet, samples
         valid = pending["valid"]
-        if version < end and int(valid.sum()) >= minimum_batch:
+        synchronize = (getattr(connection, "synchronize_online", False)
+                       and student.inference_calls >= student.bootstrap_action_chunks)
+        if version < end and (int(valid.sum()) >= minimum_batch or synchronize):
             fresh = {"latent": latent[valid].float().cpu().numpy(),
                      "goal": goal[valid].float().cpu().numpy(),
                      "proprio": proprio[valid].float().cpu().numpy(),
@@ -171,17 +183,25 @@ def run_refill(cfg, env, base_policy, lee, checkpoint, teacher, teacher_sensor,
                            "actor_pid": os.getpid(), "full_fleet_resets": 1}
             diagnostics.update(target_diagnostics(pending["raw_target"], pending["target"], valid))
             connection.send({"command": "update", "batch": fresh, "student_version": version,
-                             "physics_step": physics, "episode": completed, "diagnostics": diagnostics})
+                             "physics_step": physics, "episode": completed, "diagnostics": diagnostics,
+                             "row_slots": valid.nonzero().flatten().cpu().numpy(),
+                             "row_episodes": episode_serial[valid].cpu().numpy(),
+                             "failure_events": list(failure_events)})
+            failure_events.clear()
             packet = connection.recv()
+            if packet.get("skipped_empty_global_batch", False):
+                if int(packet["step"]) != version:
+                    raise RuntimeError("An empty global batch must not advance the optimizer")
+                return predict(latent, goal, proprio, *legacy, **kwargs)
             if int(packet["step"]) != version+1:
                 raise RuntimeError("One fresh update is required per K=10 boundary")
             version += 1
-            samples += int(valid.sum())
+            samples += int(packet.get("trained_samples", int(valid.sum())))
             apply_weights(student, packet)
             if version == initial_version+1 or version % 10 == 0:
                 print({"update": version, "physics_step": physics, "fresh_states": int(valid.sum()),
                        **diagnostics}, flush=True)
-        return predict(latent, goal, proprio, past, mask)
+        return predict(latent, goal, proprio, *legacy, **kwargs)
 
     student.model.predict_action = online_predict
     td = env.reset()
@@ -201,6 +221,7 @@ def run_refill(cfg, env, base_policy, lee, checkpoint, teacher, teacher_sensor,
                 ids = pending_reset.nonzero().flatten()
                 if len(ids):
                     td = refill_slots(env, student, td, ids, route_rng)
+                    episode_serial[ids] += 1
                     replacements += len(ids)
                     active[ids] = True
                     pending_reset[ids] = False
@@ -241,6 +262,9 @@ def run_refill(cfg, env, base_policy, lee, checkpoint, teacher, teacher_sensor,
             goal_distance = (env.target_pos[:, 0]-td["info", "drone_state"][:, 0, :3]).norm(dim=-1)
             brake_failed = student.goal_braking & (goal_distance>student.goal_stop_distance)
             finished = active & (success | collision | oob | brake_failed | timeout)
+            if failure_feedback:
+                for slot in (finished & (collision | oob)).nonzero().flatten().tolist():
+                    failure_events.append((slot, int(episode_serial[slot]), physics))
             # Match the existing evaluator's terminal-type priority.
             remaining = finished.clone()
             for key, mask in (("collision", collision), ("out_of_bounds", oob),
@@ -286,6 +310,7 @@ def run_refill(cfg, env, base_policy, lee, checkpoint, teacher, teacher_sensor,
             "completed_trajectories": completed, "refilled_slots": replacements,
             "forced_test_resets": test_resets, "training_counts_not_heldout_eval": counts,
             "query_interval_steps": 10, "supervised_action_index": 0,
+            "failure_window_chunks": int(cfg.online.get("failure_window_chunks", 0)),
             "student_update_before_chunk_generation": True, "weights_fixed_inside_chunk": True,
             "peak_allocated_gib": torch.cuda.max_memory_allocated()/2**30,
             "peak_reserved_gib": torch.cuda.max_memory_reserved()/2**30}

@@ -23,7 +23,9 @@ def apply_tail(student, packet):
     import torch
     parameters = dict(student.model.named_parameters())
     names = packet["names"]
-    allowed = ("policy.blocks.6.", "policy.blocks.7.", "policy.norm.", "policy.out.")
+    branch = "diffusion" if getattr(student.model, "flow_only", False) else "policy"
+    allowed = tuple(branch+suffix for suffix in
+                    (".blocks.6.", ".blocks.7.", ".norm.", ".out."))
     prefixes = allowed[:2] if packet.get("freeze_policy_output_head", False) else allowed
     expected = [name for name in parameters if name.startswith(prefixes)]
     if names != expected:
@@ -59,12 +61,17 @@ every drone's inputs before one learner request, and split only inference.
         mode = torch.cat(modes)
         return SimpleNamespace(latent_dist=SimpleNamespace(mode=lambda: mode))
 
-    def predict_chunks(latent, goal, proprio, past, mask):
+    def predict_chunks(latent, goal, proprio, *legacy, **kwargs):
         if len(latent) <= limit:
-            return predict(latent, goal, proprio, past, mask)
-        return torch.cat([predict(*(value[start:start+limit] for value in
-                                    (latent, goal, proprio, past, mask)))
-                          for start in range(0, len(latent), limit)])
+            return predict(latent, goal, proprio, *legacy, **kwargs)
+        parts = []
+        for start in range(0, len(latent), limit):
+            options = dict(kwargs)
+            if options.get("initial_noise") is not None:
+                options["initial_noise"] = options["initial_noise"][start:start+limit]
+            parts.append(predict(*(value[start:start+limit] for value in
+                                   (latent, goal, proprio, *legacy)), **options))
+        return torch.cat(parts)
 
     student.vae.encode = encode_chunks
     return predict_chunks
@@ -128,7 +135,12 @@ def main(cfg):
     teacher.requires_grad_(False)
     centers = env.fixed_scene["obstacle_center_xyz"].to(cfg.device)
     sizes = env.fixed_scene["obstacle_size_xyz"].to(cfg.device)
-    connection = Client(str(cfg.online.socket), family="AF_UNIX")
+    local_learner = bool(cfg.online.get("local_learner", False))
+    if local_learner:
+        from local_flow_online_sft import LocalFlowSFT
+        connection = LocalFlowSFT(cfg, checkpoint, output.parent)
+    else:
+        connection = Client(str(cfg.online.socket), family="AF_UNIX")
     packet = connection.recv()
     target_mode = str(cfg.online.get("teacher_target_mode", "raw"))
     if packet.get("teacher_target_mode", "raw") != target_mode:
@@ -144,10 +156,13 @@ def main(cfg):
     if bool(cfg.online.get("refill_enabled", False)):
         from online_refill import run_refill
         metadata = run_refill(cfg, env, WamLeePolicy, lee, checkpoint, teacher, teacher_sensor,
-                              connection, packet, centers, sizes, apply_tail,
+                              connection, packet, centers, sizes,
+                              connection.attach if local_learner else apply_tail,
                               install_inference_microbatches, static_observation)
         output.write_text(json.dumps(metadata, indent=2)+"\n")
         print(json.dumps(metadata), flush=True)
+        if local_learner:
+            connection.finalize(metadata)
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

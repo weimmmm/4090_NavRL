@@ -123,8 +123,9 @@ class SuperLeeActionDataset(Dataset):
     def __init__(self, data_root: Path,
                  shard_names: Iterable[str] | None = None,
                  max_windows: int | None = None,
-                 random_seed: int = 42):
+                 random_seed: int = 42, include_history: bool = True):
         self.data_root = Path(data_root).expanduser().resolve()
+        self.include_history = bool(include_history)
         available = {
             path.parent.relative_to(self.data_root).as_posix(): path
             for path in sorted(self.data_root.rglob("trajectories.h5"))
@@ -153,7 +154,7 @@ class SuperLeeActionDataset(Dataset):
         for shard_index, (name, path) in enumerate(
                 zip(self.shard_names, self.scene_paths)):
             with h5py.File(path, "r") as handle:
-                self._validate_handle(handle, path)
+                self._validate_handle(handle, path, require_history=self.include_history)
                 frames = handle["frames"]
                 env_id = np.asarray(frames["env_id"][:], dtype=np.int32)
                 frame_index = np.asarray(
@@ -238,7 +239,7 @@ class SuperLeeActionDataset(Dataset):
             self._windows = self._windows[chosen]
 
     @staticmethod
-    def _validate_handle(handle: h5py.File, path: Path) -> None:
+    def _validate_handle(handle: h5py.File, path: Path, require_history=True) -> None:
         if str(handle.attrs.get("format", "")) != DATASET_FORMAT:
             raise ValueError(f"unsupported L20 dataset format in {path}")
         try:
@@ -257,7 +258,9 @@ class SuperLeeActionDataset(Dataset):
         if not np.isclose(float(recording.get("range_m", -1.0)), 5.0):
             raise ValueError(f"recording LiDAR is not 5 m in {path}")
         missing_frames = REQUIRED_FRAME_FIELDS - set(handle["frames"].keys())
-        missing_steps = REQUIRED_STEP_FIELDS - set(handle["steps"].keys())
+        required_steps = REQUIRED_STEP_FIELDS if require_history else (
+            REQUIRED_STEP_FIELDS - {"world_velocity"})
+        missing_steps = required_steps - set(handle["steps"].keys())
         missing_episodes = REQUIRED_EPISODE_FIELDS - set(
             handle["episodes"].keys())
         if missing_frames or missing_steps or missing_episodes:
@@ -368,27 +371,30 @@ class SuperLeeActionDataset(Dataset):
         if actions.shape != (ACTION_HORIZON, 3):
             raise ValueError(f"unexpected future action shape {actions.shape}")
 
-        past = np.zeros((PAST_HORIZON, 3), dtype=np.float32)
-        past_mask = np.zeros(PAST_HORIZON, dtype=np.float32)
-        past_count = min(PAST_HORIZON, current_step)
-        if past_count:
-            start = step_offset + current_step - past_count
-            stop = step_offset + current_step
-            world_past = np.asarray(
-                handle["steps/world_velocity"][start:stop], dtype=np.float32)
-            # Use one fixed coordinate system for the complete temporal
-            # context.  Rotating each row with its historical yaw would mix
-            # frames if the otherwise-uncommanded aircraft yaw drifts.
-            past[-past_count:] = _world_to_ego_yaw(
-                world_past, current_state[3:7])
-            past_mask[-past_count:] = 1.0
+        include_history = getattr(self, "include_history", True)
+        if include_history:
+            past = np.zeros((PAST_HORIZON, 3), dtype=np.float32)
+            past_mask = np.zeros(PAST_HORIZON, dtype=np.float32)
+            past_count = min(PAST_HORIZON, current_step)
+            if past_count:
+                start = step_offset + current_step - past_count
+                stop = step_offset + current_step
+                world_past = np.asarray(
+                    handle["steps/world_velocity"][start:stop], dtype=np.float32)
+                # Rotate all historical rows into the current observation's
+                # yaw frame; legacy checkpoints retain this exact input.
+                past[-past_count:] = _world_to_ego_yaw(
+                    world_past, current_state[3:7])
+                past_mask[-past_count:] = 1.0
 
         goal, proprio = self.conditions(item)
         source = np.asarray((
             shard, episode, int(frames["frame_index"][current]),
             current_step,
         ), dtype=np.int64)
-        values = (image, actions, goal, proprio, past, past_mask)
+        values = (image, actions, goal, proprio)
+        if include_history:
+            values += (past, past_mask)
         if not all(np.isfinite(value).all() for value in values):
             raise ValueError(
                 f"non-finite action window {self.scene_paths[shard]}:"

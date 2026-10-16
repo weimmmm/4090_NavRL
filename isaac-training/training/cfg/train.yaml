@@ -168,9 +168,14 @@ super:
 # velocity commands; each is rotated into world ENU and sent to the original
 # unmodified Lee controller at the 0.016 s physics rate.
 wam_eval:
+  # Inference-only ablation for SuperActionExpertModel. The default preserves
+  # the existing deterministic deployment and checkpoint format unchanged.
+  action_generation: auto
   checkpoint: training/lidar_WAM/outputs/super_history_world_action_dit_t1/best.pt
   world_checkpoint: training/lidar_WAM/outputs/super_lidar_video_dit_t1/best.pt
   sample_steps: 10
+  # Optional PyTorch allocator cap when sharing the evaluation GPU.
+  cuda_memory_fraction: null
   # Match the deterministic noise used by offline action-sampling validation.
   action_seed: 271828
   # Rectified-flow initial Gaussian scale.  Zero evaluates the deterministic
@@ -188,8 +193,9 @@ wam_eval:
   # Deterministic 3-D-reference-velocity adapter (used by corrected checkpoints).
   yaw_speed_threshold: 0.2
   max_yaw_rate: 2.5
-  # Match SUPER's traj_opt/boundary/max_vel. Diffusion samples are otherwise
-  # unbounded even though the expert labels are not.
+  # Legacy checkpoints only: preserve the historical total-speed norm cap.
+  # New Flow-only checkpoints use their recorded per-axis ego-FLU +/-2 m/s
+  # limits instead; their total speed is NOT capped at 2 m/s.
   max_reference_speed: 2.0
   max_reference_acceleration: 6.0
   # Optional adapter-side terminal brake.  It does not alter Lee; when

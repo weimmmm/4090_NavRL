@@ -12,7 +12,7 @@ import torch
 from torch.nn import functional as F
 
 
-TARGET_MODES = ("raw", "student-norm")
+TARGET_MODES = ("raw", "student-norm", "student-box")
 
 
 def student_feasible_target(target: torch.Tensor) -> torch.Tensor:
@@ -33,6 +33,8 @@ def online_teacher_target(target: torch.Tensor, mode: str) -> torch.Tensor:
         return target
     if mode == "student-norm":
         return student_feasible_target(target)
+    if mode == "student-box":
+        return target.float().clamp(-1., 1.)
     raise ValueError(f"Unknown teacher target mode: {mode!r}")
 
 
@@ -94,7 +96,7 @@ def selective_online_correction_loss(prediction: torch.Tensor,
                                      reference: torch.Tensor,
                                      threshold_mps: float,
                                      world_size: int,
-                                     total_samples: int):
+                                     total_samples: int, correction_eligible=None):
     """Choose ONE supervision source per fresh state, never two competing ones.
 
     A frozen original policy sees the same current online student inputs.
@@ -121,6 +123,11 @@ def selective_online_correction_loss(prediction: torch.Tensor,
     original, teacher = reference.detach().float(), target.detach().float()
     gap = (original[:, 0]-teacher).norm(dim=-1)*2.
     correct = gap > float(threshold_mps)
+    if correction_eligible is not None:
+        if (correction_eligible.shape != (len(prediction),)
+                or not bool(((correction_eligible == 0) | (correction_eligible == 1)).all())):
+            raise ValueError("Correction eligibility must be a binary label-only mask [B]")
+        correct &= correction_eligible.detach().bool()
     teacher_error = F.smooth_l1_loss(
         prediction[:, 0].float(), teacher, reduction="none", beta=.25).mean(-1)
     keep_error = F.smooth_l1_loss(
@@ -131,3 +138,29 @@ def selective_online_correction_loss(prediction: torch.Tensor,
                            (teacher_error*correct).sum(),
                            (keep_error*~correct).sum())).detach()*scale
     return loss, metrics
+
+
+def selective_flow_correction_loss(prediction, target, reference, threshold_mps,
+                                   world_size, total_samples, tail_weight=.5,
+                                   correction_eligible=None):
+    """PPO corrects only action zero; protect the other nine on corrected rows.
+
+    Agreement rows retain the existing whole-chunk preservation objective.
+    There is no competing reference loss on the PPO-supervised first action.
+    All terms use the global fresh-state denominator (including uneven ranks).
+    """
+    if not 0 <= tail_weight < float("inf"):
+        raise ValueError("Tail preservation weight must be finite and nonnegative")
+    loss, metrics = selective_online_correction_loss(
+        prediction, target, reference, threshold_mps, world_size, total_samples,
+        correction_eligible)
+    if total_samples <= 0:
+        return loss, metrics, prediction.sum()*0.
+    original = reference.detach().float()
+    correction = ((original[:, 0]-target.detach().float()).norm(dim=-1)*2 > threshold_mps)
+    if correction_eligible is not None:
+        correction &= correction_eligible.detach().bool()
+    error = F.smooth_l1_loss(prediction[:, 1:].float(), original[:, 1:],
+                             reduction="none", beta=.25).mean((1, 2))
+    tail = (error*correction).sum()*world_size/total_samples
+    return loss+tail_weight*tail, metrics, tail
